@@ -1,0 +1,29 @@
+{
+    "name": "unifi-cam-proxy",
+    "version": "1.0.0",
+    "description": "This enables using non-Ubiquiti cameras within the UniFi Protect ecosystem. This is particularly useful to use existing RTSP-enabled cameras in the same UI and mobile app as your other Unifi devices.",
+    "main": "index.js",
+    "directories": {
+        "doc": "docs",
+        "test": "tests"
+    },
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "logger": "node tools/eventLogger.js"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/NorthernMan54/unifi-cam-proxy.git"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "commonjs",
+    "bugs": {
+        "url": "https://github.com/NorthernMan54/unifi-cam-proxy/issues"
+    },
+    "homepage": "https://github.com/NorthernMan54/unifi-cam-proxy#readme",
+    "dependencies": {
+        "mqtt": "^5.14.1"
+    }
+}

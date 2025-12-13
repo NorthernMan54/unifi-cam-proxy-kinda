@@ -100,7 +100,17 @@ class FrigateCam(RTSPCam):
         msg = message.payload.decode()
         try:
             frigate_msg = json.loads(message.payload.decode())
-            if not frigate_msg["after"]["camera"] == self.args.frigate_camera:
+
+            event_type = frigate_msg.get("type")
+            event_id = frigate_msg.get("after", {}).get("id")
+            camera = frigate_msg.get("after", {}).get("camera")
+            label = frigate_msg.get("after", {}).get("label")
+            
+            if camera != self.args.frigate_camera:
+                # self.logger.debug(
+                #    f"Frigate: Ignoring Frigate event for different camera: {camera} "
+                #    f"(expecting {self.args.frigate_camera})"
+                #)
                 return
 
             label = frigate_msg["after"]["label"]
