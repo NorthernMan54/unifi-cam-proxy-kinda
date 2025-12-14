@@ -53,6 +53,18 @@ class FrigateCam(RTSPCam):
             type=int,
             help="Camera frame height in pixels (default: 1080)",
         )
+        parser.add_argument(
+            "--frigate-detect-width",
+            default=1280,
+            type=int,
+            help="Frigate detection frame width in pixels (default: 1280)",
+        )
+        parser.add_argument(
+            "--frigate-detect-height",
+            default=720,
+            type=int,
+            help="Frigate detection frame height in pixels (default: 720)",
+        )
 
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
@@ -87,18 +99,18 @@ class FrigateCam(RTSPCam):
         # Extract bounding box if available
         box = after.get("box")
         if box and len(box) == 4:
-            # Frigate box format: [x_min, y_min, x_max, y_max] in 1280x720 pixels
-            # UniFi format: [x, y, width, height] in 1010x750 coordinate system
+            # Frigate box format: [x_min, y_min, x_max, y_max] in configured pixel dimensions
+            # UniFi format: [x, y, width, height] in 1000x1000 coordinate system
 
             # Scale factors
-            FRIGATE_WIDTH = 1280
-            FRIGATE_HEIGHT = 720
-            UNIFI_WIDTH = 1010
-            UNIFI_HEIGHT = 750
-            UNIFI_Y_OFFSET = 125
+            frigate_width = self.args.frigate_detect_width
+            frigate_height = self.args.frigate_detect_height
+            UNIFI_WIDTH = 1000
+            UNIFI_HEIGHT = 1000
+            UNIFI_Y_OFFSET = 0  # Offset is needed if cam width/height differ from detection dimensions
 
-            x_scale = UNIFI_WIDTH / FRIGATE_WIDTH  # 1010 / 1280 = 0.7891
-            y_scale = UNIFI_HEIGHT / FRIGATE_HEIGHT  # 750 / 720 = 1.0417
+            x_scale = UNIFI_WIDTH / frigate_width
+            y_scale = UNIFI_HEIGHT / frigate_height
 
             # Transform coordinates
             x_min_unifi = int(box[0] * x_scale)
