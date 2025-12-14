@@ -87,14 +87,31 @@ class FrigateCam(RTSPCam):
         # Extract bounding box if available
         box = after.get("box")
         if box and len(box) == 4:
-            # Frigate box format: [x_min, y_min, x_max, y_max] in pixels
-            # Pass directly as pixels without conversion
-            # UniFi format: [x, y, width, height]
-            x_min = int(box[0])
-            y_min = int(box[1])
-            width = int(box[2] - box[0])
-            height = int(box[3] - box[1])
-            coord = [x_min, y_min, width, height]
+            # Frigate box format: [x_min, y_min, x_max, y_max] in 1280x720 pixels
+            # UniFi format: [x, y, width, height] in 1010x750 coordinate system
+
+            # Scale factors
+            FRIGATE_WIDTH = 1280
+            FRIGATE_HEIGHT = 720
+            UNIFI_WIDTH = 1010
+            UNIFI_HEIGHT = 750
+            UNIFI_Y_OFFSET = 125
+
+            x_scale = UNIFI_WIDTH / FRIGATE_WIDTH  # 1010 / 1280 = 0.7891
+            y_scale = UNIFI_HEIGHT / FRIGATE_HEIGHT  # 750 / 720 = 1.0417
+
+            # Transform coordinates
+            x_min_unifi = int(box[0] * x_scale)
+            y_min_unifi = int(box[1] * y_scale) + UNIFI_Y_OFFSET
+            x_max_unifi = int(box[2] * x_scale)
+            y_max_unifi = int(box[3] * y_scale) + UNIFI_Y_OFFSET
+
+            # Convert to UniFi format
+            x = x_min_unifi
+            y = y_min_unifi
+            width = x_max_unifi - x_min_unifi
+            height = y_max_unifi - y_min_unifi
+            coord = [x, y, width, height]
         else:
             # Fallback to default if no bounding box
             coord = [0, 0, 1920, 1080]
