@@ -42,8 +42,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
         
         # Video resolution detected from source (will be probed during init_adoption)
-        self._detected_width: int = 1920
-        self._detected_height: int = 1080
+        # Store separate resolutions for each stream with defaults
+        self._detected_resolutions: dict[str, tuple[int, int]] = {
+            "video1": (2560, 1920),  # High quality default
+            "video2": (1280, 704),   # Medium quality default
+            "video3": (640, 360),    # Low quality default
+        }
 
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
@@ -317,8 +321,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._msg_id += 1
         return self._msg_id
 
-    def probe_video_resolution(self, source_url: str) -> tuple[int, int]:
+    def probe_video_resolution(self, stream_index: str, source_url: str) -> tuple[int, int]:
         """Probe video source to detect width and height using ffprobe"""
+        # Get default resolution for this stream
+        default_width, default_height = self._detected_resolutions[stream_index]
+        
         try:
             cmd = [
                 'ffprobe',
@@ -329,7 +336,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                 '-rtsp_transport', self.args.rtsp_transport,
                 source_url
             ]
-            self.logger.info(f"Probing video source: {source_url}")
+            self.logger.info(f"Probing {stream_index} source: {source_url}")
             result = subprocess.run(
                 cmd, 
                 capture_output=True, 
@@ -340,35 +347,59 @@ class UnifiCamBase(metaclass=ABCMeta):
             if result.returncode == 0:
                 data = json.loads(result.stdout)
                 if data.get('streams') and len(data['streams']) > 0:
-                    width = data['streams'][0].get('width', 1920)
-                    height = data['streams'][0].get('height', 1080)
-                    self.logger.info(f"Detected video resolution: {width}x{height}")
+                    width = data['streams'][0].get('width', default_width)
+                    height = data['streams'][0].get('height', default_height)
+                    self.logger.info(f"Detected {stream_index} resolution: {width}x{height}")
                     return width, height
                     
         except subprocess.TimeoutExpired:
-            self.logger.warning("Video probe timed out after 15 seconds, using defaults")
+            self.logger.warning(f"{stream_index} probe timed out after 15 seconds, using defaults")
         except json.JSONDecodeError as e:
-            self.logger.warning(f"Could not parse ffprobe output: {e}, using defaults")
+            self.logger.warning(f"Could not parse ffprobe output for {stream_index}: {e}, using defaults")
         except Exception as e:
-            self.logger.warning(f"Could not probe video source: {e}, using defaults")
+            self.logger.warning(f"Could not probe {stream_index} source: {e}, using defaults")
         
-        # Fallback to defaults
-        self.logger.info("Using default resolution: 1920x1080")
-        return 1920, 1080
+        # Fallback to defaults for this stream
+        self.logger.info(f"Using default resolution for {stream_index}: {default_width}x{default_height}")
+        return default_width, default_height
 
     async def init_adoption(self) -> None:
         self.logger.info(
             f"Adopting with token [{self.args.token}] and mac [{self.args.mac}]"
         )
         
-        # Probe video resolution from video1 stream
-        try:
-            source = await self.get_stream_source("video1")
-            self._detected_width, self._detected_height = self.probe_video_resolution(source)
-        except Exception as e:
-            self.logger.warning(f"Could not probe video source: {e}, using defaults 1920x1080")
-            self._detected_width = 1920
-            self._detected_height = 1080
+        # Probe video resolutions only for streams that are actually configured
+        # video1 is required, video2 and video3 use their defaults if not probed
+        video1_source = None
+        for stream_index in ["video1", "video2", "video3"]:
+            try:
+                source = await self.get_stream_source(stream_index)
+                # Only probe if we got a valid source
+                if source:
+                    # For video1, always probe
+                    if stream_index == "video1":
+                        video1_source = source
+                        width, height = self.probe_video_resolution(stream_index, source)
+                        self._detected_resolutions[stream_index] = (width, height)
+                    # For video2/video3, only probe if source is different from video1 (not a fallback)
+                    elif source != video1_source:
+                        width, height = self.probe_video_resolution(stream_index, source)
+                        self._detected_resolutions[stream_index] = (width, height)
+                    else:
+                        # Stream is using video1 as fallback, skip probing
+                        self.logger.debug(f"{stream_index} using video1 source as fallback, using default resolution")
+            except NotImplementedError:
+                # If get_stream_source is not implemented, skip probing this stream
+                self.logger.debug(f"{stream_index} not implemented, using defaults")
+                break  # No need to try other streams if method not implemented
+            except Exception as e:
+                # If stream probe fails, use the default resolution for that stream
+                if stream_index == "video1":
+                    # video1 is required, so keep the default
+                    self.logger.warning(f"Could not probe {stream_index}: {e}, using defaults")
+                else:
+                    # For video2/video3, silently use their default resolutions
+                    self.logger.debug(f"Could not probe {stream_index}, using default resolution")
         
         await self.send(
             self.gen_response(
@@ -591,7 +622,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 20,
                         "gopModel": 0,
-                        "height": self._detected_height,
+                        "height": self._detected_resolutions["video1"][1],
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -625,7 +656,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": self._detected_width,
+                        "width": self._detected_resolutions["video1"][0],
                     },
                     "video2": {
                         "M": 1,
@@ -653,7 +684,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 10,
                         "gopModel": 0,
-                        "height": 704,
+                        "height": self._detected_resolutions["video2"][1],
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -687,7 +718,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 1280,
+                        "width": self._detected_resolutions["video2"][0],
                     },
                     "video3": {
                         "M": 1,
@@ -715,7 +746,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 15,
                         "gopModel": 0,
-                        "height": 360,
+                        "height": self._detected_resolutions["video3"][1],
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -749,7 +780,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 640,
+                        "width": self._detected_resolutions["video3"][0],
                     },
                     "vinFps": 30,
                 },
