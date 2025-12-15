@@ -13,3 +13,5 @@ MANIFEST.in
 /.idea/
 /node_modules
 tools/frigate-events.log
+tools/config.json
+*.log
