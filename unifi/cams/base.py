@@ -39,8 +39,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_event_id: int = 0
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
-        self._motion_last_descriptor: Optional[dict[str, Any]] = None
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
+        
+        # Video resolution detected from source (will be probed during init_adoption)
+        self._detected_width: int = 1920
+        self._detected_height: int = 1080
 
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
@@ -161,7 +164,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     descriptors = [custom_descriptor]
                     # Save the last descriptor for motion stop
                     self._motion_last_descriptor = custom_descriptor
-                
+
                 payload.update(
                     {
                         "objectTypes": [object_type.value],
@@ -293,7 +296,6 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._motion_event_id += 1
             self._motion_event_ts = None
             self._motion_object_type = None
-            self._motion_last_descriptor = None
 
     def update_motion_snapshot(self, path: Path) -> None:
         self._motion_snapshot = path
@@ -315,11 +317,59 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._msg_id += 1
         return self._msg_id
 
+    def probe_video_resolution(self, source_url: str) -> tuple[int, int]:
+        """Probe video source to detect width and height using ffprobe"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'json',
+                '-rtsp_transport', self.args.rtsp_transport,
+                source_url
+            ]
+            self.logger.info(f"Probing video source: {source_url}")
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=15
+            )
+            
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if data.get('streams') and len(data['streams']) > 0:
+                    width = data['streams'][0].get('width', 1920)
+                    height = data['streams'][0].get('height', 1080)
+                    self.logger.info(f"Detected video resolution: {width}x{height}")
+                    return width, height
+                    
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Video probe timed out after 15 seconds, using defaults")
+        except json.JSONDecodeError as e:
+            self.logger.warning(f"Could not parse ffprobe output: {e}, using defaults")
+        except Exception as e:
+            self.logger.warning(f"Could not probe video source: {e}, using defaults")
+        
+        # Fallback to defaults
+        self.logger.info("Using default resolution: 1920x1080")
+        return 1920, 1080
+
     async def init_adoption(self) -> None:
         self.logger.info(
             f"Adopting with token [{self.args.token}] and mac [{self.args.mac}]"
         )
-        features = await self.get_feature_flags()
+        
+        # Probe video resolution from video1 stream
+        try:
+            source = await self.get_stream_source("video1")
+            self._detected_width, self._detected_height = self.probe_video_resolution(source)
+        except Exception as e:
+            self.logger.warning(f"Could not probe video source: {e}, using defaults 1920x1080")
+            self._detected_width = 1920
+            self._detected_height = 1080
+        
         await self.send(
             self.gen_response(
                 "ubnt_avclient_hello",
@@ -340,7 +390,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "totalLoad": 0.5474,
                     "upgradeTimeoutSec": 150,
                     "uptime": int(self.get_uptime()),
-                    "features": features,
+                    "features": await self.get_feature_flags(),
                 },
             ),
         )
@@ -349,13 +399,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         pass
 
     async def process_param_agreement(self, msg: AVClientRequest) -> AVClientResponse:
-        features = await self.get_feature_flags()
         return self.gen_response(
             "ubnt_avclient_paramAgreement",
             msg["messageId"],
             {
                 "authToken": self.args.token,
-                "features": features,
+                "features": await self.get_feature_flags(),
             },
         )
 
@@ -425,7 +474,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             msg["messageId"],
             payload,
         )
-
+  
     async def process_video_settings(self, msg: AVClientRequest) -> AVClientResponse:
         vid_dst = {
             "video1": ["file:///dev/null"],
@@ -438,8 +487,12 @@ class UnifiCamBase(metaclass=ABCMeta):
                 if v:
                     if "avSerializer" in v:
                         vid_dst[k] = v["avSerializer"]["destinations"]
-                        if "/dev/null" in vid_dst[k]:
+                        # Check if any destination contains /dev/null (means stop stream)
+                        if any("/dev/null" in dest for dest in vid_dst[k]):
                             self.stop_video_stream(k)
+                            # Remove stream from tracking when stopping
+                            if k in self._streams:
+                                del self._streams[k]
                         elif "parameters" in v["avSerializer"]:
                             self._streams[k] = stream = v["avSerializer"]["parameters"][
                                 "streamName"
@@ -538,7 +591,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 20,
                         "gopModel": 0,
-                        "height": 1440,
+                        "height": self._detected_height,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -572,7 +625,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 2560,
+                        "width": self._detected_width,
                     },
                     "video2": {
                         "M": 1,
@@ -911,7 +964,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             msg["messageId"],
             {},
         )
-
+    
     def gen_response(
         self, name: str, response_to: int = 0, payload: Optional[dict[str, Any]] = None
     ) -> AVClientResponse:
@@ -1026,7 +1079,6 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f"Received unhandled message type: {fn}. "
                 f"Message contents: {m}"
             )
-
         if res is not None:
             await self.send(res)
 
@@ -1068,26 +1120,71 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
                 f' {self.args.rtsp_transport} -i "{source}"'
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
-                f" streamName={stream_name} -f {self.args.format} - | {sys.executable} -m"
-                " unifi.clock_sync"
-                f" --timestamp-modifier {self.args.timestamp_modifier} | nc"
+                f" streamName={stream_name} -f {self.args.format} - "
+                f" | {sys.executable} -m unifi.clock_sync --timestamp-modifier {self.args.timestamp_modifier} --audio-offset -4000"
+                f" | nc"
                 f" {destination[0]} {destination[1]}"
             )
 
             if is_dead:
-                self.logger.warning(f"Previous ffmpeg process for {stream_index} died.")
+                exit_code = self._ffmpeg_handles[stream_index].poll()
+                self.logger.warning(f"Previous ffmpeg process for {stream_index} died with exit code {exit_code}.")
 
             self.logger.info(
                 f"Spawning ffmpeg for {stream_index} ({stream_name}): {cmd}"
             )
+            # Start process in a new process group so we can kill the entire pipeline
+            import os
             self._ffmpeg_handles[stream_index] = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True,
+                cmd, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL, 
+                shell=True,
+                preexec_fn=os.setsid  # Create new process group
             )
 
     def stop_video_stream(self, stream_index: str):
         if stream_index in self._ffmpeg_handles:
             self.logger.info(f"Stopping stream {stream_index}")
-            self._ffmpeg_handles[stream_index].kill()
+            proc = self._ffmpeg_handles[stream_index]
+            
+            # Check if process is already dead
+            if proc.poll() is not None:
+                self.logger.debug(f"Process for {stream_index} already terminated with code {proc.poll()}")
+                del self._ffmpeg_handles[stream_index]
+                return
+            
+            try:
+                # Terminate the process group to kill all processes in the pipeline
+                import os
+                import signal
+                pgid = os.getpgid(proc.pid)
+                self.logger.debug(f"Sending SIGTERM to process group {pgid} for {stream_index}")
+                os.killpg(pgid, signal.SIGTERM)
+                
+                # Wait for graceful shutdown
+                try:
+                    proc.wait(timeout=2)
+                    self.logger.debug(f"Stream {stream_index} terminated gracefully")
+                except subprocess.TimeoutExpired:
+                    self.logger.warning(f"Stream {stream_index} did not terminate gracefully, sending SIGKILL")
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                        proc.wait(timeout=1)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        pass
+                        
+            except (ProcessLookupError, PermissionError, AttributeError, OSError) as e:
+                self.logger.debug(f"Error stopping {stream_index}: {e}, trying proc.kill()")
+                # Fall back to killing just the parent process
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+            
+            # Remove from handles
+            del self._ffmpeg_handles[stream_index]
 
     async def close(self):
         self.logger.info("Cleaning up instance")
