@@ -148,7 +148,7 @@ async function injectEventLifecycle(client, camera, position) {
     console.log(`Bounding box: [${box.join(', ')}] (${BOX_SIZE}x${BOX_SIZE} pixels)`);
 
     // Send "new" event
-    console.log('[1/3] Sending "new" event...');
+    console.log('[1/3] Sending "new" event... to', camera);
     const newEvent = createEventPayload('new', eventId, camera, box, false);
     client.publish(config.frigateTopic, JSON.stringify(newEvent));
     const newTimestamp = new Date().toISOString();
@@ -157,7 +157,7 @@ async function injectEventLifecycle(client, camera, position) {
     await new Promise(resolve => setTimeout(resolve, 2000));
 
     // Send "update" event
-    console.log('[2/3] Sending "update" event...');
+    console.log('[2/3] Sending "update" event... to', camera);
     const updateEvent = createEventPayload('update', eventId, camera, box, false);
     client.publish(config.frigateTopic, JSON.stringify(updateEvent));
     const updateTimestamp = new Date().toISOString();
@@ -166,7 +166,7 @@ async function injectEventLifecycle(client, camera, position) {
     await new Promise(resolve => setTimeout(resolve, 2000));
 
     // Send "end" event
-    console.log('[3/3] Sending "end" event...');
+    console.log('[3/3] Sending "end" event... to', camera);
     const endEvent = createEventPayload('end', eventId, camera, box, true);
     client.publish(config.frigateTopic, JSON.stringify(endEvent));
     const endTimestamp = new Date().toISOString();
