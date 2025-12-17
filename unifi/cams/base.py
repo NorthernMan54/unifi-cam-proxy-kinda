@@ -144,6 +144,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         self,
         object_type: Optional[SmartDetectObjectType] = None,
         custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
     ) -> None:
         if not self._motion_event_ts:
             payload: dict[str, Any] = {
@@ -152,7 +153,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "clockMonotonic": int(self.get_uptime()),
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
-                "clockWall": int(round(time.time() * 1000)),
+                "clockWall": event_timestamp or int(round(time.time() * 1000)),
                 "edgeType": "start",
                 "eventId": self._motion_event_id,
                 "eventType": "motion",
@@ -207,6 +208,7 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def trigger_motion_update(
         self,
         custom_descriptor: Optional[dict[str, Any]] = None,
+                event_timestamp: Optional[float] = None,
     ) -> None:
         """Send a motion update (moving) event with updated descriptor information."""
         if self._motion_event_ts and self._motion_object_type:
@@ -218,12 +220,12 @@ class UnifiCamBase(metaclass=ABCMeta):
                 self._motion_last_descriptor = custom_descriptor
             
             payload: dict[str, Any] = {
-                "clockBestMonotonic": int(self.get_uptime()),
-                "clockBestWall": int(round(self._motion_event_ts * 1000)),
+                "clockBestMonotonic": 0,
+                "clockBestWall": 0,
                 "clockMonotonic": int(self.get_uptime()),
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
-                "clockWall": int(round(time.time() * 1000)),
+                "clockWall": event_timestamp or int(round(time.time() * 1000)),
                 "edgeType": "moving",
                 "eventId": self._motion_event_id,
                 "eventType": "motion",
@@ -249,17 +251,18 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def trigger_motion_stop(
         self,
         custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
     ) -> None:
         motion_start_ts = self._motion_event_ts
         motion_object_type = self._motion_object_type
         if motion_start_ts:
             payload: dict[str, Any] = {
-                "clockBestMonotonic": int(self.get_uptime()),
-                "clockBestWall": int(round(motion_start_ts * 1000)),
+                "clockBestMonotonic": 0,
+                "clockBestWall": 0,
                 "clockMonotonic": int(self.get_uptime()),
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
-                "clockWall": int(round(time.time() * 1000)),
+                "clockWall": event_timestamp or int(round(time.time() * 1000)),
                 "edgeType": "stop",
                 "eventId": self._motion_event_id,
                 "eventType": "motion",
@@ -281,7 +284,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "edgeType": "leave",
                         "zonesStatus": {"0": {"score": 48}},
                         "smartDetectSnapshot": "motionsnap.jpg",
-                        "displayTimeoutMSec": 10000,
+                        "displayTimeoutMSec": 1000,
                         "descriptors": descriptors,
                     }
                 )
