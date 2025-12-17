@@ -1121,7 +1121,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f' {self.args.rtsp_transport} -i "{source}"'
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
                 f" streamName={stream_name} -f {self.args.format} - "
-                f" | {sys.executable} -m unifi.clock_sync --timestamp-modifier {self.args.timestamp_modifier} --audio-offset -4000"
+                f" | {sys.executable} -m unifi.clock_sync --timestamp-modifier {self.args.timestamp_modifier}"
                 f" | nc"
                 f" {destination[0]} {destination[1]}"
             )
