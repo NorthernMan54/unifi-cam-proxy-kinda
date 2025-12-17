@@ -18,10 +18,34 @@ class RTSPCam(UnifiCamBase):
         self.snapshot_stream = None
         self.runner = None
         self.stream_source = dict()
-        for i, stream_index in enumerate(["video1", "video2", "video3"]):
-            if not i < len(self.args.source):
-                i = -1
-            self.stream_source[stream_index] = self.args.source[i]
+        self.configured_streams = set()  # Track which streams were explicitly configured
+        
+        # Support both old --source format and new --video1/2/3 format
+        if hasattr(args, 'source') and args.source:
+            # Legacy format: --source URL1 [URL2] [URL3]
+            # In legacy mode, all three streams are considered configured
+            for i, stream_index in enumerate(["video1", "video2", "video3"]):
+                if i < len(args.source):
+                    self.stream_source[stream_index] = args.source[i]
+                else:
+                    self.stream_source[stream_index] = args.source[0]
+                self.configured_streams.add(stream_index)
+        else:
+            # New format: --video1 URL1 [--video2 URL2] [--video3 URL3]
+            if not args.video1:
+                raise ValueError("Either --source or --video1 must be provided")
+            
+            # Only set stream sources for explicitly configured streams
+            self.stream_source["video1"] = args.video1
+            self.configured_streams.add("video1")
+            
+            if args.video2:
+                self.stream_source["video2"] = args.video2
+                self.configured_streams.add("video2")
+            if args.video3:
+                self.stream_source["video3"] = args.video3
+                self.configured_streams.add("video3")
+        
         if not self.args.snapshot_url:
             self.start_snapshot_stream()
 
@@ -32,8 +56,26 @@ class RTSPCam(UnifiCamBase):
             "--source",
             "-s",
             nargs="+",
-            required=True,
-            help="Source(s) for up to three streams in order of descending quality",
+            required=False,
+            help="Source(s) for up to three streams in order of descending quality (deprecated, use --video1/2/3)",
+        )
+        parser.add_argument(
+            "--video1",
+            type=str,
+            required=False,
+            help="RTSP source for high quality video stream (required if --source not provided)",
+        )
+        parser.add_argument(
+            "--video2",
+            type=str,
+            required=False,
+            help="RTSP source for medium quality video stream (optional, defaults to video1)",
+        )
+        parser.add_argument(
+            "--video3",
+            type=str,
+            required=False,
+            help="RTSP source for low quality video stream (optional, defaults to video1)",
         )
         parser.add_argument(
             "--http-api",
@@ -52,10 +94,12 @@ class RTSPCam(UnifiCamBase):
 
     def start_snapshot_stream(self) -> None:
         if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
+            # Use video3 (lowest quality) for snapshots
+            snapshot_source = self.stream_source.get("video3", self.stream_source["video1"])
             cmd = (
                 f"AV_LOG_FORCE_NOCOLOR=1 ffmpeg -loglevel level+{self.args.loglevel} "
                 f"-nostdin -y -re -rtsp_transport {self.args.rtsp_transport} "
-                f'-i "{self.args.source[-1]}" '
+                f'-i "{snapshot_source}" '
                 "-r 1 "
                 f"-update 1 {self.snapshot_dir}/screen.jpg"
             )
@@ -105,4 +149,9 @@ class RTSPCam(UnifiCamBase):
             self.snapshot_stream.kill()
 
     async def get_stream_source(self, stream_index: str) -> str:
-        return self.stream_source[stream_index]
+        # Return source if stream is explicitly configured
+        if stream_index in self.stream_source:
+            return self.stream_source[stream_index]
+        # For unconfigured streams, return video1 as fallback for actual streaming
+        # This allows video2/video3 to use video1's stream if they weren't configured
+        return self.stream_source.get("video1", "")

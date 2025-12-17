@@ -304,8 +304,9 @@ class FrigateCam(RTSPCam):
                 custom_descriptor = self.build_descriptor_from_frigate_msg(
                     frigate_msg, object_type
                 )
-                await self.trigger_motion_start(object_type, custom_descriptor)
-                
+                start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)
+                await self.trigger_motion_start(object_type, custom_descriptor, start_time_ms)
+
             elif event_type == "update":
                 if event_id in self.active_events:
                     # Update last_update timestamp
@@ -319,9 +320,10 @@ class FrigateCam(RTSPCam):
                     custom_descriptor = self.build_descriptor_from_frigate_msg(
                         frigate_msg, object_type
                     )
-                    
+
+                    frame_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)   
                     # Send moving update with updated bounding box
-                    await self.trigger_motion_update(custom_descriptor)
+                    await self.trigger_motion_update(custom_descriptor, frame_time_ms)
                     
                     self.logger.debug(
                         f"Sent moving update for event {event_id}. "
@@ -350,7 +352,7 @@ class FrigateCam(RTSPCam):
                     )
                     # Save it so trigger_motion_stop can use it
                     self._motion_last_descriptor = final_descriptor
-                    
+                    end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000)
                     if snapshot_ready:
                         # Wait for the best snapshot to be ready before ending the motion event
                         self.logger.info(f"Frigate: Awaiting snapshot (id: {event_id})")
@@ -365,13 +367,13 @@ class FrigateCam(RTSPCam):
                             f"Frigate: Ending {event_data['label']} motion event (id: {event_id}). "
                             f"Duration: {current_time - event_data['started_at']:.1f}s"
                         )
-                        await self.trigger_motion_stop()
+                        await self.trigger_motion_stop(self._motion_last_descriptor, end_time_ms)
                     else:
                         self.logger.warning(
                             f"MISSED EVENT: Received end event (id={event_id}) but "
                             f"snapshot_ready is not set. Event state may be corrupted."
                         )
-                        await self.trigger_motion_stop()
+                        await self.trigger_motion_stop(self._motion_last_descriptor, end_time_ms)
                     
                     # Clean up event
                     del self.active_events[event_id]
