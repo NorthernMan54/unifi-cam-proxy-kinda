@@ -3,9 +3,11 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
+import aiohttp
 import backoff
 from aiomqtt import Client, Message
 from aiomqtt.exceptions import MqttError
@@ -18,11 +20,10 @@ class FrigateCam(RTSPCam):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
         self.args = args
-        self.event_id: Optional[str] = None
-        self.event_label: Optional[str] = None
-        self.event_snapshot_ready = None
-        # Track multiple concurrent events
-        self.active_events: dict[str, dict[str, Any]] = {}
+        # Map Frigate event IDs to UniFi event IDs for tracking
+        self.frigate_to_unifi_event_map: dict[str, int] = {}
+        # Store snapshot readiness per Frigate event ID
+        self.event_snapshot_ready: dict[str, asyncio.Event] = {}
         self.event_timeout_seconds = 60
 
     @classmethod
@@ -64,6 +65,12 @@ class FrigateCam(RTSPCam):
             default=720,
             type=int,
             help="Frigate detection frame height in pixels (default: 720)",
+        )
+        parser.add_argument(
+            "--frigate-http-url",
+            required=False,
+            type=str,
+            help="Frigate HTTP API URL (e.g., http://frigate:5000). If provided, snapshots will be fetched via HTTP instead of MQTT.",
         )
 
     async def get_feature_flags(self) -> dict[str, Any]:
@@ -168,6 +175,97 @@ class FrigateCam(RTSPCam):
         
         return descriptor
 
+    async def fetch_snapshot_from_api(
+        self, event_id: str, snapshot_type: str = "snapshot"
+    ) -> Optional[Path]:
+        """
+        Fetch a specific snapshot type from Frigate HTTP API.
+        
+        Args:
+            event_id: Frigate event ID
+            snapshot_type: Type of snapshot - "snapshot" (default), "thumbnail", or "clip"
+        
+        Returns:
+            Path to temporary file with snapshot, or None if fetch failed.
+        """
+        if not self.args.frigate_http_url:
+            return None
+        
+        # Frigate API endpoints for different snapshot types
+        if snapshot_type == "thumbnail":
+            url = f"{self.args.frigate_http_url}/api/events/{event_id}/thumbnail.jpg"
+        elif snapshot_type == "clip":
+            url = f"{self.args.frigate_http_url}/api/events/{event_id}/clip.mp4"
+        else:  # snapshot
+            url = f"{self.args.frigate_http_url}/api/events/{event_id}/snapshot.jpg"
+        
+        self.logger.debug(f"Fetching {snapshot_type} for event {event_id} from {url}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                    if response.status == 200:
+                        image_data = await response.read()
+                        suffix = ".mp4" if snapshot_type == "clip" else ".jpg"
+                        f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                        f.write(image_data)
+                        f.close()
+                        self.logger.info(
+                            f"Successfully fetched {snapshot_type} for event {event_id} from API "
+                            f"({len(image_data)} bytes) -> {f.name}"
+                        )
+                        return Path(f.name)
+                    else:
+                        self.logger.warning(
+                            f"Failed to fetch {snapshot_type} for event {event_id}: "
+                            f"HTTP {response.status}"
+                        )
+                        return None
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Timeout fetching {snapshot_type} for event {event_id}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error fetching {snapshot_type} for event {event_id}: {e}")
+            return None
+
+    async def fetch_all_snapshots_from_api(
+        self, event_id: str
+    ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
+        """
+        Fetch all three snapshot types from Frigate HTTP API.
+        
+        Returns:
+            Tuple of (snapshot_full, snapshot_crop/thumbnail, heatmap)
+            - snapshot_full: Full resolution snapshot (for FoV)
+            - snapshot_crop: Thumbnail/cropped version (for cropped view)
+            - heatmap: Use full snapshot as heatmap (Frigate doesn't provide separate heatmap)
+        """
+        if not self.args.frigate_http_url:
+            return (None, None, None)
+        
+        self.logger.debug(f"Fetching all snapshots for event {event_id}")
+        
+        # Fetch both full snapshot and thumbnail in parallel
+        results = await asyncio.gather(
+            self.fetch_snapshot_from_api(event_id, "snapshot"),
+            self.fetch_snapshot_from_api(event_id, "thumbnail"),
+            return_exceptions=True
+        )
+        
+        snapshot_full = results[0] if not isinstance(results[0], Exception) else None
+        snapshot_crop = results[1] if not isinstance(results[1], Exception) else None
+        
+        # Use full snapshot as heatmap (Frigate doesn't provide separate heatmap)
+        heatmap = snapshot_full
+        
+        self.logger.info(
+            f"Fetched snapshots for event {event_id}: "
+            f"full={'✓' if snapshot_full else '✗'}, "
+            f"crop={'✓' if snapshot_crop else '✗'}, "
+            f"heatmap={'✓' if heatmap else '✗'}"
+        )
+        
+        return (snapshot_full, snapshot_crop, heatmap)
+
     async def run(self) -> None:
         has_connected = False
 
@@ -196,42 +294,158 @@ class FrigateCam(RTSPCam):
                                 f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/+/snapshot"
                             ):
                                 tg.create_task(self.handle_snapshot_event(message))
+                            elif message.topic.matches(
+                                f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/motion"
+                            ):
+                                tg.create_task(self.handle_motion_event(message))   
             except MqttError:
                 if not has_connected:
                     raise
 
         await mqtt_connect()
 
+    async def handle_motion_event(self, message: Message) -> None:
+        """Handle raw motion events from Frigate (if needed)"""
+        if not isinstance(message.payload, bytes):
+            self.logger.warning(
+                f"Unexpectedly received non-bytes payload for motion event: {message.payload}"
+            )
+            return
+        msg = message.payload.decode()
+        # self.logger.debug(f"Received raw motion event: {msg}")
+        if msg == "ON":
+            self.logger.debug("Frigate motion event: ON")
+            await self.trigger_motion_start()
+        elif msg == "OFF":
+            self.logger.debug("Frigate motion event: OFF")
+            await self.trigger_motion_stop()
+
+    async def grab_most_recent_event_snapshot(self) -> Optional[Path]:
+        """
+        Grab the most recent snapshot based on event API.
+        Queries Frigate's events API to find the most recent event with a snapshot,
+        then fetches the snapshot image.
+        """
+        if not self.args.frigate_http_url:
+            self.logger.warning("Cannot grab recent event snapshot: frigate_http_url not configured")
+            return None
+        
+        # Build the events API URL
+        events_url = f"{self.args.frigate_http_url}/api/events"
+        params = {
+            "camera": self.args.frigate_camera,
+            "limit": 1,
+            "has_snapshot": 1
+        }
+        
+        self.logger.debug(f"Fetching most recent event from {events_url} with params {params}")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Fetch the most recent event
+                async with session.get(
+                    events_url, 
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as response:
+                    if response.status != 200:
+                        self.logger.warning(
+                            f"Failed to fetch recent events: HTTP {response.status}"
+                        )
+                        return None
+                    
+                    events = await response.json()
+                    
+                    if not events or len(events) == 0:
+                        self.logger.warning("No recent events with snapshots found")
+                        return None
+                    
+                    # Get the most recent event
+                    most_recent_event = events[0]
+                    event_id = most_recent_event.get("id")
+                    
+                    if not event_id:
+                        self.logger.warning("Most recent event missing 'id' field")
+                        return None
+                    
+                    # Log full event details
+                    # self.logger.debug(f"Most recent event details: {json.dumps(most_recent_event, indent=2)}")
+                    
+                    # Log summary
+                    start_time = most_recent_event.get("start_time")
+                    end_time = most_recent_event.get("end_time")
+                    event_data = most_recent_event.get("data", {})
+                    
+                    self.logger.info(
+                        f"Event summary: id={event_id}, "
+                        f"label={most_recent_event.get('label')}, "
+                        f"camera={most_recent_event.get('camera')}, "
+                        f"start_time={start_time}, "
+                        f"end_time={end_time}, "
+                        f"score={event_data.get('score')}, "
+                        f"top_score={event_data.get('top_score')}, "
+                        f"box={event_data.get('box')}"
+                    )
+                    
+                    # Now fetch the snapshot for this event
+                    snapshot_path = await self.fetch_snapshot_from_api(event_id)
+                    
+                    if snapshot_path:
+                        self.logger.info(
+                            f"Successfully retrieved snapshot for most recent event {event_id}"
+                        )
+                    
+                    return snapshot_path
+                    
+        except asyncio.TimeoutError:
+            self.logger.warning("Timeout fetching most recent event")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error fetching most recent event snapshot: {e}")
+            return None
+
     async def monitor_event_timeouts(self) -> None:
         """Monitor active events and end those that haven't received updates in 60 seconds"""
         while True:
             await asyncio.sleep(5)  # Check every 5 seconds
-            current_time = asyncio.get_event_loop().time()
-            expired_events = []
+            current_time = time.time()
+            expired_frigate_events = []
             
-            for event_id, event_data in self.active_events.items():
-                time_since_update = current_time - event_data["last_update"]
-                if time_since_update > self.event_timeout_seconds:
-                    expired_events.append(event_id)
+            # Check all active smart detect events (from base class)
+            for unifi_event_id, event_data in list(self._active_smart_events.items()):
+                time_since_start = current_time - event_data["start_time"]
+                # Use a longer timeout since we don't track last_update in base class
+                if time_since_start > self.event_timeout_seconds:
+                    # Find the Frigate event ID that maps to this UniFi event ID
+                    frigate_event_id = None
+                    for fid, uid in self.frigate_to_unifi_event_map.items():
+                        if uid == unifi_event_id:
+                            frigate_event_id = fid
+                            break
+                    
+                    expired_frigate_events.append((frigate_event_id, unifi_event_id))
                     self.logger.warning(
-                        f"EVENT TIMEOUT: Event {event_id} ({event_data['label']}) has not "
-                        f"received updates for {time_since_update:.1f}s. Force ending event."
+                        f"EVENT TIMEOUT: Event {unifi_event_id} (Frigate: {frigate_event_id}, "
+                        f"{event_data['object_type'].value}) has been active for "
+                        f"{time_since_start:.1f}s. Force ending event."
                     )
             
             # End expired events
-            for event_id in expired_events:
-                event_data = self.active_events[event_id]
+            for frigate_event_id, unifi_event_id in expired_frigate_events:
+                event_data = self._active_smart_events.get(unifi_event_id)
+                if not event_data:
+                    continue
+                    
                 try:
-                    # Set the old event_id context for trigger_motion_stop
-                    self.event_id = event_id
-                    self.event_label = event_data["label"]
-                    await self.trigger_motion_stop()
+                    await self.trigger_motion_stop(object_type=event_data["object_type"])
                 except Exception as e:
-                    self.logger.exception(f"Error ending timed out event {event_id}: {e}")
+                    self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
                 finally:
-                    del self.active_events[event_id]
-                    self.event_id = None
-                    self.event_label = None
+                    # Clean up mappings
+                    if frigate_event_id and frigate_event_id in self.frigate_to_unifi_event_map:
+                        del self.frigate_to_unifi_event_map[frigate_event_id]
+                    if frigate_event_id and frigate_event_id in self.event_snapshot_ready:
+                        del self.event_snapshot_ready[frigate_event_id]
 
     async def handle_detection_event(self, message: Message) -> None:
         if not isinstance(message.payload, bytes):
@@ -258,7 +472,21 @@ class FrigateCam(RTSPCam):
             self.logger.debug(
                     f"Frigate: Received: {frigate_msg} "
                 )
+
+            before_snapshot_time = frigate_msg.get('before', {}).get('snapshot', {}).get('frame_time', 'N/A') if frigate_msg.get('before', {}).get('snapshot') else 'N/A'
+            after_snapshot_time = frigate_msg.get('after', {}).get('snapshot', {}).get('frame_time', 'N/A') if frigate_msg.get('after', {}).get('snapshot') else 'N/A'
             
+            before_data = frigate_msg.get('before', {})
+            after_data = frigate_msg.get('after', {})
+            
+            self.logger.debug(
+                f"Times - before: frame={before_data.get('frame_time', 'N/A')}, snapshot_frame={before_snapshot_time}, start={before_data.get('start_time', 'N/A')}, end={before_data.get('end_time', 'N/A')} | after: frame={after_data.get('frame_time', 'N/A')}, snapshot_frame={after_snapshot_time}, start={after_data.get('start_time', 'N/A')}, end={after_data.get('end_time', 'N/A')}"
+            )
+
+            self.logger.debug(
+                f"{before_data.get('frame_time', 'N/A')},{before_snapshot_time},{before_data.get('start_time', 'N/A')},{before_data.get('end_time', 'N/A')},{after_data.get('frame_time', 'N/A')},{after_snapshot_time},{after_data.get('start_time', 'N/A')},{after_data.get('end_time', 'N/A')}"
+            )
+
             object_type = self.label_to_object_type(label)
             if not object_type:
                 self.logger.warning(
@@ -269,35 +497,34 @@ class FrigateCam(RTSPCam):
 
             self.logger.debug(
                 f"Frigate event: type={event_type}, id={event_id}, label={label}, "
-                f"active_events={list(self.active_events.keys())}"
+                f"active_frigate_events={list(self.frigate_to_unifi_event_map.keys())}"
             )
-            
-            current_time = asyncio.get_event_loop().time()
 
             if event_type == "new":
-                if event_id in self.active_events:
+                if event_id in self.frigate_to_unifi_event_map:
                     self.logger.warning(
-                        f"Received 'new' event for already active event_id={event_id}. "
-                        f"This may indicate event was not properly ended. Re-initializing."
+                        f"Received 'new' event for already active Frigate event_id={event_id}. "
+                        f"This may indicate event was not properly ended. Stopping old event first."
                     )
+                    # Stop the old event before starting new one
+                    old_unifi_id = self.frigate_to_unifi_event_map[event_id]
+                    if old_unifi_id in self._active_smart_events:
+                        old_event = self._active_smart_events[old_unifi_id]
+                        await self.trigger_motion_stop(object_type=old_event["object_type"])
+                    del self.frigate_to_unifi_event_map[event_id]
                 
-                # Start new event
-                self.active_events[event_id] = {
-                    "label": label,
-                    "object_type": object_type,
-                    "snapshot_ready": asyncio.Event(),
-                    "last_update": current_time,
-                    "started_at": current_time,
-                }
+                # Get the current UniFi event ID (will be used for this new event)
+                unifi_event_id = self._motion_event_id
                 
-                # Set context for motion start
-                self.event_id = event_id
-                self.event_label = label
-                self.event_snapshot_ready = self.active_events[event_id]["snapshot_ready"]
+                # Store mapping from Frigate event ID to UniFi event ID
+                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
+                
+                # Create snapshot ready event for this Frigate event
+                self.event_snapshot_ready[event_id] = asyncio.Event()
                 
                 self.logger.info(
-                    f"Frigate: Starting {label} motion event (id: {event_id}). "
-                    f"Total active events: {len(self.active_events)}"
+                    f"Frigate: Starting {label} smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
                 )
                 
                 # Build custom descriptor from Frigate data
@@ -306,15 +533,35 @@ class FrigateCam(RTSPCam):
                 )
                 start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)
                 await self.trigger_motion_start(object_type, custom_descriptor, start_time_ms)
+                
+                # Fetch snapshots if available
+                has_snapshot = after_data.get('has_snapshot', False)
+                if has_snapshot and self.args.frigate_http_url:
+                    self.logger.debug(f"Event {event_id} has snapshot, fetching all types...")
+                    snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
+                    if snapshot_full or snapshot_crop or heatmap:
+                        self.update_motion_snapshots(
+                            crop=snapshot_crop,
+                            fov=snapshot_full,
+                            heatmap=heatmap
+                        )
+                        self.logger.info(
+                            f"Updated snapshots for event {event_id}: "
+                            f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
+                            f"heatmap={heatmap is not None}"
+                        )
 
             elif event_type == "update":
-                if event_id in self.active_events:
-                    # Update last_update timestamp
-                    self.active_events[event_id]["last_update"] = current_time
+                if event_id in self.frigate_to_unifi_event_map:
+                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
                     
-                    # Set context for motion update
-                    self.event_id = event_id
-                    self.event_label = label
+                    # Verify the UniFi event is still active
+                    if unifi_event_id not in self._active_smart_events:
+                        self.logger.warning(
+                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
+                            f"but that event is not active. Skipping update."
+                        )
+                        return
                     
                     # Build updated descriptor from Frigate data
                     custom_descriptor = self.build_descriptor_from_frigate_msg(
@@ -323,71 +570,114 @@ class FrigateCam(RTSPCam):
 
                     frame_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)   
                     # Send moving update with updated bounding box
-                    await self.trigger_motion_update(custom_descriptor, frame_time_ms)
+                    await self.trigger_motion_update(custom_descriptor, frame_time_ms, object_type)
                     
+                    # Fetch updated snapshots if available
+                    has_snapshot = after_data.get('has_snapshot', False)
+                    if has_snapshot and self.args.frigate_http_url:
+                        self.logger.debug(f"Event {event_id} has updated snapshot, fetching all types...")
+                        snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
+                        if snapshot_full or snapshot_crop or heatmap:
+                            self.update_motion_snapshots(
+                                crop=snapshot_crop,
+                                fov=snapshot_full,
+                                heatmap=heatmap
+                            )
+                            self.logger.debug(
+                                f"Updated snapshots for event {event_id}: "
+                                f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
+                                f"heatmap={heatmap is not None}"
+                            )
+                    
+                    event_data = self._active_smart_events[unifi_event_id]
+                    event_age = time.time() - event_data["start_time"]
                     self.logger.debug(
-                        f"Sent moving update for event {event_id}. "
-                        f"Age: {current_time - self.active_events[event_id]['started_at']:.1f}s"
+                        f"Sent moving update for smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                        f"Age: {event_age:.1f}s"
                     )
                 else:
                     self.logger.warning(
-                        f"MISSED EVENT: Received 'update' for unknown event_id={event_id} "
+                        f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
                     
             elif event_type == "end":
-                if event_id in self.active_events:
-                    event_data = self.active_events[event_id]
-                    snapshot_ready = event_data["snapshot_ready"]
+                if event_id in self.frigate_to_unifi_event_map:
+                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
                     
-                    # Set context for motion stop
-                    self.event_id = event_id
-                    self.event_label = event_data["label"]
-                    self.event_snapshot_ready = snapshot_ready
+                    # Verify the UniFi event is still active
+                    if unifi_event_id not in self._active_smart_events:
+                        self.logger.warning(
+                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
+                            f"but that event is not active. Cleaning up mapping."
+                        )
+                        del self.frigate_to_unifi_event_map[event_id]
+                        if event_id in self.event_snapshot_ready:
+                            del self.event_snapshot_ready[event_id]
+                        return
+                    
+                    event_data = self._active_smart_events[unifi_event_id]
                     
                     # Build final descriptor from end event data
                     # This will be included in the "leave" event by trigger_motion_stop
                     final_descriptor = self.build_descriptor_from_frigate_msg(
                         frigate_msg, object_type
                     )
-                    # Save it so trigger_motion_stop can use it
-                    self._motion_last_descriptor = final_descriptor
                     end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000)
-                    if snapshot_ready:
-                        # Wait for the best snapshot to be ready before ending the motion event
-                        self.logger.info(f"Frigate: Awaiting snapshot (id: {event_id})")
-                        try:
-                            await asyncio.wait_for(snapshot_ready.wait(), timeout=10.0)
-                        except asyncio.TimeoutError:
-                            self.logger.warning(
-                                f"Snapshot wait timeout for event {event_id}. Proceeding without snapshot."
-                            )
-                        
-                        self.logger.info(
-                            f"Frigate: Ending {event_data['label']} motion event (id: {event_id}). "
-                            f"Duration: {current_time - event_data['started_at']:.1f}s"
-                        )
-                        await self.trigger_motion_stop(self._motion_last_descriptor, end_time_ms)
-                    else:
-                        self.logger.warning(
-                            f"MISSED EVENT: Received end event (id={event_id}) but "
-                            f"snapshot_ready is not set. Event state may be corrupted."
-                        )
-                        await self.trigger_motion_stop(self._motion_last_descriptor, end_time_ms)
                     
-                    # Clean up event
-                    del self.active_events[event_id]
-                    self.event_id = None
-                    self.event_label = None
-                    self.event_snapshot_ready = None
+                    # Fetch all snapshot types - try HTTP API first, fall back to MQTT
+                    if self.args.frigate_http_url:
+                        has_snapshot = after_data.get('has_snapshot', False)
+                        if has_snapshot:
+                            self.logger.info(f"Fetching final snapshots for event {event_id}...")
+                            snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
+                            if snapshot_full or snapshot_crop or heatmap:
+                                self.update_motion_snapshots(
+                                    crop=snapshot_crop,
+                                    fov=snapshot_full,
+                                    heatmap=heatmap
+                                )
+                                self.logger.info(
+                                    f"Updated final snapshots for event {event_id}: "
+                                    f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
+                                    f"heatmap={heatmap is not None}"
+                                )
+                        else:
+                            self.logger.warning(f"Event {event_id} ended but has_snapshot=False")
+                    else:
+                        # Fall back to MQTT snapshot wait
+                        if event_id in self.event_snapshot_ready:
+                            snapshot_ready = self.event_snapshot_ready[event_id]
+                            self.logger.info(f"Frigate: Awaiting snapshot via MQTT (Frigate: {event_id})")
+                            try:
+                                await asyncio.wait_for(snapshot_ready.wait(), timeout=10.0)
+                            except asyncio.TimeoutError:
+                                self.logger.warning(
+                                    f"Snapshot wait timeout for Frigate event {event_id}. Proceeding without snapshot."
+                                )
+                    
+                    event_duration = time.time() - event_data["start_time"]
+                    self.logger.info(
+                        f"Frigate: Ending {label} smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                        f"Duration: {event_duration:.1f}s"
+                    )
+                    self.logger.info(
+                        f"{end_time_ms}, {int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)}"
+                    )
+                    await self.trigger_motion_stop(final_descriptor, end_time_ms, object_type)
+                    
+                    # Clean up mappings
+                    del self.frigate_to_unifi_event_map[event_id]
+                    if event_id in self.event_snapshot_ready:
+                        del self.event_snapshot_ready[event_id]
                     
                     self.logger.info(
                         f"Frigate: Event {event_id} ended. "
-                        f"Remaining active events: {len(self.active_events)}"
+                        f"Remaining active events: {len(self.frigate_to_unifi_event_map)}"
                     )
                 else:
                     self.logger.warning(
-                        f"MISSED EVENT: Received 'end' for unknown event_id={event_id} "
+                        f"MISSED EVENT: Received 'end' for unknown Frigate event_id={event_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
             else:
@@ -417,22 +707,34 @@ class FrigateCam(RTSPCam):
             
         snapshot_label = topic_parts[-2]
         
-        # Find matching active event by label
-        matching_event_id = None
-        for event_id, event_data in self.active_events.items():
-            if event_data["label"] == snapshot_label and not message.retain:
-                matching_event_id = event_id
-                break
+        self.logger.debug(
+            f"Received snapshot: topic={message.topic.value}, "
+            f"message={message}"
+        )
         
-        if matching_event_id:
+        # Find matching active Frigate event by label
+        # We need to match based on label since snapshots don't include event ID
+        matching_frigate_event_id = None
+        for frigate_event_id, unifi_event_id in self.frigate_to_unifi_event_map.items():
+            # Check if this UniFi event is still active and matches the label
+            if unifi_event_id in self._active_smart_events:
+                event_data = self._active_smart_events[unifi_event_id]
+                # Match by object type (person -> person, vehicle labels -> vehicle)
+                event_label = event_data["object_type"].value
+                if event_label == snapshot_label and not message.retain:
+                    matching_frigate_event_id = frigate_event_id
+                    break
+        
+        if matching_frigate_event_id:
             f = tempfile.NamedTemporaryFile(delete=False)
             f.write(message.payload)
             f.close()
             self.logger.debug(
-                f"Updating snapshot for event {matching_event_id} ({snapshot_label}) with {f.name}"
+                f"Updating snapshot for Frigate event {matching_frigate_event_id} ({snapshot_label}) with {f.name}"
             )
             self.update_motion_snapshot(Path(f.name))
-            self.active_events[matching_event_id]["snapshot_ready"].set()
+            if matching_frigate_event_id in self.event_snapshot_ready:
+                self.event_snapshot_ready[matching_frigate_event_id].set()
         else:
             self.logger.debug(
                 f"Discarding snapshot for label={snapshot_label} "

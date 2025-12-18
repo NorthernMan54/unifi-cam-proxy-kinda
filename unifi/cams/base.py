@@ -35,10 +35,28 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._msg_id: int = 0
         self._init_time: float = time.time()
         self._streams: dict[str, str] = {}
-        self._motion_snapshot: Optional[Path] = None
+        
+        # Snapshot storage - UniFi Protect requests three types:
+        # 1. motionSnapshot - Cropped image with bounding box
+        # 2. motionSnapshotFullFoV - Full size image with bounding box  
+        # 3. motionHeatmap - Heatmap visualization (use full FoV as fallback)
+        self._motion_snapshot: Optional[Path] = None  # Legacy field, typically the cropped version
+        self._motion_snapshot_crop: Optional[Path] = None  # Cropped with bounding box
+        self._motion_snapshot_fov: Optional[Path] = None  # Full field of view with bounding box
+        self._motion_heatmap: Optional[Path] = None  # Heatmap (defaults to FoV if not available)
+        
         self._motion_event_id: int = 0
+        
+        # Enhanced event tracking to support overlapping events
+        # Track both generic motion (EventAnalytics) and smart detect events (EventSmartDetect)
+        self._active_analytics_event: Optional[dict[str, Any]] = None  # Generic motion event
+        self._active_smart_events: dict[int, dict[str, Any]] = {}  # Smart detect events by event_id
+        
+        # Legacy compatibility (deprecated, use _active_* instead)
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
+        self._motion_last_descriptor: Optional[dict[str, Any]] = None
+        
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
         
         # Video resolution detected from source (will be probed during init_adoption)
@@ -146,7 +164,91 @@ class UnifiCamBase(metaclass=ABCMeta):
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
     ) -> None:
-        if not self._motion_event_ts:
+        """
+        Start a motion event. Supports both generic motion (EventAnalytics) and 
+        smart detect events (EventSmartDetect with object_type).
+        
+        EventAnalytics can wrap multiple EventSmartDetect events - the analytics event
+        represents generic motion, while smart detect events represent specific objects.
+        Multiple smart detect events can be active simultaneously.
+        """
+        current_time = time.time()
+        event_id = self._motion_event_id
+        
+        if object_type:
+            # This is a SmartDetect event for a specific object
+            # Check if we already have an active smart detect event with this event_id
+            if event_id in self._active_smart_events:
+                existing_event = self._active_smart_events[event_id]
+                self.logger.warning(
+                    f"Smart detect event {event_id} already active "
+                    f"(type: {existing_event['object_type'].value}, "
+                    f"started: {current_time - existing_event['start_time']:.1f}s ago). "
+                    f"Ignoring duplicate start for {object_type.value}."
+                )
+                return
+            
+            # Build descriptors array
+            descriptors = []
+            if custom_descriptor:
+                descriptors = [custom_descriptor]
+            
+            payload: dict[str, Any] = {
+                "clockBestMonotonic": 0,
+                "clockBestWall": 0,
+                "clockMonotonic": int(self.get_uptime()),
+                "clockStream": int(self.get_uptime()),
+                "clockStreamRate": 1000,
+                "clockWall": event_timestamp or int(round(time.time() * 1000)),
+                "edgeType": "enter",
+                "eventId": event_id,
+                "eventType": "motion",
+                "levels": {"0": 99},
+                "objectTypes": [object_type.value],
+                "zonesStatus": {"0": {"score": 99}},
+                "smartDetectSnapshot": "",
+                "displayTimeoutMSec": 5000,
+                "descriptors": descriptors,
+            }
+            
+            self.logger.info(
+                f"Starting smart detect event {event_id} for {object_type.value} "
+                f"(active smart events: {len(self._active_smart_events)})"
+            )
+            
+            await self.send(
+                self.gen_response("EventSmartDetect", payload=payload)
+            )
+            
+            # Track this smart detect event
+            self._active_smart_events[event_id] = {
+                "object_type": object_type,
+                "start_time": current_time,
+                "event_timestamp": event_timestamp,
+                "last_descriptor": custom_descriptor,
+                # UniFi Protect requests three snapshot types:
+                "snapshot_crop": None,  # motionSnapshot - cropped with bounding box
+                "snapshot_fov": None,   # motionSnapshotFullFoV - full size with bounding box
+                "heatmap": None,        # motionHeatmap - heatmap visualization
+            }
+            
+            # Update legacy compatibility fields
+            self._motion_event_ts = current_time
+            self._motion_object_type = object_type
+            self._motion_last_descriptor = custom_descriptor
+            
+        else:
+            # This is a generic EventAnalytics motion event
+            # Check if we already have an active analytics event
+            if self._active_analytics_event is not None:
+                existing_start = self._active_analytics_event['start_time']
+                self.logger.warning(
+                    f"Analytics event already active "
+                    f"(started: {current_time - existing_start:.1f}s ago). "
+                    f"Ignoring duplicate start."
+                )
+                return
+            
             payload: dict[str, Any] = {
                 "clockBestMonotonic": 0,
                 "clockBestWall": 0,
@@ -155,69 +257,202 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "clockStreamRate": 1000,
                 "clockWall": event_timestamp or int(round(time.time() * 1000)),
                 "edgeType": "start",
-                "eventId": self._motion_event_id,
+                "eventId": event_id,
                 "eventType": "motion",
-                "levels": {"0": 47},
+                "levels": {"0": 99},
                 "motionHeatmap": "",
                 "motionSnapshot": "",
             }
-            if object_type:
-                # Build descriptors array
-                descriptors = []
-                if custom_descriptor:
-                    # Use custom descriptor if provided
-                    descriptors = [custom_descriptor]
-                    # Save the last descriptor for motion stop
-                    self._motion_last_descriptor = custom_descriptor
-
-                payload.update(
-                    {
-                        "objectTypes": [object_type.value],
-                        "edgeType": "enter",
-                        "zonesStatus": {"0": {"score": 48}},
-                        "smartDetectSnapshot": "",
-                        "displayTimeoutMSec": 10000,
-                        "descriptors": descriptors,
-                    }
-                )
-
+            
             self.logger.info(
-                f"Triggering motion start (idx: {self._motion_event_id})"
-                + f" for {object_type.value}"
-                if object_type
-                else ""
+                f"Starting analytics event {event_id} "
+                f"(active smart events: {len(self._active_smart_events)})"
             )
+            
             await self.send(
-                self.gen_response(
-                    "EventSmartDetect" if object_type else "EventAnalytics",
-                    payload=payload,
-                ),
+                self.gen_response("EventAnalytics", payload=payload)
             )
-            self._motion_event_ts = time.time()
-            self._motion_object_type = object_type
-
-            # Capture snapshot at beginning of motion event for thumbnail
-            motion_snapshot_path: str = tempfile.NamedTemporaryFile(delete=False).name
-            try:
-                shutil.copyfile(await self.get_snapshot(), motion_snapshot_path)
-                self.logger.debug(f"Captured motion snapshot to {motion_snapshot_path}")
-                self._motion_snapshot = Path(motion_snapshot_path)
-            except FileNotFoundError:
-                pass
+            
+            # Track this analytics event
+            self._active_analytics_event = {
+                "event_id": event_id,
+                "start_time": current_time,
+                "event_timestamp": event_timestamp,
+            }
+            
+            # Update legacy compatibility fields
+            if not self._motion_event_ts:  # Only set if not already set by smart detect
+                self._motion_event_ts = current_time
+        
+        # Capture snapshot for the event (shared between analytics and smart detect)
+        # Only capture if this is the first event (analytics or first smart detect)
+        if not self._motion_snapshot:
+            snapshot_path = None
+            if hasattr(self, 'grab_most_recent_event_snapshot'):
+                try:
+                    self.logger.debug("Attempting to grab most recent event snapshot")
+                    snapshot_path = await self.grab_most_recent_event_snapshot()
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to grab recent event snapshot: {e}, "
+                        f"falling back to get_snapshot"
+                    )
+            
+            # Fallback to regular snapshot if recent event snapshot not available
+            if not snapshot_path:
+                motion_snapshot_path: str = tempfile.NamedTemporaryFile(delete=False).name
+                try:
+                    shutil.copyfile(await self.get_snapshot(), motion_snapshot_path)
+                    self.logger.debug(f"Captured motion snapshot to {motion_snapshot_path}")
+                    snapshot_path = Path(motion_snapshot_path)
+                except FileNotFoundError:
+                    self.logger.debug("Could not capture motion snapshot")
+            
+            if snapshot_path:
+                # Store in legacy field
+                self._motion_snapshot = snapshot_path
+                
+                # Store in new snapshot type fields
+                # By default, use the same snapshot for all three types
+                # Drivers can override update_motion_snapshots() to provide specific versions
+                self._motion_snapshot_crop = snapshot_path
+                self._motion_snapshot_fov = snapshot_path  
+                self._motion_heatmap = snapshot_path
+                
+                # Store snapshot references in smart detect event if applicable
+                if object_type and event_id in self._active_smart_events:
+                    self._active_smart_events[event_id]["snapshot_crop"] = snapshot_path
+                    self._active_smart_events[event_id]["snapshot_fov"] = snapshot_path
+                    self._active_smart_events[event_id]["heatmap"] = snapshot_path
 
     async def trigger_motion_update(
         self,
         custom_descriptor: Optional[dict[str, Any]] = None,
-                event_timestamp: Optional[float] = None,
+        event_timestamp: Optional[float] = None,
+        object_type: Optional[SmartDetectObjectType] = None,
     ) -> None:
-        """Send a motion update (moving) event with updated descriptor information."""
-        if self._motion_event_ts and self._motion_object_type:
-            # Build descriptors array
+        """
+        Send a motion update (moving) event with updated descriptor information.
+        Only applicable to SmartDetect events (not generic EventAnalytics).
+        
+        Args:
+            custom_descriptor: Updated descriptor data (bounding box, etc.)
+            event_timestamp: Optional timestamp for the event
+            object_type: Optional object type to update. If not provided, uses the
+                        most recent active smart detect event (legacy behavior).
+        """
+        event_id = self._motion_event_id
+        
+        # Determine which event to update
+        target_object_type = object_type or self._motion_object_type
+        
+        if not target_object_type:
+            self.logger.warning(
+                "trigger_motion_update called but no object_type specified and "
+                "no active smart detect event found. Ignoring."
+            )
+            return
+        
+        # Check if we have an active smart detect event for this event_id
+        if event_id not in self._active_smart_events:
+            self.logger.warning(
+                f"trigger_motion_update called for event {event_id} "
+                f"({target_object_type.value}) but no active event found. "
+                f"Event may have already ended or never started. Ignoring."
+            )
+            return
+        
+        active_event = self._active_smart_events[event_id]
+        
+        # Verify object type matches if we're being specific
+        if active_event["object_type"] != target_object_type:
+            self.logger.warning(
+                f"trigger_motion_update called for {target_object_type.value} "
+                f"but active event {event_id} is for {active_event['object_type'].value}. "
+                f"Ignoring."
+            )
+            return
+        
+        # Build descriptors array
+        descriptors = []
+        if custom_descriptor:
+            descriptors = [custom_descriptor]
+            # Update the stored descriptor for this event
+            active_event["last_descriptor"] = custom_descriptor
+            self._motion_last_descriptor = custom_descriptor  # Legacy compatibility
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "moving",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 48},
+            "objectTypes": [target_object_type.value],
+            "zonesStatus": {"0": {"score": 48}},
+            "smartDetectSnapshot": "",
+            "displayTimeoutMSec": 10000,
+            "descriptors": descriptors,
+        }
+        
+        self.logger.debug(
+            f"Updating smart detect event {event_id} for {target_object_type.value}"
+        )
+        
+        await self.send(
+            self.gen_response("EventSmartDetect", payload=payload)
+        )
+
+    async def trigger_motion_stop(
+        self,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+        object_type: Optional[SmartDetectObjectType] = None,
+    ) -> None:
+        """
+        Stop a motion event. Can stop either a generic motion event (EventAnalytics) 
+        or a specific smart detect event (EventSmartDetect).
+        
+        Args:
+            custom_descriptor: Optional final descriptor data
+            event_timestamp: Optional timestamp for the event
+            object_type: If provided, stops a specific smart detect event. 
+                        If None, stops the generic analytics event or uses legacy behavior.
+        """
+        event_id = self._motion_event_id
+        
+        if object_type:
+            # Stop a specific SmartDetect event
+            if event_id not in self._active_smart_events:
+                self.logger.warning(
+                    f"trigger_motion_stop called for smart detect event {event_id} "
+                    f"({object_type.value}) but no active event found. "
+                    f"Event may have already ended or never started. Ignoring."
+                )
+                return
+            
+            active_event = self._active_smart_events[event_id]
+            
+            # Verify object type matches
+            if active_event["object_type"] != object_type:
+                self.logger.warning(
+                    f"trigger_motion_stop called for {object_type.value} "
+                    f"but active event {event_id} is for {active_event['object_type'].value}. "
+                    f"Ignoring."
+                )
+                return
+            
+            # Build descriptors array - use custom_descriptor if provided, 
+            # otherwise fall back to last saved descriptor for this event
             descriptors = []
             if custom_descriptor:
                 descriptors = [custom_descriptor]
-                # Save the last descriptor for motion stop
-                self._motion_last_descriptor = custom_descriptor
+            elif active_event["last_descriptor"]:
+                descriptors = [active_event["last_descriptor"]]
             
             payload: dict[str, Any] = {
                 "clockBestMonotonic": 0,
@@ -226,36 +461,67 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
                 "clockWall": event_timestamp or int(round(time.time() * 1000)),
-                "edgeType": "moving",
-                "eventId": self._motion_event_id,
+                "edgeType": "leave",
+                "eventId": event_id,
                 "eventType": "motion",
-                "levels": {"0": 48},
-                "objectTypes": [self._motion_object_type.value],
+                "levels": {"0": 49},
+                "objectTypes": [object_type.value],
                 "zonesStatus": {"0": {"score": 48}},
-                "smartDetectSnapshot": "",
-                "displayTimeoutMSec": 10000,
+                "smartDetectSnapshot": "motionsnap.jpg",
+                "displayTimeoutMSec": 1000,
                 "descriptors": descriptors,
             }
             
-            self.logger.debug(
-                f"Triggering motion update (idx: {self._motion_event_id}) "
-                f"for {self._motion_object_type.value}"
+            duration = time.time() - active_event["start_time"]
+            self.logger.info(
+                f"Stopping smart detect event {event_id} for {object_type.value} "
+                f"(duration: {duration:.1f}s, remaining smart events: "
+                f"{len(self._active_smart_events) - 1})"
             )
+            
             await self.send(
-                self.gen_response(
-                    "EventSmartDetect",
-                    payload=payload,
-                ),
+                self.gen_response("EventSmartDetect", payload=payload)
             )
-
-    async def trigger_motion_stop(
-        self,
-        custom_descriptor: Optional[dict[str, Any]] = None,
-        event_timestamp: Optional[float] = None,
-    ) -> None:
-        motion_start_ts = self._motion_event_ts
-        motion_object_type = self._motion_object_type
-        if motion_start_ts:
+            
+            # Clean up this smart detect event
+            del self._active_smart_events[event_id]
+            
+            # Update legacy compatibility fields
+            if not self._active_smart_events:
+                # No more smart detect events
+                self._motion_object_type = None
+                self._motion_last_descriptor = None
+                # Only clear motion_event_ts if no analytics event is active
+                if self._active_analytics_event is None:
+                    self._motion_event_ts = None
+            
+            # Increment event ID for next event
+            self._motion_event_id += 1
+            
+        else:
+            # Stop generic EventAnalytics motion event (or use legacy behavior)
+            # Legacy behavior: if there's an active smart detect event, stop it instead
+            if self._motion_object_type and event_id in self._active_smart_events:
+                # Recursively call with the object type from the active smart event
+                self.logger.debug(
+                    f"trigger_motion_stop called without object_type, "
+                    f"but active smart detect event found. Stopping smart detect event."
+                )
+                await self.trigger_motion_stop(
+                    custom_descriptor=custom_descriptor,
+                    event_timestamp=event_timestamp,
+                    object_type=self._motion_object_type
+                )
+                return
+            
+            # Stop the analytics event
+            if self._active_analytics_event is None:
+                self.logger.warning(
+                    f"trigger_motion_stop called for analytics event but no active event found. "
+                    f"Event may have already ended or never started. Ignoring."
+                )
+                return
+            
             payload: dict[str, Any] = {
                 "clockBestMonotonic": 0,
                 "clockBestWall": 0,
@@ -264,48 +530,119 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "clockStreamRate": 1000,
                 "clockWall": event_timestamp or int(round(time.time() * 1000)),
                 "edgeType": "stop",
-                "eventId": self._motion_event_id,
+                "eventId": event_id,
                 "eventType": "motion",
                 "levels": {"0": 49},
                 "motionHeatmap": "heatmap.png",
                 "motionSnapshot": "motionsnap.jpg",
             }
-            if motion_object_type:
-                # Build descriptors array - use custom_descriptor if provided, otherwise fall back to last saved
-                descriptors = []
-                if custom_descriptor:
-                    descriptors = [custom_descriptor]
-                elif self._motion_last_descriptor:
-                    descriptors = [self._motion_last_descriptor]
-                
-                payload.update(
-                    {
-                        "objectTypes": [motion_object_type.value],
-                        "edgeType": "leave",
-                        "zonesStatus": {"0": {"score": 48}},
-                        "smartDetectSnapshot": "motionsnap.jpg",
-                        "displayTimeoutMSec": 1000,
-                        "descriptors": descriptors,
-                    }
-                )
+            
+            duration = time.time() - self._active_analytics_event["start_time"]
             self.logger.info(
-                f"Triggering motion stop (idx: {self._motion_event_id})"
-                + f" for {motion_object_type.value}"
-                if motion_object_type
-                else ""
+                f"Stopping analytics event {event_id} (duration: {duration:.1f}s)"
             )
+            
             await self.send(
-                self.gen_response(
-                    "EventSmartDetect" if motion_object_type else "EventAnalytics",
-                    payload=payload,
-                ),
+                self.gen_response("EventAnalytics", payload=payload)
             )
+            
+            # Clean up analytics event
+            self._active_analytics_event = None
+            
+            # Update legacy compatibility fields
+            if not self._active_smart_events:
+                # No smart detect events either, fully clear state
+                self._motion_event_ts = None
+            
+            # Increment event ID for next event
             self._motion_event_id += 1
-            self._motion_event_ts = None
-            self._motion_object_type = None
 
     def update_motion_snapshot(self, path: Path) -> None:
+        """
+        Update motion snapshot (legacy method).
+        By default, updates all three snapshot types to the same path.
+        For more granular control, use update_motion_snapshots().
+        """
         self._motion_snapshot = path
+        self._motion_snapshot_crop = path
+        self._motion_snapshot_fov = path
+        self._motion_heatmap = path
+    
+    def update_motion_snapshots(
+        self,
+        crop: Optional[Path] = None,
+        fov: Optional[Path] = None,
+        heatmap: Optional[Path] = None,
+    ) -> None:
+        """
+        Update specific motion snapshot types.
+        
+        Args:
+            crop: Path to cropped snapshot with bounding box (motionSnapshot)
+            fov: Path to full field-of-view snapshot with bounding box (motionSnapshotFullFoV)
+            heatmap: Path to heatmap visualization (motionHeatmap)
+        """
+        if crop is not None:
+            self._motion_snapshot_crop = crop
+            self._motion_snapshot = crop  # Update legacy field
+        if fov is not None:
+            self._motion_snapshot_fov = fov
+        if heatmap is not None:
+            self._motion_heatmap = heatmap
+    
+    def get_active_events_summary(self) -> dict[str, Any]:
+        """
+        Get a summary of currently active motion events.
+        Useful for debugging and monitoring event state.
+        """
+        return {
+            "analytics_event": {
+                "active": self._active_analytics_event is not None,
+                "event_id": self._active_analytics_event["event_id"] if self._active_analytics_event else None,
+                "duration": time.time() - self._active_analytics_event["start_time"] 
+                    if self._active_analytics_event else None,
+            },
+            "smart_detect_events": {
+                event_id: {
+                    "object_type": event["object_type"].value,
+                    "duration": time.time() - event["start_time"],
+                    "has_descriptor": event["last_descriptor"] is not None,
+                    "has_snapshot_crop": event["snapshot_crop"] is not None,
+                    "has_snapshot_fov": event["snapshot_fov"] is not None,
+                    "has_heatmap": event["heatmap"] is not None,
+                }
+                for event_id, event in self._active_smart_events.items()
+            },
+            "total_active_events": (1 if self._active_analytics_event else 0) + len(self._active_smart_events),
+        }
+    
+    async def stop_all_motion_events(self) -> None:
+        """
+        Stop all active motion events (both analytics and smart detect).
+        Useful during cleanup or when forcing a reset of event state.
+        """
+        # Stop all smart detect events
+        smart_event_ids = list(self._active_smart_events.keys())
+        for event_id in smart_event_ids:
+            event = self._active_smart_events[event_id]
+            self.logger.info(
+                f"Force stopping smart detect event {event_id} "
+                f"({event['object_type'].value})"
+            )
+            try:
+                await self.trigger_motion_stop(object_type=event["object_type"])
+            except Exception as e:
+                self.logger.error(
+                    f"Error stopping smart detect event {event_id}: {e}"
+                )
+        
+        # Stop analytics event if active
+        if self._active_analytics_event is not None:
+            self.logger.info("Force stopping analytics event")
+            try:
+                await self.trigger_motion_stop()
+            except Exception as e:
+                self.logger.error(f"Error stopping analytics event: {e}")
 
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
         try:
@@ -950,9 +1287,22 @@ class UnifiCamBase(metaclass=ABCMeta):
         self, msg: AVClientRequest
     ) -> Optional[AVClientResponse]:
         snapshot_type = msg["payload"]["what"]
-        if snapshot_type in ["motionSnapshot", "smartDetectZoneSnapshot"]:
-            path = self._motion_snapshot
+        
+        # Select appropriate snapshot based on request type
+        if snapshot_type == "motionSnapshot":
+            # Cropped image with bounding box
+            path = self._motion_snapshot_crop or self._motion_snapshot
+        elif snapshot_type == "motionSnapshotFullFoV":
+            # Full field of view image with bounding box
+            path = self._motion_snapshot_fov or self._motion_snapshot
+        elif snapshot_type == "motionHeatmap":
+            # Heatmap visualization (use FoV as fallback)
+            path = self._motion_heatmap or self._motion_snapshot_fov or self._motion_snapshot
+        elif snapshot_type == "smartDetectZoneSnapshot":
+            # Smart detect zone snapshot (use crop)
+            path = self._motion_snapshot_crop or self._motion_snapshot
         else:
+            # Regular snapshot request
             path = await self.get_snapshot()
 
         if path and path.exists():
@@ -970,7 +1320,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     self.logger.exception("Failed to upload snapshot")
         else:
             self.logger.warning(
-                f"Snapshot file {path} is not ready yet, skipping upload"
+                f"Snapshot file {path} is not ready yet, skipping upload for {snapshot_type}"
             )
 
         if msg["responseExpected"]:
@@ -1222,7 +1572,7 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     async def close(self):
         self.logger.info("Cleaning up instance")
-        await self.trigger_motion_stop()
+        await self.stop_all_motion_events()
         self.close_streams()
 
     def close_streams(self):
