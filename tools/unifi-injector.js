@@ -113,7 +113,7 @@ function createEventPayload(type, eventId, camera, box, isEnd = false) {
         current_zones: [],
         entered_zones: [],
         has_clip: isEnd,
-        has_snapshot: true,
+        has_snapshot: false,
         attributes: {},
         current_attributes: [],
         pending_loitering: false,
@@ -150,7 +150,7 @@ async function injectEventLifecycle(client, camera, position) {
     // Send "new" event
     console.log('[1/3] Sending "new" event... to', camera);
     const newEvent = createEventPayload('new', eventId, camera, box, false);
-    client.publish(config.frigateTopic, JSON.stringify(newEvent));
+    client.publish(config.frigateEventsTopic, JSON.stringify(newEvent));
     const newTimestamp = new Date().toISOString();
     console.log(`✓ Published "new" event - box: [${box.join(', ')}] at ${newTimestamp}`);
 
@@ -159,7 +159,7 @@ async function injectEventLifecycle(client, camera, position) {
     // Send "update" event
     console.log('[2/3] Sending "update" event... to', camera);
     const updateEvent = createEventPayload('update', eventId, camera, box, false);
-    client.publish(config.frigateTopic, JSON.stringify(updateEvent));
+    client.publish(config.frigateEventsTopic, JSON.stringify(updateEvent));
     const updateTimestamp = new Date().toISOString();
     console.log(`✓ Published "update" event - box: [${box.join(', ')}] at ${updateTimestamp}`);
 
@@ -168,12 +168,21 @@ async function injectEventLifecycle(client, camera, position) {
     // Send "end" event
     console.log('[3/3] Sending "end" event... to', camera);
     const endEvent = createEventPayload('end', eventId, camera, box, true);
-    client.publish(config.frigateTopic, JSON.stringify(endEvent));
+    client.publish(config.frigateEventsTopic, JSON.stringify(endEvent));
     const endTimestamp = new Date().toISOString();
     console.log(`✓ Published "end" event - box: [${box.join(', ')}] at ${endTimestamp}`);
 
     await new Promise(resolve => setTimeout(resolve, 1000));
 }
+
+// Export for use in other scripts
+module.exports = {
+    POSITIONS,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT,
+    BOX_SIZE,
+    injectEventLifecycle
+};
 
 // Main function
 async function main() {
@@ -233,5 +242,7 @@ async function main() {
     });
 }
 
-// Run the script
-main().catch(console.error);
+// Run the script only if called directly
+if (require.main === module) {
+    main().catch(console.error);
+}

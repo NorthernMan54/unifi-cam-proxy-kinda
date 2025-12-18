@@ -15,3 +15,5 @@ MANIFEST.in
 tools/frigate-events.log
 tools/config.json
 *.log
+tools/recent-events-response.json
+tools/driveway.json

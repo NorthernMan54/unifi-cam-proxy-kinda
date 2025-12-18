@@ -15,7 +15,7 @@ try {
     // Default configuration if file doesn't exist
     config = {
         mqttBroker: 'mqtt://localhost:1883',
-        frigateTopic: 'frigate/events',
+        frigateEventsTopic: 'frigate/events',
         logFile: 'frigate-events.log',
         cameras: []
     };
@@ -67,13 +67,13 @@ client.on('connect', () => {
     }
 
     // Subscribe to Frigate events topic
-    client.subscribe(config.frigateTopic, (err) => {
+    client.subscribe(config.frigateEventsTopic, (err) => {
         if (err) {
             console.error('Subscription error:', err);
-            logEvent(`ERROR: Failed to subscribe to ${config.frigateTopic}`);
+            logEvent(`ERROR: Failed to subscribe to ${config.frigateEventsTopic}`);
         } else {
-            console.log(`Subscribed to: ${config.frigateTopic}`);
-            logEvent(`Subscribed to: ${config.frigateTopic}`);
+            console.log(`Subscribed to: ${config.frigateEventsTopic}`);
+            logEvent(`Subscribed to: ${config.frigateEventsTopic}`);
         }
     });
 });
