@@ -628,6 +628,7 @@ class FrigateCam(RTSPCam):
                     continue
                     
                 try:
+                    # End smart detect event (motion event will end separately)
                     await self.trigger_motion_stop(object_type=event_data["object_type"])
                 except Exception as e:
                     self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
@@ -704,7 +705,7 @@ class FrigateCam(RTSPCam):
                         await self.trigger_motion_stop(object_type=old_event["object_type"])
                     del self.frigate_to_unifi_event_map[event_id]
                 
-                # Get the current UniFi event ID (will be used for this new event)
+                # Get the current UniFi event ID (from the motion event Frigate already started)
                 unifi_event_id = self._motion_event_id
                 
                 # Store mapping from Frigate event ID to UniFi event ID
@@ -714,10 +715,11 @@ class FrigateCam(RTSPCam):
                 self.event_snapshot_ready[event_id] = asyncio.Event()
                 
                 self.logger.info(
-                    f"Frigate: Starting {label} smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
                 )
                 
+                # Send smart detect event as update to existing motion event
                 # Build custom descriptor from Frigate data
                 custom_descriptor = self.build_descriptor_from_frigate_msg(
                     frigate_msg, object_type
@@ -857,12 +859,14 @@ class FrigateCam(RTSPCam):
                     
                     event_duration = time.time() - event_data["start_time"]
                     self.logger.info(
-                        f"Frigate: Ending {label} smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                        f"Frigate: Ending {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
                         f"Duration: {event_duration:.1f}s"
                     )
                     self.logger.info(
                         f"{end_time_ms}, {int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)}"
                     )
+                    
+                    # End the smart detect event (motion event will end when Frigate sends motion OFF)
                     await self.trigger_motion_stop(final_descriptor, end_time_ms, object_type)
                     
                     # Clean up mappings

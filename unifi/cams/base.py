@@ -208,6 +208,35 @@ class UnifiCamBase(metaclass=ABCMeta):
             "motionDetect": ["enhanced"],
         }
 
+
+    ###
+
+    # Payload structure reference for motion events:
+    # clockBestMonotonic: i.z.number(),
+    # clockBestWall: i.z.number(),
+    # clockMonotonic: i.z.number(),
+    # clockStream: i.z.number(),
+    # clockStreamRate: i.z.number(),
+    # clockWall: i.z.number(),
+    # edgeType: i.z.enum(["start", "stop", "unknown"]),
+    # eventId: i.z.number(),
+    # eventType: i.z.enum(["motion", "pulse"]),
+    # levels: i.z.record(i.z.string(), i.z.number()).optional(),
+    # These fields appear to be only used on a stop event, and are passed as part of the snapshot getRequest
+    # motionHeatmap: i.z.string(),          - passed as filename in getRequest
+    # motionHeatmapHeight: i.z.number().optional(),
+    # motionHeatmapWidth: i.z.number().optional(),
+    # motionRawHeatmapNPZ: i.z.string().optional(),
+    # motionSnapshot: i.z.string(),         - passed as filename in getRequest
+    # motionSnapshotFullFoV: i.z.string().optional(),
+    # motionSnapshotFullFoVHeight: i.z.number().optional(),
+    # motionSnapshotFullFoVWidth: i.z.number().optional(),
+    # motionSnapshotHeight: i.z.number().optional(),
+    # motionSnapshotWidth: i.z.number().optional()
+
+    ###
+
+
     # API for subclasses
     async def trigger_motion_start(
         self,
@@ -581,8 +610,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                 if self._active_analytics_event is None:
                     self._motion_event_ts = None
             
-            # Increment event ID for next event
-            self._motion_event_id += 1
+            # Only increment event ID if there's no active analytics event wrapping this smart detect
+            # If there's an analytics event, the ID will increment when that ends
+            if self._active_analytics_event is None:
+                self._motion_event_id += 1
             
         else:
             # Stop generic EventAnalytics motion event (or use legacy behavior)
