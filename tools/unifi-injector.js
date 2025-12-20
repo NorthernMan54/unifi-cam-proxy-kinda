@@ -113,7 +113,7 @@ function createEventPayload(type, eventId, camera, box, isEnd = false) {
         current_zones: [],
         entered_zones: [],
         has_clip: isEnd,
-        has_snapshot: false,
+        has_snapshot: true,
         attributes: {},
         current_attributes: [],
         pending_loitering: false,

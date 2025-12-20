@@ -29,6 +29,57 @@ class SmartDetectObjectType(Enum):
 
 class UnifiCamBase(metaclass=ABCMeta):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
+        """
+        Initialize the camera base with configuration and state management.
+        Args:
+            args: Command-line arguments containing:
+                - cert: Path to SSL certificate file
+                - (other camera-specific configuration options)
+            logger: Logger instance for outputting diagnostic information
+        Attributes:
+            Message & Timing:
+                _msg_id (int): Counter for WebSocket message identification
+                _init_time (float): Timestamp when camera was initialized
+            Streams:
+                _streams (dict[str, str]): Mapping of stream names to URLs/identifiers
+                _ffmpeg_handles (dict[str, subprocess.Popen]): Active FFmpeg process handles by stream name
+            Snapshots:
+                # Structure: Optional[Path] - filesystem path to stored snapshot image
+                _motion_snapshot: Legacy cropped snapshot with bounding box
+                _motion_snapshot_crop: Cropped image with bounding box overlay
+                _motion_snapshot_fov: Full field-of-view image with bounding box overlay
+                _motion_heatmap: Motion heatmap visualization (falls back to FoV if unavailable)
+            Event Tracking:
+                _motion_event_id (int): Sequential identifier for motion events
+                # Structure: Optional[dict[str, Any]] with keys:
+                #   - event_id (int): Unique event identifier
+                #   - start_time (float): Event start time
+                #   - event_timestamp (Optional[float]): Event timestamp
+                #   - snapshot_filename (Optional[str]): Filename for motionSnapshot
+                #   - snapshot_fov_filename (Optional[str]): Filename for motionSnapshotFullFoV
+                #   - heatmap_filename (Optional[str]): Filename for motionHeatmap
+                _active_analytics_event: Current generic motion (EventAnalytics) event state
+                # Structure: dict[int, dict[str, Any]] - keyed by event_id, values contain:
+                #   - event_id (int): Unique event identifier
+                #   - object_type (SmartDetectObjectType): Detected object classification
+                #   - timestamp (float): Event start time
+                #   - descriptor (dict): Additional event metadata
+                _active_smart_events: Active smart detection events supporting concurrent detections
+                # Legacy fields (deprecated - use _active_* instead):
+                _motion_event_ts (Optional[float]): Timestamp of last motion event
+                _motion_object_type (Optional[SmartDetectObjectType]): Last detected object type
+                _motion_last_descriptor (Optional[dict[str, Any]]): Last event descriptor metadata
+            Video Configuration:
+                # Structure: dict[str, tuple[int, int]] - keyed by stream name ("video1", "video2", "video3")
+                #   Values are (width, height) tuples representing detected video resolution
+                _detected_resolutions: Video resolution for each stream quality level
+            Network:
+                _ssl_context (ssl.SSLContext): SSL context for secure WebSocket connections
+                _session (Optional[WebSocketClientProtocol]): Active WebSocket connection to UniFi Protect
+        Side Effects:
+            - Registers atexit handler to clean up streams on program termination
+            - Creates SSL context with certificate validation disabled
+        """
         self.args = args
         self.logger = logger
 
@@ -206,8 +257,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "levels": {"0": 99},
                 "objectTypes": [object_type.value],
                 "zonesStatus": {"0": {"score": 99}},
-                "smartDetectSnapshot": "",
+                "smartDetectSnapshot": "smartDetectSnapshotline209.png",
                 "displayTimeoutMSec": 5000,
+                "motionHeatmap": "motionHeatmapline211.png",
+                "motionSnapshot": "motionSnapshotline212.png",
                 "descriptors": descriptors,
             }
             
@@ -259,9 +312,9 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "edgeType": "start",
                 "eventId": event_id,
                 "eventType": "motion",
-                "levels": {"0": 99},
-                "motionHeatmap": "",
-                "motionSnapshot": "",
+                "levels": {"0": 47},
+                "motionHeatmap": "motionHeatmapline263.png",
+                "motionSnapshot": "motionSnapshotline264.png",
             }
             
             self.logger.info(
@@ -278,6 +331,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "event_id": event_id,
                 "start_time": current_time,
                 "event_timestamp": event_timestamp,
+                # Snapshot filenames to be used in EventAnalytics stop payload
+                "snapshot_filename": None,
+                "snapshot_fov_filename": None,
+                "heatmap_filename": None,
             }
             
             # Update legacy compatibility fields
@@ -288,13 +345,33 @@ class UnifiCamBase(metaclass=ABCMeta):
         # Only capture if this is the first event (analytics or first smart detect)
         if not self._motion_snapshot:
             snapshot_path = None
-            if hasattr(self, 'grab_most_recent_event_snapshot'):
+            snapshot_full = None
+            snapshot_crop = None
+            heatmap = None
+            
+            # For smart detect events, try to grab event-specific snapshot
+            # For generic motion, fetch all three snapshot types
+            if object_type and hasattr(self, 'grab_most_recent_event_snapshot'):
                 try:
-                    self.logger.debug("Attempting to grab most recent event snapshot")
+                    self.logger.debug("Attempting to grab most recent event snapshot for smart detect")
                     snapshot_path = await self.grab_most_recent_event_snapshot()
                 except Exception as e:
                     self.logger.warning(
                         f"Failed to grab recent event snapshot: {e}, "
+                        f"falling back to motion snapshot"
+                    )
+            elif not object_type and hasattr(self, 'grab_all_motion_snapshots'):
+                try:
+                    self.logger.debug("Attempting to grab all motion snapshots")
+                    snapshot_full, snapshot_crop, heatmap = await self.grab_all_motion_snapshots()
+                    # Use crop as the primary snapshot
+                    if snapshot_crop:
+                        snapshot_path = snapshot_crop
+                    elif snapshot_full:
+                        snapshot_path = snapshot_full
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to grab motion snapshots: {e}, "
                         f"falling back to get_snapshot"
                     )
             
@@ -313,11 +390,16 @@ class UnifiCamBase(metaclass=ABCMeta):
                 self._motion_snapshot = snapshot_path
                 
                 # Store in new snapshot type fields
-                # By default, use the same snapshot for all three types
-                # Drivers can override update_motion_snapshots() to provide specific versions
-                self._motion_snapshot_crop = snapshot_path
-                self._motion_snapshot_fov = snapshot_path  
-                self._motion_heatmap = snapshot_path
+                # If we have specific snapshots, use them; otherwise use the same snapshot for all
+                if snapshot_full or snapshot_crop or heatmap:
+                    self._motion_snapshot_crop = snapshot_crop or snapshot_path
+                    self._motion_snapshot_fov = snapshot_full or snapshot_path  
+                    self._motion_heatmap = heatmap or snapshot_path
+                else:
+                    # Default: use the same snapshot for all three types
+                    self._motion_snapshot_crop = snapshot_path
+                    self._motion_snapshot_fov = snapshot_path  
+                    self._motion_heatmap = snapshot_path
                 
                 # Store snapshot references in smart detect event if applicable
                 if object_type and event_id in self._active_smart_events:
@@ -394,9 +476,11 @@ class UnifiCamBase(metaclass=ABCMeta):
             "levels": {"0": 48},
             "objectTypes": [target_object_type.value],
             "zonesStatus": {"0": {"score": 48}},
-            "smartDetectSnapshot": "",
+            "smartDetectSnapshot": "smartDetectSnapshotline399.png",
             "displayTimeoutMSec": 10000,
             "descriptors": descriptors,
+            "motionHeatmap": "motionHeatmapline402.png",
+            "motionSnapshot": "motionSnapshotline403.png",
         }
         
         self.logger.debug(
@@ -467,9 +551,11 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "levels": {"0": 49},
                 "objectTypes": [object_type.value],
                 "zonesStatus": {"0": {"score": 48}},
-                "smartDetectSnapshot": "motionsnap.jpg",
+                "smartDetectSnapshot": "smartDetectSnapshotline472.jpg",
                 "displayTimeoutMSec": 1000,
                 "descriptors": descriptors,
+                "motionHeatmap": "motionHeatmapline477.png",
+                "motionSnapshot": "motionSnapshotline478.png",
             }
             
             duration = time.time() - active_event["start_time"]
@@ -522,6 +608,16 @@ class UnifiCamBase(metaclass=ABCMeta):
                 )
                 return
             
+            # Generate unique filenames that include event ID for snapshot identification
+            snapshot_filename = f"motion_{event_id}_snapshot.jpg"
+            snapshot_fov_filename = f"motion_{event_id}_fullfov.jpg"
+            heatmap_filename = f"motion_{event_id}_heatmap.png"
+            
+            # Store filenames in the active event for later retrieval
+            self._active_analytics_event["snapshot_filename"] = snapshot_filename
+            self._active_analytics_event["snapshot_fov_filename"] = snapshot_fov_filename
+            self._active_analytics_event["heatmap_filename"] = heatmap_filename
+            
             payload: dict[str, Any] = {
                 "clockBestMonotonic": 0,
                 "clockBestWall": 0,
@@ -533,8 +629,9 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "eventId": event_id,
                 "eventType": "motion",
                 "levels": {"0": 49},
-                "motionHeatmap": "heatmap.png",
-                "motionSnapshot": "motionsnap.jpg",
+                "motionHeatmap": heatmap_filename,
+                "motionSnapshot": snapshot_filename,
+                "motionSnapshotFullFoV": snapshot_fov_filename,
             }
             
             duration = time.time() - self._active_analytics_event["start_time"]
