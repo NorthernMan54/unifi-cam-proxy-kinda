@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import atexit
 import json
 import logging
@@ -96,7 +97,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_snapshot_fov: Optional[Path] = None  # Full field of view with bounding box
         self._motion_heatmap: Optional[Path] = None  # Heatmap (defaults to FoV if not available)
         
-        self._motion_event_id: int = 0
+        # Global event ID counter - UniFi requires unique IDs across all event types
+        self._motion_event_id: int = 0  # Shared counter for both analytics and smart detect events
         
         # Enhanced event tracking to support overlapping events
         # Track both generic motion (EventAnalytics) and smart detect events (EventSmartDetect)
@@ -234,255 +236,153 @@ class UnifiCamBase(metaclass=ABCMeta):
     # motionSnapshotHeight: i.z.number().optional(),
     # motionSnapshotWidth: i.z.number().optional()
 
+    # payload structure reference for smart detect events:
+    # clockWall: a.default.number(),
+    # clockStream: a.default.number().optional(),
+    # clockStreamRate: a.default.number().optional(),
+    # displayTimeoutMSec: a.default.number(),
+    # descriptors: t.smartDetectObjectDescriptorSchema.passthrough().array().default([]),
+    # linesStatus: u.linesStatusesSchema.optional(),
+    # zonesStatus: u.zonesStatusesSchema.optional(),
+    # loiterZonesStatus: u.loiterStatusesSchema.optional(),
+    # edgeType: a.default.union([a.default.nativeEnum(m), a.default.string()]).optional(),
+    # objectTypes: a.default.nativeEnum(s.OBJECT_TYPES).array().optional()
+
+    # descriptors object structure:
+    # trackerID: n.trackerIdSchema,
+    # name: a.default.string(),
+    # confidenceLevel: a.default.number(),
+    # coord: f,
+    # depth: a.default.number().positive().nullable().optional(),
+    # speed: a.default.number().positive().nullable().optional(),
+    # objectType: s.objectTypesSchema,
+    # zones: a.default.number().finite().array(),
+    # lines: a.default.number().finite().array(),
+    # loiterZones: a.default.number().finite().array().optional(),
+    # stationary: a.default.coerce.boolean(),
+    # attributes: a.default.record(a.default.unknown()).nullable().optional(),
+    # coord3d: a.default.number().finite().array(),
+    # faceEmbed: a.default.number().finite().array().optional(),
+    # matchedId: a.default.number().optional(),
+    # firstShownTimeMs: a.default.number().finite().optional(),
+    # idleSinceTimeMs: a.default.number().finite().optional()
     ###
 
 
-    # API for subclasses
-    async def trigger_motion_start(
+    # API for subclasses - Smart Detect Events
+    async def trigger_smart_detect_start(
         self,
-        object_type: Optional[SmartDetectObjectType] = None,
+        object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
     ) -> None:
         """
-        Start a motion event. Supports both generic motion (EventAnalytics) and 
-        smart detect events (EventSmartDetect with object_type).
-        
-        EventAnalytics can wrap multiple EventSmartDetect events - the analytics event
-        represents generic motion, while smart detect events represent specific objects.
-        Multiple smart detect events can be active simultaneously.
-        """
-        current_time = time.time()
-        event_id = self._motion_event_id
-        
-        if object_type:
-            # This is a SmartDetect event for a specific object
-            # Check if we already have an active smart detect event with this event_id
-            if event_id in self._active_smart_events:
-                existing_event = self._active_smart_events[event_id]
-                self.logger.warning(
-                    f"Smart detect event {event_id} already active "
-                    f"(type: {existing_event['object_type'].value}, "
-                    f"started: {current_time - existing_event['start_time']:.1f}s ago). "
-                    f"Ignoring duplicate start for {object_type.value}."
-                )
-                return
-            
-            # Build descriptors array
-            descriptors = []
-            if custom_descriptor:
-                descriptors = [custom_descriptor]
-            
-            payload: dict[str, Any] = {
-                "clockBestMonotonic": 0,
-                "clockBestWall": 0,
-                "clockMonotonic": int(self.get_uptime()),
-                "clockStream": int(self.get_uptime()),
-                "clockStreamRate": 1000,
-                "clockWall": event_timestamp or int(round(time.time() * 1000)),
-                "edgeType": "enter",
-                "eventId": event_id,
-                "eventType": "motion",
-                "levels": {"0": 99},
-                "objectTypes": [object_type.value],
-                "zonesStatus": {"0": {"score": 99}},
-                "smartDetectSnapshot": "smartDetectSnapshotline209.png",
-                "displayTimeoutMSec": 5000,
-                "motionHeatmap": "motionHeatmapline211.png",
-                "motionSnapshot": "motionSnapshotline212.png",
-                "descriptors": descriptors,
-            }
-            
-            self.logger.info(
-                f"Starting smart detect event {event_id} for {object_type.value} "
-                f"(active smart events: {len(self._active_smart_events)})"
-            )
-            
-            await self.send(
-                self.gen_response("EventSmartDetect", payload=payload)
-            )
-            
-            # Track this smart detect event
-            self._active_smart_events[event_id] = {
-                "object_type": object_type,
-                "start_time": current_time,
-                "event_timestamp": event_timestamp,
-                "last_descriptor": custom_descriptor,
-                # UniFi Protect requests three snapshot types:
-                "snapshot_crop": None,  # motionSnapshot - cropped with bounding box
-                "snapshot_fov": None,   # motionSnapshotFullFoV - full size with bounding box
-                "heatmap": None,        # motionHeatmap - heatmap visualization
-            }
-            
-            # Update legacy compatibility fields
-            self._motion_event_ts = current_time
-            self._motion_object_type = object_type
-            self._motion_last_descriptor = custom_descriptor
-            
-        else:
-            # This is a generic EventAnalytics motion event
-            # Check if we already have an active analytics event
-            if self._active_analytics_event is not None:
-                existing_start = self._active_analytics_event['start_time']
-                self.logger.warning(
-                    f"Analytics event already active "
-                    f"(started: {current_time - existing_start:.1f}s ago). "
-                    f"Ignoring duplicate start."
-                )
-                return
-            
-            payload: dict[str, Any] = {
-                "clockBestMonotonic": 0,
-                "clockBestWall": 0,
-                "clockMonotonic": int(self.get_uptime()),
-                "clockStream": int(self.get_uptime()),
-                "clockStreamRate": 1000,
-                "clockWall": event_timestamp or int(round(time.time() * 1000)),
-                "edgeType": "start",
-                "eventId": event_id,
-                "eventType": "motion",
-                "levels": {"0": 47},
-                "motionHeatmap": "motionHeatmapline263.png",
-                "motionSnapshot": "motionSnapshotline264.png",
-            }
-            
-            self.logger.info(
-                f"Starting analytics event {event_id} "
-                f"(active smart events: {len(self._active_smart_events)})"
-            )
-            
-            await self.send(
-                self.gen_response("EventAnalytics", payload=payload)
-            )
-            
-            # Track this analytics event
-            self._active_analytics_event = {
-                "event_id": event_id,
-                "start_time": current_time,
-                "event_timestamp": event_timestamp,
-                # Snapshot filenames to be used in EventAnalytics stop payload
-                "snapshot_filename": None,
-                "snapshot_fov_filename": None,
-                "heatmap_filename": None,
-            }
-            
-            # Update legacy compatibility fields
-            if not self._motion_event_ts:  # Only set if not already set by smart detect
-                self._motion_event_ts = current_time
-        
-        # Capture snapshot for the event (shared between analytics and smart detect)
-        # Only capture if this is the first event (analytics or first smart detect)
-        if not self._motion_snapshot:
-            snapshot_path = None
-            snapshot_full = None
-            snapshot_crop = None
-            heatmap = None
-            
-            # For smart detect events, try to grab event-specific snapshot
-            # For generic motion, fetch all three snapshot types
-            if object_type and hasattr(self, 'grab_most_recent_event_snapshot'):
-                try:
-                    self.logger.debug("Attempting to grab most recent event snapshot for smart detect")
-                    snapshot_path = await self.grab_most_recent_event_snapshot()
-                except Exception as e:
-                    self.logger.warning(
-                        f"Failed to grab recent event snapshot: {e}, "
-                        f"falling back to motion snapshot"
-                    )
-            elif not object_type and hasattr(self, 'grab_all_motion_snapshots'):
-                try:
-                    self.logger.debug("Attempting to grab all motion snapshots")
-                    snapshot_full, snapshot_crop, heatmap = await self.grab_all_motion_snapshots()
-                    # Use crop as the primary snapshot
-                    if snapshot_crop:
-                        snapshot_path = snapshot_crop
-                    elif snapshot_full:
-                        snapshot_path = snapshot_full
-                except Exception as e:
-                    self.logger.warning(
-                        f"Failed to grab motion snapshots: {e}, "
-                        f"falling back to get_snapshot"
-                    )
-            
-            # Fallback to regular snapshot if recent event snapshot not available
-            if not snapshot_path:
-                motion_snapshot_path: str = tempfile.NamedTemporaryFile(delete=False).name
-                try:
-                    shutil.copyfile(await self.get_snapshot(), motion_snapshot_path)
-                    self.logger.debug(f"Captured motion snapshot to {motion_snapshot_path}")
-                    snapshot_path = Path(motion_snapshot_path)
-                except FileNotFoundError:
-                    self.logger.debug("Could not capture motion snapshot")
-            
-            if snapshot_path:
-                # Store in legacy field
-                self._motion_snapshot = snapshot_path
-                
-                # Store in new snapshot type fields
-                # If we have specific snapshots, use them; otherwise use the same snapshot for all
-                if snapshot_full or snapshot_crop or heatmap:
-                    self._motion_snapshot_crop = snapshot_crop or snapshot_path
-                    self._motion_snapshot_fov = snapshot_full or snapshot_path  
-                    self._motion_heatmap = heatmap or snapshot_path
-                else:
-                    # Default: use the same snapshot for all three types
-                    self._motion_snapshot_crop = snapshot_path
-                    self._motion_snapshot_fov = snapshot_path  
-                    self._motion_heatmap = snapshot_path
-                
-                # Store snapshot references in smart detect event if applicable
-                if object_type and event_id in self._active_smart_events:
-                    self._active_smart_events[event_id]["snapshot_crop"] = snapshot_path
-                    self._active_smart_events[event_id]["snapshot_fov"] = snapshot_path
-                    self._active_smart_events[event_id]["heatmap"] = snapshot_path
-
-    async def trigger_motion_update(
-        self,
-        custom_descriptor: Optional[dict[str, Any]] = None,
-        event_timestamp: Optional[float] = None,
-        object_type: Optional[SmartDetectObjectType] = None,
-    ) -> None:
-        """
-        Send a motion update (moving) event with updated descriptor information.
-        Only applicable to SmartDetect events (not generic EventAnalytics).
+        Start a smart detect event for a specific object type.
         
         Args:
-            custom_descriptor: Updated descriptor data (bounding box, etc.)
+            object_type: The type of object detected (person, vehicle, etc.)
+            custom_descriptor: Optional descriptor data (bounding box, etc.)
             event_timestamp: Optional timestamp for the event
-            object_type: Optional object type to update. If not provided, uses the
-                        most recent active smart detect event (legacy behavior).
         """
+        current_time = time.time()
+        
+        # Get the next available event ID and increment counter
         event_id = self._motion_event_id
+        self._motion_event_id += 1
         
-        # Determine which event to update
-        target_object_type = object_type or self._motion_object_type
-        
-        if not target_object_type:
+        # Check if we already have an active smart detect event with this event_id
+        if event_id in self._active_smart_events:
+            existing_event = self._active_smart_events[event_id]
             self.logger.warning(
-                "trigger_motion_update called but no object_type specified and "
-                "no active smart detect event found. Ignoring."
+                f"Smart detect event {event_id} already active "
+                f"(type: {existing_event['object_type'].value}, "
+                f"started: {current_time - existing_event['start_time']:.1f}s ago). "
+                f"Ignoring duplicate start for {object_type.value}."
             )
             return
         
-        # Check if we have an active smart detect event for this event_id
-        if event_id not in self._active_smart_events:
+        # Build descriptors array
+        descriptors = []
+        if custom_descriptor:
+            descriptors = [custom_descriptor]
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "enter",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 99},
+            "objectTypes": [object_type.value],
+            "zonesStatus": {"0": {"score": 99}},
+            "smartDetectSnapshot": "smartDetectSnapshotline209.png",
+            "displayTimeoutMSec": 5000,
+            "motionHeatmap": "motionHeatmapline211.png",
+            "motionSnapshot": "motionSnapshotline212.png",
+            "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline326.png",
+            "snapshot": "smartDetectSnapshotline326.png",
+            "descriptors": descriptors,
+        }
+        
+        self.logger.info(
+            f"Starting smart detect event {event_id} for {object_type.value} "
+            f"(active smart events: {len(self._active_smart_events)})"
+        )
+        
+        await self.send(
+            self.gen_response("EventSmartDetect", payload=payload)
+        )
+        
+        # Track this smart detect event
+        self._active_smart_events[event_id] = {
+            "object_type": object_type,
+            "start_time": current_time,
+            "event_timestamp": event_timestamp,
+            "last_descriptor": custom_descriptor,
+            # UniFi Protect requests three snapshot types:
+            "snapshot_crop": None,  # motionSnapshot - cropped with bounding box
+            "snapshot_fov": None,   # motionSnapshotFullFoV - full size with bounding box
+            "heatmap": None,        # motionHeatmap - heatmap visualization
+        }
+        
+        # Update legacy compatibility fields
+        self._motion_event_ts = current_time
+        self._motion_object_type = object_type
+        self._motion_last_descriptor = custom_descriptor
+
+    async def trigger_smart_detect_update(
+        self,
+        object_type: SmartDetectObjectType,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Send a smart detect update (moving) event with updated descriptor information.
+        
+        Args:
+            object_type: The type of object to update
+            custom_descriptor: Updated descriptor data (bounding box, etc.)
+            event_timestamp: Optional timestamp for the event
+        """
+        # Find the active smart detect event with matching object type
+        event_id = None
+        for eid, event in self._active_smart_events.items():
+            if event["object_type"] == object_type:
+                event_id = eid
+                break
+        
+        if event_id is None:
             self.logger.warning(
-                f"trigger_motion_update called for event {event_id} "
-                f"({target_object_type.value}) but no active event found. "
-                f"Event may have already ended or never started. Ignoring."
+                f"trigger_smart_detect_update called for {object_type.value} "
+                f"but no active event found. Event may have already ended or never started. Ignoring."
             )
             return
         
         active_event = self._active_smart_events[event_id]
-        
-        # Verify object type matches if we're being specific
-        if active_event["object_type"] != target_object_type:
-            self.logger.warning(
-                f"trigger_motion_update called for {target_object_type.value} "
-                f"but active event {event_id} is for {active_event['object_type'].value}. "
-                f"Ignoring."
-            )
-            return
         
         # Build descriptors array
         descriptors = []
@@ -503,22 +403,289 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventId": event_id,
             "eventType": "motion",
             "levels": {"0": 48},
-            "objectTypes": [target_object_type.value],
+            "objectTypes": [object_type.value],
             "zonesStatus": {"0": {"score": 48}},
             "smartDetectSnapshot": "smartDetectSnapshotline399.png",
             "displayTimeoutMSec": 10000,
             "descriptors": descriptors,
             "motionHeatmap": "motionHeatmapline402.png",
             "motionSnapshot": "motionSnapshotline403.png",
+             "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline413.png",
+            "snapshot": "smartDetectSnapshotline414.png",
         }
         
         self.logger.debug(
-            f"Updating smart detect event {event_id} for {target_object_type.value}"
+            f"Updating smart detect event {event_id} for {object_type.value}"
         )
         
         await self.send(
             self.gen_response("EventSmartDetect", payload=payload)
         )
+
+    async def trigger_smart_detect_stop(
+        self,
+        object_type: SmartDetectObjectType,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Stop a smart detect event for a specific object type.
+        
+        Args:
+            object_type: The type of object to stop detecting
+            custom_descriptor: Optional final descriptor data
+            event_timestamp: Optional timestamp for the event
+        """
+        # Find the active smart detect event by object type
+        event_id = None
+        for eid, event in self._active_smart_events.items():
+            if event["object_type"] == object_type:
+                event_id = eid
+                break
+        
+        if event_id is None:
+            self.logger.warning(
+                f"trigger_smart_detect_stop called for {object_type.value} "
+                f"but no active event found. Event may have already ended or never started. Ignoring."
+            )
+            return
+        
+        active_event = self._active_smart_events[event_id]
+        
+        # Build descriptors array - use custom_descriptor if provided, 
+        # otherwise fall back to last saved descriptor for this event
+        descriptors = []
+        if custom_descriptor:
+            descriptors = [custom_descriptor]
+        elif active_event["last_descriptor"]:
+            descriptors = [active_event["last_descriptor"]]
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "leave",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 49},
+            "objectTypes": [object_type.value],
+            "zonesStatus": {"0": {"score": 48}},
+            "smartDetectSnapshot": "smartDetectSnapshotline472.jpg",
+            "displayTimeoutMSec": 1000,
+            "descriptors": descriptors,
+            "motionHeatmap": "motionHeatmapline477.png",
+            "motionSnapshot": "motionSnapshotline478.png",
+            "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline481.png",
+            "snapshot": "smartDetectSnapshotline481.png",
+        }
+        
+        duration = time.time() - active_event["start_time"]
+        self.logger.info(
+            f"Stopping smart detect event {event_id} for {object_type.value} "
+            f"(duration: {duration:.1f}s, remaining smart events: "
+            f"{len(self._active_smart_events) - 1})"
+        )
+        
+        await self.send(
+            self.gen_response("EventSmartDetect", payload=payload)
+        )
+        
+        # Clean up this smart detect event
+        del self._active_smart_events[event_id]
+        
+        # Update legacy compatibility fields
+        if not self._active_smart_events:
+            # No more smart detect events
+            self._motion_object_type = None
+            self._motion_last_descriptor = None
+            # Only clear motion_event_ts if no analytics event is active
+            if self._active_analytics_event is None:
+                self._motion_event_ts = None
+
+    # API for subclasses - Analytics (Motion) Events
+    async def trigger_analytics_start(
+        self,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Start a generic analytics motion event.
+        
+        Args:
+            event_timestamp: Optional timestamp for the event
+        """
+        current_time = time.time()
+        
+        # Get the next available event ID and increment counter
+        event_id = self._motion_event_id
+        self._motion_event_id += 1
+        
+        # Check if we already have an active analytics event
+        if self._active_analytics_event is not None:
+            existing_start = self._active_analytics_event['start_time']
+            self.logger.warning(
+                f"Analytics event {self._active_analytics_event['event_id']} already active "
+                f"(started: {current_time - existing_start:.1f}s ago). "
+                f"Ignoring duplicate start."
+            )
+            return
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "start",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 47},
+            "motionHeatmap": "motionHeatmapline263.png",
+            "motionSnapshot": "motionSnapshotline264.png",
+        }
+        
+        self.logger.info(
+            f"Starting analytics event {event_id} "
+            f"(active smart events: {len(self._active_smart_events)})"
+        )
+        
+        await self.send(
+            self.gen_response("EventAnalytics", payload=payload)
+        )
+        
+        # Track this analytics event
+        self._active_analytics_event = {
+            "event_id": event_id,
+            "start_time": current_time,
+            "event_timestamp": event_timestamp,
+            # Snapshot filenames to be used in EventAnalytics stop payload
+            "snapshot_filename": None,
+            "snapshot_fov_filename": None,
+            "heatmap_filename": None,
+        }
+        
+        # Update legacy compatibility fields
+        if not self._motion_event_ts:  # Only set if not already set by smart detect
+            self._motion_event_ts = current_time
+
+    async def trigger_analytics_stop(
+        self,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Stop the active analytics motion event.
+        
+        Args:
+            event_timestamp: Optional timestamp for the event
+        """
+        # Get the event ID from the active analytics event
+        if self._active_analytics_event is None:
+            self.logger.warning(
+                f"trigger_analytics_stop called but no active event found. "
+                f"Event may have already ended or never started. Ignoring."
+            )
+            return
+        
+        event_id = self._active_analytics_event["event_id"]
+        
+        # Generate URL-based filenames using Frigate API pattern
+        # UniFi expects different filename for FoV, but same base for snapshot and heatmap
+        current_timestamp = int(time.time())
+        snapshot_filename = f"latest.jpg?timestamp={current_timestamp}"
+        snapshot_fov_filename = f"latest_fullfov.jpg?timestamp={current_timestamp}"
+        heatmap_filename = f"latest.jpg?timestamp={current_timestamp}"
+        
+        # Store filenames in the active event for later retrieval
+        self._active_analytics_event["snapshot_filename"] = snapshot_filename
+        self._active_analytics_event["snapshot_fov_filename"] = snapshot_fov_filename
+        self._active_analytics_event["heatmap_filename"] = heatmap_filename
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "stop",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 49},
+            "motionHeatmap": heatmap_filename,
+            "motionSnapshot": snapshot_filename,
+            "motionSnapshotFullFoV": snapshot_fov_filename,
+        }
+        
+        duration = time.time() - self._active_analytics_event["start_time"]
+        self.logger.info(
+            f"Stopping analytics event {event_id} (duration: {duration:.1f}s)"
+        )
+        
+        await self.send(
+            self.gen_response("EventAnalytics", payload=payload)
+        )
+        
+        # Clean up analytics event
+        self._active_analytics_event = None
+        
+        # Update legacy compatibility fields
+        if not self._active_smart_events:
+            # No smart detect events either, fully clear state
+            self._motion_event_ts = None
+
+    # Legacy API for subclasses - backwards compatibility
+    async def trigger_motion_start(
+        self,
+        object_type: Optional[SmartDetectObjectType] = None,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Start a motion event. Supports both generic motion (EventAnalytics) and 
+        smart detect events (EventSmartDetect with object_type).
+        
+        DEPRECATED: Use trigger_analytics_start() or trigger_smart_detect_start() instead.
+        
+        All events use a globally unique event ID counter that increments
+        for each new event regardless of type.
+        """
+        if object_type:
+            await self.trigger_smart_detect_start(object_type, custom_descriptor, event_timestamp)
+        else:
+            await self.trigger_analytics_start(event_timestamp)
+
+    async def trigger_motion_update(
+        self,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+        object_type: Optional[SmartDetectObjectType] = None,
+    ) -> None:
+        """
+        Send a motion update (moving) event with updated descriptor information.
+        Only applicable to SmartDetect events (not generic EventAnalytics).
+        
+        DEPRECATED: Use trigger_smart_detect_update() instead.
+        
+        Args:
+            custom_descriptor: Updated descriptor data (bounding box, etc.)
+            event_timestamp: Optional timestamp for the event
+            object_type: Optional object type to update. If not provided, uses the
+                        most recent active smart detect event (legacy behavior).
+        """
+        # Determine which event to update
+        target_object_type = object_type or self._motion_object_type
+        
+        if not target_object_type:
+            self.logger.warning(
+                "trigger_motion_update called but no object_type specified and "
+                "no active smart detect event found. Ignoring."
+            )
+            return
+        
+        await self.trigger_smart_detect_update(target_object_type, custom_descriptor, event_timestamp)
 
     async def trigger_motion_stop(
         self,
@@ -530,160 +697,18 @@ class UnifiCamBase(metaclass=ABCMeta):
         Stop a motion event. Can stop either a generic motion event (EventAnalytics) 
         or a specific smart detect event (EventSmartDetect).
         
+        DEPRECATED: Use trigger_analytics_stop() or trigger_smart_detect_stop() instead.
+        
         Args:
             custom_descriptor: Optional final descriptor data
             event_timestamp: Optional timestamp for the event
             object_type: If provided, stops a specific smart detect event. 
-                        If None, stops the generic analytics event or uses legacy behavior.
+                        If None, stops the generic analytics event.
         """
-        event_id = self._motion_event_id
-        
         if object_type:
-            # Stop a specific SmartDetect event
-            if event_id not in self._active_smart_events:
-                self.logger.warning(
-                    f"trigger_motion_stop called for smart detect event {event_id} "
-                    f"({object_type.value}) but no active event found. "
-                    f"Event may have already ended or never started. Ignoring."
-                )
-                return
-            
-            active_event = self._active_smart_events[event_id]
-            
-            # Verify object type matches
-            if active_event["object_type"] != object_type:
-                self.logger.warning(
-                    f"trigger_motion_stop called for {object_type.value} "
-                    f"but active event {event_id} is for {active_event['object_type'].value}. "
-                    f"Ignoring."
-                )
-                return
-            
-            # Build descriptors array - use custom_descriptor if provided, 
-            # otherwise fall back to last saved descriptor for this event
-            descriptors = []
-            if custom_descriptor:
-                descriptors = [custom_descriptor]
-            elif active_event["last_descriptor"]:
-                descriptors = [active_event["last_descriptor"]]
-            
-            payload: dict[str, Any] = {
-                "clockBestMonotonic": 0,
-                "clockBestWall": 0,
-                "clockMonotonic": int(self.get_uptime()),
-                "clockStream": int(self.get_uptime()),
-                "clockStreamRate": 1000,
-                "clockWall": event_timestamp or int(round(time.time() * 1000)),
-                "edgeType": "leave",
-                "eventId": event_id,
-                "eventType": "motion",
-                "levels": {"0": 49},
-                "objectTypes": [object_type.value],
-                "zonesStatus": {"0": {"score": 48}},
-                "smartDetectSnapshot": "smartDetectSnapshotline472.jpg",
-                "displayTimeoutMSec": 1000,
-                "descriptors": descriptors,
-                "motionHeatmap": "motionHeatmapline477.png",
-                "motionSnapshot": "motionSnapshotline478.png",
-            }
-            
-            duration = time.time() - active_event["start_time"]
-            self.logger.info(
-                f"Stopping smart detect event {event_id} for {object_type.value} "
-                f"(duration: {duration:.1f}s, remaining smart events: "
-                f"{len(self._active_smart_events) - 1})"
-            )
-            
-            await self.send(
-                self.gen_response("EventSmartDetect", payload=payload)
-            )
-            
-            # Clean up this smart detect event
-            del self._active_smart_events[event_id]
-            
-            # Update legacy compatibility fields
-            if not self._active_smart_events:
-                # No more smart detect events
-                self._motion_object_type = None
-                self._motion_last_descriptor = None
-                # Only clear motion_event_ts if no analytics event is active
-                if self._active_analytics_event is None:
-                    self._motion_event_ts = None
-            
-            # Only increment event ID if there's no active analytics event wrapping this smart detect
-            # If there's an analytics event, the ID will increment when that ends
-            if self._active_analytics_event is None:
-                self._motion_event_id += 1
-            
+            await self.trigger_smart_detect_stop(object_type, custom_descriptor, event_timestamp)
         else:
-            # Stop generic EventAnalytics motion event (or use legacy behavior)
-            # Legacy behavior: if there's an active smart detect event, stop it instead
-            if self._motion_object_type and event_id in self._active_smart_events:
-                # Recursively call with the object type from the active smart event
-                self.logger.debug(
-                    f"trigger_motion_stop called without object_type, "
-                    f"but active smart detect event found. Stopping smart detect event."
-                )
-                await self.trigger_motion_stop(
-                    custom_descriptor=custom_descriptor,
-                    event_timestamp=event_timestamp,
-                    object_type=self._motion_object_type
-                )
-                return
-            
-            # Stop the analytics event
-            if self._active_analytics_event is None:
-                self.logger.warning(
-                    f"trigger_motion_stop called for analytics event but no active event found. "
-                    f"Event may have already ended or never started. Ignoring."
-                )
-                return
-            
-            # Generate unique filenames that include event ID for snapshot identification
-            snapshot_filename = f"motion_{event_id}_snapshot.jpg"
-            snapshot_fov_filename = f"motion_{event_id}_fullfov.jpg"
-            heatmap_filename = f"motion_{event_id}_heatmap.png"
-            
-            # Store filenames in the active event for later retrieval
-            self._active_analytics_event["snapshot_filename"] = snapshot_filename
-            self._active_analytics_event["snapshot_fov_filename"] = snapshot_fov_filename
-            self._active_analytics_event["heatmap_filename"] = heatmap_filename
-            
-            payload: dict[str, Any] = {
-                "clockBestMonotonic": 0,
-                "clockBestWall": 0,
-                "clockMonotonic": int(self.get_uptime()),
-                "clockStream": int(self.get_uptime()),
-                "clockStreamRate": 1000,
-                "clockWall": event_timestamp or int(round(time.time() * 1000)),
-                "edgeType": "stop",
-                "eventId": event_id,
-                "eventType": "motion",
-                "levels": {"0": 49},
-                "motionHeatmap": heatmap_filename,
-                "motionSnapshot": snapshot_filename,
-                "motionSnapshotFullFoV": snapshot_fov_filename,
-            }
-            
-            duration = time.time() - self._active_analytics_event["start_time"]
-            self.logger.info(
-                f"Stopping analytics event {event_id} (duration: {duration:.1f}s)"
-            )
-            
-            await self.send(
-                self.gen_response("EventAnalytics", payload=payload)
-            )
-            
-            # Clean up analytics event
-            self._active_analytics_event = None
-            
-            # Update legacy compatibility fields
-            if not self._active_smart_events:
-                # No smart detect events either, fully clear state
-                self._motion_event_ts = None
-            
-            # Increment event ID for next event
-            self._motion_event_id += 1
+            await self.trigger_analytics_stop(event_timestamp)
 
     def update_motion_snapshot(self, path: Path) -> None:
         """
@@ -1415,41 +1440,201 @@ class UnifiCamBase(metaclass=ABCMeta):
         self, msg: AVClientRequest
     ) -> Optional[AVClientResponse]:
         snapshot_type = msg["payload"]["what"]
+        filename = msg["payload"].get("filename", "")
         
-        # Select appropriate snapshot based on request type
-        if snapshot_type == "motionSnapshot":
-            # Cropped image with bounding box
-            path = self._motion_snapshot_crop or self._motion_snapshot
-        elif snapshot_type == "motionSnapshotFullFoV":
-            # Full field of view image with bounding box
-            path = self._motion_snapshot_fov or self._motion_snapshot
-        elif snapshot_type == "motionHeatmap":
-            # Heatmap visualization (use FoV as fallback)
-            path = self._motion_heatmap or self._motion_snapshot_fov or self._motion_snapshot
-        elif snapshot_type == "smartDetectZoneSnapshot":
-            # Smart detect zone snapshot (use crop)
-            path = self._motion_snapshot_crop or self._motion_snapshot
+        self.logger.debug(f"Snapshot request: type={snapshot_type}, filename={filename}")
+        
+        # Check if filename contains URL parameters (indicates Frigate API URL)
+        if filename and ("?" in filename or filename.startswith("latest.jpg")):
+            # This is a URL-based filename, fetch from Frigate API
+            if hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera'):
+                if self.args.frigate_http_url:
+                    # Determine query parameters based on snapshot type
+                    # motionSnapshot: 360p thumbnail with crop
+                    # motionSnapshotFullFoV: full resolution
+                    # motionHeatmap: full resolution (same as FoV)
+                    if snapshot_type == "motionSnapshot":
+                        # Thumbnail version with height and quality parameters
+                        query_params = "height=360&quality=80"
+                    elif snapshot_type == "motionSnapshotFullFoV":
+                        # Full resolution, no additional parameters beyond timestamp
+                        query_params = ""
+                    elif snapshot_type == "motionHeatmap":
+                        # Heatmap uses full resolution
+                        query_params = ""
+                    else:
+                        # Default to no extra parameters
+                        query_params = ""
+                    
+                    # Extract timestamp from filename if present
+                    timestamp_param = ""
+                    if "timestamp=" in filename:
+                        # Extract existing timestamp parameter
+                        timestamp_param = filename.split("?", 1)[1] if "?" in filename else ""
+                    
+                    # Build final query string
+                    if query_params and timestamp_param:
+                        final_query = f"{query_params}&{timestamp_param}"
+                    elif query_params:
+                        final_query = query_params
+                    elif timestamp_param:
+                        final_query = timestamp_param
+                    else:
+                        final_query = ""
+                    
+                    # Build the full URL to Frigate
+                    # Always use 'latest.jpg' as the base - Frigate API endpoint
+                    # (UniFi may send latest_fullfov.jpg, latest_heatmap.jpg, etc. but Frigate only has latest.jpg)
+                    if final_query:
+                        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{final_query}"
+                    else:
+                        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
+                    
+                    self.logger.info(f"Fetching {snapshot_type} from Frigate: {snapshot_url}")
+                    
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            # Fetch from Frigate
+                            async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                                if response.status == 200:
+                                    image_data = await response.read()
+                                    self.logger.info(f"Fetched {snapshot_type} from Frigate ({len(image_data)} bytes)")
+                                    
+                                    # Upload to UniFi Protect
+                                    files = {"payload": image_data}
+                                    files.update(msg["payload"].get("formFields", {}))
+                                    
+                                    try:
+                                        await session.post(
+                                            msg["payload"]["uri"],
+                                            data=files,
+                                            ssl=self._ssl_context,
+                                        )
+                                        self.logger.debug(f"Uploaded {snapshot_type} from Frigate URL")
+                                    except aiohttp.ClientError:
+                                        self.logger.exception("Failed to upload snapshot to UniFi Protect")
+                                else:
+                                    error_body = await response.text()
+                                    self.logger.warning(
+                                        f"Failed to fetch {snapshot_type} from Frigate: "
+                                        f"HTTP {response.status}, Response: {error_body}"
+                                    )
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Timeout fetching {snapshot_type} from Frigate")
+                    except Exception as e:
+                        self.logger.error(f"Error fetching {snapshot_type} from Frigate: {e}")
+                else:
+                    self.logger.warning(f"URL-based filename but frigate_http_url not configured")
+            else:
+                self.logger.warning(f"URL-based filename but Frigate configuration not available")
         else:
-            # Regular snapshot request
-            path = await self.get_snapshot()
+            # Check if this is a regular snapshot request and Frigate is configured
+            if snapshot_type == "snapshot" and hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera'):
+                if self.args.frigate_http_url:
+                    # Determine query parameters based on quality
+                    quality_param = msg["payload"].get("quality", "medium")
+                    
+                    # Map UniFi quality levels to height parameters
+                    if quality_param == "high":
+                        query_params = "height=1080&quality=95"
+                    elif quality_param == "medium":
+                        query_params = "height=720&quality=85"
+                    elif quality_param == "low":
+                        query_params = "height=360&quality=70"
+                    else:
+                        # Default to medium quality
+                        query_params = "height=720&quality=85"
+                    
+                    # Build the full URL to Frigate
+                    snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{query_params}"
+                    
+                    self.logger.info(f"Fetching snapshot (quality={quality_param}) from Frigate: {snapshot_url}")
+                    
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            # Fetch from Frigate
+                            async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                                if response.status == 200:
+                                    image_data = await response.read()
+                                    self.logger.info(f"Fetched snapshot from Frigate ({len(image_data)} bytes)")
+                                    
+                                    # Upload to UniFi Protect
+                                    files = {"payload": image_data}
+                                    files.update(msg["payload"].get("formFields", {}))
+                                    
+                                    try:
+                                        await session.post(
+                                            msg["payload"]["uri"],
+                                            data=files,
+                                            ssl=self._ssl_context,
+                                        )
+                                        self.logger.debug(f"Uploaded snapshot from Frigate")
+                                    except aiohttp.ClientError:
+                                        self.logger.exception("Failed to upload snapshot to UniFi Protect")
+                                else:
+                                    error_body = await response.text()
+                                    self.logger.warning(
+                                        f"Failed to fetch snapshot from Frigate: "
+                                        f"HTTP {response.status}, Response: {error_body}"
+                                    )
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Timeout fetching snapshot from Frigate")
+                    except Exception as e:
+                        self.logger.error(f"Error fetching snapshot from Frigate: {e}")
+                else:
+                    # Fall back to legacy method if frigate_http_url not configured
+                    path = await self.get_snapshot()
+                    if path and path.exists():
+                        async with aiohttp.ClientSession() as session:
+                            files = {"payload": open(path, "rb")}
+                            files.update(msg["payload"].get("formFields", {}))
+                            try:
+                                await session.post(
+                                    msg["payload"]["uri"],
+                                    data=files,
+                                    ssl=self._ssl_context,
+                                )
+                                self.logger.debug(f"Uploaded snapshot from {path}")
+                            except aiohttp.ClientError:
+                                self.logger.exception("Failed to upload snapshot")
+                    else:
+                        self.logger.warning(f"Snapshot file {path} is not ready yet, skipping upload")
+            else:
+                # Legacy path-based snapshot handling for motion events
+                # Select appropriate snapshot based on request type
+                if snapshot_type == "motionSnapshot":
+                    # Cropped image with bounding box
+                    path = self._motion_snapshot_crop or self._motion_snapshot
+                elif snapshot_type == "motionSnapshotFullFoV":
+                    # Full field of view image with bounding box
+                    path = self._motion_snapshot_fov or self._motion_snapshot
+                elif snapshot_type == "motionHeatmap":
+                    # Heatmap visualization (use FoV as fallback)
+                    path = self._motion_heatmap or self._motion_snapshot_fov or self._motion_snapshot
+                elif snapshot_type == "smartDetectZoneSnapshot":
+                    # Smart detect zone snapshot (use crop)
+                    path = self._motion_snapshot_crop or self._motion_snapshot
+                else:
+                    # Regular snapshot request (fallback to get_snapshot method)
+                    path = await self.get_snapshot()
 
-        if path and path.exists():
-            async with aiohttp.ClientSession() as session:
-                files = {"payload": open(path, "rb")}
-                files.update(msg["payload"].get("formFields", {}))
-                try:
-                    await session.post(
-                        msg["payload"]["uri"],
-                        data=files,
-                        ssl=self._ssl_context,
+                if path and path.exists():
+                    async with aiohttp.ClientSession() as session:
+                        files = {"payload": open(path, "rb")}
+                        files.update(msg["payload"].get("formFields", {}))
+                        try:
+                            await session.post(
+                                msg["payload"]["uri"],
+                                data=files,
+                                ssl=self._ssl_context,
+                            )
+                            self.logger.debug(f"Uploaded {snapshot_type} from {path}")
+                        except aiohttp.ClientError:
+                            self.logger.exception("Failed to upload snapshot")
+                else:
+                    self.logger.warning(
+                        f"Snapshot file {path} is not ready yet, skipping upload for {snapshot_type}"
                     )
-                    self.logger.debug(f"Uploaded {snapshot_type} from {path}")
-                except aiohttp.ClientError:
-                    self.logger.exception("Failed to upload snapshot")
-        else:
-            self.logger.warning(
-                f"Snapshot file {path} is not ready yet, skipping upload for {snapshot_type}"
-            )
 
         if msg["responseExpected"]:
             return self.gen_response("GetRequest", response_to=msg["messageId"])
@@ -1505,7 +1690,13 @@ class UnifiCamBase(metaclass=ABCMeta):
         m = json.loads(msg)
         fn = m["functionName"]
 
-        self.logger.info(f"Processing [{fn}] message")
+        # Add extra details for GetRequest messages
+        if fn == "GetRequest" and "payload" in m:
+            what = m["payload"].get("what", "N/A")
+            filename = m["payload"].get("filename", "N/A")
+            self.logger.info(f"Processing [{fn}] message (what={what}, filename={filename})")
+        else:
+            self.logger.info(f"Processing [{fn}] message")
         self.logger.debug(f"Message contents: {m}")
 
         if (("responseExpected" not in m) or (m["responseExpected"] is False)) and (

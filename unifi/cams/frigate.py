@@ -343,10 +343,10 @@ class FrigateCam(RTSPCam):
         # self.logger.debug(f"Received raw motion event: {msg}")
         if msg == "ON":
             self.logger.debug("Frigate motion event: ON")
-            await self.trigger_motion_start()
+            await self.trigger_analytics_start()
         elif msg == "OFF":
             self.logger.debug("Frigate motion event: OFF")
-            await self.trigger_motion_stop()
+            await self.trigger_analytics_stop()
 
     async def grab_most_recent_event_snapshot(self) -> Optional[Path]:
         """
@@ -629,7 +629,7 @@ class FrigateCam(RTSPCam):
                     
                 try:
                     # End smart detect event (motion event will end separately)
-                    await self.trigger_motion_stop(object_type=event_data["object_type"])
+                    await self.trigger_smart_detect_stop(event_data["object_type"])
                 except Exception as e:
                     self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
                 finally:
@@ -702,7 +702,7 @@ class FrigateCam(RTSPCam):
                     old_unifi_id = self.frigate_to_unifi_event_map[event_id]
                     if old_unifi_id in self._active_smart_events:
                         old_event = self._active_smart_events[old_unifi_id]
-                        await self.trigger_motion_stop(object_type=old_event["object_type"])
+                        await self.trigger_smart_detect_stop(old_event["object_type"])
                     del self.frigate_to_unifi_event_map[event_id]
                 
                 # Get the current UniFi event ID (from the motion event Frigate already started)
@@ -725,7 +725,7 @@ class FrigateCam(RTSPCam):
                     frigate_msg, object_type
                 )
                 start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)
-                await self.trigger_motion_start(object_type, custom_descriptor, start_time_ms)
+                await self.trigger_smart_detect_start(object_type, custom_descriptor, start_time_ms)
                 
                 # Fetch snapshots if available
                 has_snapshot = after_data.get('has_snapshot', False)
@@ -763,7 +763,7 @@ class FrigateCam(RTSPCam):
 
                     frame_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)   
                     # Send moving update with updated bounding box
-                    await self.trigger_motion_update(custom_descriptor, frame_time_ms, object_type)
+                    await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
                     
                     # Fetch updated snapshots if available
                     has_snapshot = after_data.get('has_snapshot', False)
@@ -867,7 +867,7 @@ class FrigateCam(RTSPCam):
                     )
                     
                     # End the smart detect event (motion event will end when Frigate sends motion OFF)
-                    await self.trigger_motion_stop(final_descriptor, end_time_ms, object_type)
+                    await self.trigger_smart_detect_stop(object_type, final_descriptor, end_time_ms)
                     
                     # Clean up mappings
                     del self.frigate_to_unifi_event_map[event_id]
