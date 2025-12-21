@@ -72,6 +72,12 @@ class FrigateCam(RTSPCam):
             type=str,
             help="Frigate HTTP API URL (e.g., http://frigate:5000). If provided, snapshots will be fetched via HTTP instead of MQTT.",
         )
+        parser.add_argument(
+            "--frigate-time-sync-ms",
+            default=0,
+            type=int,
+            help="Time synchronization offset in milliseconds to apply to Frigate event timestamps (default: 0). Positive values shift timestamps backward to compensate for Frigate event delay relative to video.",
+        )
 
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
@@ -152,6 +158,12 @@ class FrigateCam(RTSPCam):
         current_zones = after.get("current_zones", [])
         zones = [0] if not current_zones else [0]  # Default to zone 0
         
+        # Extract speed information if available (Frigate provides speeds in km/h or mph)
+        average_speed = after.get("average_estimated_speed", 0)
+        # Convert to appropriate units if needed
+        # UniFi Protect expects positive number or null, stored as float
+        speed = float(average_speed) if average_speed > 0 else None
+        
         descriptor = {
             "trackerID": tracker_id,
             "name": object_type.value,
@@ -165,12 +177,12 @@ class FrigateCam(RTSPCam):
             "attributes": {},  # Optional but included for completeness
             "coord3d": [0, 0, 0],  # Required field: no 3D coordinates available
             "depth": None,  # Optional depth information
-            "speed": None,  # Optional speed information
+            "speed": speed,  # Average estimated speed from Frigate
         }
         
         self.logger.debug(
             f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
-            f"coord={coord}, stationary={stationary}"
+            f"coord={coord}, stationary={stationary}, speed={speed}"
         )
         
         return descriptor
@@ -243,7 +255,7 @@ class FrigateCam(RTSPCam):
     ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
         """
         Fetch all three snapshot types from Frigate HTTP API.
-        Uses timestamp from _active_analytics_event to get snapshot at event midpoint.
+        Uses timestamp from active analytics event to get snapshot at event midpoint.
         
         Args:
             event_id: Frigate event ID
@@ -259,17 +271,20 @@ class FrigateCam(RTSPCam):
         
         # Calculate midpoint timestamp from active analytics event
         timestamp = None
-        if self._active_analytics_event is not None:
-            start_time = self._active_analytics_event.get('start_time')
-            if start_time is not None:
-                current_time = time.time()
-                # Frigate API expects integer timestamp (seconds since epoch)
-                timestamp = int((start_time + current_time) / 2)
-                self.logger.debug(
-                    f"Using event midpoint timestamp for snapshots: {timestamp} "
-                    f"(start={start_time}, current={current_time})"
-                )
-        else:
+        if self._active_analytics_event_id is not None:
+            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+            if active_event:
+                start_time = active_event.get('start_time')
+                if start_time is not None:
+                    current_time = time.time()
+                    # Frigate API expects integer timestamp (seconds since epoch)
+                    timestamp = int((start_time + current_time) / 2)
+                    self.logger.debug(
+                        f"Using event midpoint timestamp for snapshots: {timestamp} "
+                        f"(start={start_time}, current={current_time})"
+                    )
+        
+        if timestamp is None:
             self.logger.debug(f"No active analytics event, fetching snapshots without timestamp")
         
         # Fetch both full snapshot and thumbnail in parallel
@@ -415,14 +430,16 @@ class FrigateCam(RTSPCam):
                         f"box={event_data.get('box')}"
                     )
                     
-                    # Calculate midpoint timestamp from _active_analytics_event if available
+                    # Calculate midpoint timestamp from active analytics event if available
                     timestamp = None
-                    if self._active_analytics_event is not None:
-                        event_start = self._active_analytics_event.get('start_time')
-                        if event_start is not None:
-                            current_time = time.time()
-                            # Frigate API expects integer timestamp (seconds since epoch)
-                            timestamp = int((event_start + current_time) / 2)
+                    if self._active_analytics_event_id is not None:
+                        active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+                        if active_event:
+                            event_start = active_event.get('start_time')
+                            if event_start is not None:
+                                current_time = time.time()
+                                # Frigate API expects integer timestamp (seconds since epoch)
+                                timestamp = int((event_start + current_time) / 2)
                     
                     # Now fetch the snapshot for this event
                     snapshot_path = await self.fetch_snapshot_from_api(event_id, "snapshot", timestamp)
@@ -445,7 +462,7 @@ class FrigateCam(RTSPCam):
         """
         Grab the most recent motion snapshot from Frigate's latest frame API.
         This is a simple snapshot fetch without event context, suitable for generic motion events.
-        Uses the /api/<camera>/latest.jpg endpoint with timestamp from _active_analytics_event.
+        Uses the /api/<camera>/latest.jpg endpoint with timestamp from active analytics event.
         """
         if not self.args.frigate_http_url:
             self.logger.warning("Cannot grab motion snapshot: frigate_http_url not configured")
@@ -455,17 +472,19 @@ class FrigateCam(RTSPCam):
         snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
         
         # Add timestamp parameter from active analytics event if available
-        if self._active_analytics_event is not None:
-            start_time = self._active_analytics_event.get('start_time')
-            if start_time is not None:
-                current_time = time.time()
-                timestamp = (start_time + current_time) / 2
-                # Frigate API expects integer timestamp (seconds since epoch)
-                snapshot_url = f"{snapshot_url}?timestamp={int(timestamp)}"
-                self.logger.debug(
-                    f"Using event midpoint timestamp for motion snapshot: {int(timestamp)} "
-                    f"(start={start_time}, current={current_time})"
-                )
+        if self._active_analytics_event_id is not None:
+            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+            if active_event:
+                start_time = active_event.get('start_time')
+                if start_time is not None:
+                    current_time = time.time()
+                    timestamp = (start_time + current_time) / 2
+                    # Frigate API expects integer timestamp (seconds since epoch)
+                    snapshot_url = f"{snapshot_url}?timestamp={int(timestamp)}"
+                    self.logger.debug(
+                        f"Using event midpoint timestamp for motion snapshot: {int(timestamp)} "
+                        f"(start={start_time}, current={current_time})"
+                    )
         
         self.logger.debug(f"Fetching latest motion snapshot from {snapshot_url}")
         
@@ -504,7 +523,7 @@ class FrigateCam(RTSPCam):
     async def grab_all_motion_snapshots(self) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
         """
         Grab all three snapshot types for generic motion events from Frigate's latest frame API.
-        Fetches full resolution, thumbnail (360p), and heatmap snapshots using timestamp from _active_analytics_event.
+        Fetches full resolution, thumbnail (360p), and heatmap snapshots using timestamp from active analytics event.
         
         Returns:
             Tuple of (snapshot_full, snapshot_crop/thumbnail, heatmap)
@@ -518,15 +537,17 @@ class FrigateCam(RTSPCam):
         
         # Calculate midpoint timestamp from active analytics event
         timestamp = None
-        if self._active_analytics_event is not None:
-            start_time = self._active_analytics_event.get('start_time')
-            if start_time is not None:
-                current_time = time.time()
-                timestamp = int((start_time + current_time) / 2)
-                self.logger.debug(
-                    f"Using event midpoint timestamp for motion snapshots: {timestamp} "
-                    f"(start={start_time}, current={current_time})"
-                )
+        if self._active_analytics_event_id is not None:
+            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+            if active_event:
+                start_time = active_event.get('start_time')
+                if start_time is not None:
+                    current_time = time.time()
+                    timestamp = int((start_time + current_time) / 2)
+                    self.logger.debug(
+                        f"Using event midpoint timestamp for motion snapshots: {timestamp} "
+                        f"(start={start_time}, current={current_time})"
+                    )
         
         # Build URLs for full and thumbnail snapshots
         base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
@@ -713,7 +734,7 @@ class FrigateCam(RTSPCam):
                 custom_descriptor = self.build_descriptor_from_frigate_msg(
                     frigate_msg, object_type
                 )
-                start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)
+                start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms
                 unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, start_time_ms)
                 
                 # Store mapping from Frigate event ID to UniFi event ID
@@ -759,7 +780,7 @@ class FrigateCam(RTSPCam):
                         frigate_msg, object_type
                     )
 
-                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)   
+                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     # Send moving update with updated bounding box
                     await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
                     
@@ -822,7 +843,7 @@ class FrigateCam(RTSPCam):
                     final_descriptor = self.build_descriptor_from_frigate_msg(
                         frigate_msg, object_type
                     )
-                    end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000)
+                    end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     
                     # Fetch all snapshot types - try HTTP API first, fall back to MQTT
                     if self.args.frigate_http_url:

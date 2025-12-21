@@ -48,196 +48,186 @@ class SnapshotHandlers:
         """
         Process a snapshot request from UniFi Protect.
         
-        Handles three types of snapshot requests:
-        1. URL-based filenames (Frigate API integration)
-        2. Regular snapshots with quality parameters
-        3. Motion event snapshots (crop, FoV, heatmap)
+        Handles URL-based snapshots (Frigate), regular snapshots, and motion event snapshots.
         """
         snapshot_type = msg["payload"]["what"]
         filename = msg["payload"].get("filename", "")
         
         self.logger.debug(f"Snapshot request: type={snapshot_type}, filename={filename}")
         
-        # Check if filename contains URL parameters (indicates Frigate API URL)
-        if filename and ("?" in filename or filename.startswith("latest.jpg")):
-            await self._process_frigate_url_snapshot(msg, snapshot_type, filename)
-        # Check if this is a regular snapshot request and Frigate is configured
-        elif snapshot_type == "snapshot" and hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera'):
-            if self.args.frigate_http_url:
-                await self._process_frigate_regular_snapshot(msg)
-            else:
-                # Fall back to legacy method if frigate_http_url not configured
-                await self._process_legacy_snapshot(msg)
+        # Use Frigate if configured and either URL-based or regular snapshot
+        use_frigate = (
+            hasattr(self.args, 'frigate_http_url') and 
+            self.args.frigate_http_url and
+            (filename and "?" in filename or snapshot_type == "snapshot")
+        )
+        
+        if use_frigate:
+            await self._process_frigate_snapshot(msg, snapshot_type, filename)
         else:
-            # Legacy path-based snapshot handling for motion events
             await self._process_motion_event_snapshot(msg, snapshot_type)
-
+        
         if msg["responseExpected"]:
             return self.gen_response("GetRequest", response_to=msg["messageId"])
 
-    async def _process_frigate_url_snapshot(
-        self, msg: dict[str, Any], snapshot_type: str, filename: str
-    ) -> None:
-        """Process URL-based snapshot request (Frigate API integration)"""
-        if not (hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera')):
-            self.logger.warning(f"URL-based filename but Frigate configuration not available")
-            return
+    def _build_frigate_url(self, snapshot_type: str, filename: str) -> str:
+        """
+        Build Frigate snapshot URL with appropriate parameters.
+        
+        Args:
+            snapshot_type: Type of snapshot (motionSnapshot, motionSnapshotFullFoV, etc.)
+            filename: Filename from UniFi request (may contain event_id or timestamp)
             
-        if not self.args.frigate_http_url:
-            self.logger.warning(f"URL-based filename but frigate_http_url not configured")
-            return
+        Returns:
+            Complete URL to fetch snapshot from Frigate
+        """
+        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
         
-        # Determine query parameters based on snapshot type
-        # motionSnapshot: 360p thumbnail with crop
-        # motionSnapshotFullFoV: full resolution
-        # motionHeatmap: full resolution (same as FoV)
+        params = []
+        
+        # Add quality params for thumbnails
         if snapshot_type == "motionSnapshot":
-            # Thumbnail version with height and quality parameters
-            query_params = "height=360&quality=80"
-        elif snapshot_type == "motionSnapshotFullFoV":
-            # Full resolution, no additional parameters beyond timestamp
-            query_params = ""
-        elif snapshot_type == "motionHeatmap":
-            # Heatmap uses full resolution
-            query_params = ""
-        else:
-            # Default to no extra parameters
-            query_params = ""
+            params.extend(["height=360", "quality=80"])
         
-        # Extract timestamp from filename if present
-        timestamp_param = ""
-        if "timestamp=" in filename:
-            # Extract existing timestamp parameter
-            timestamp_param = filename.split("?", 1)[1] if "?" in filename else ""
+        # Extract and convert event_id to timestamp
+        if "event_id=" in filename:
+            event_id_str = filename.split("event_id=", 1)[1].split("&", 1)[0]
+            try:
+                event_id = int(event_id_str)
+                event_data = self._analytics_event_history.get(event_id)
+                if event_data and event_data.get("start_time"):
+                    params.append(f"timestamp={int(event_data['start_time'])}")
+                    self.logger.debug(
+                        f"Converted event_id {event_id} to timestamp {int(event_data['start_time'])} "
+                        f"from analytics event history"
+                    )
+                else:
+                    self.logger.warning(
+                        f"Event ID {event_id} not found in analytics event history "
+                        f"(history size: {len(self._analytics_event_history)})"
+                    )
+            except ValueError:
+                self.logger.warning(f"Invalid event_id in filename: {event_id_str}")
+        elif "timestamp=" in filename:
+            # Preserve existing timestamp parameter
+            timestamp_part = filename.split("?", 1)[1] if "?" in filename else ""
+            if timestamp_part:
+                params.append(timestamp_part)
         
-        # Build final query string
-        if query_params and timestamp_param:
-            final_query = f"{query_params}&{timestamp_param}"
-        elif query_params:
-            final_query = query_params
-        elif timestamp_param:
-            final_query = timestamp_param
-        else:
-            final_query = ""
+        return f"{base_url}?{('&'.join(params))}" if params else base_url
+
+    async def _fetch_and_upload_snapshot(
+        self, 
+        snapshot_url: str, 
+        upload_uri: str, 
+        form_fields: dict[str, Any],
+        snapshot_type: str
+    ) -> bool:
+        """
+        Fetch snapshot from URL and upload to UniFi Protect.
         
-        # Build the full URL to Frigate
-        # Always use 'latest.jpg' as the base - Frigate API endpoint
-        # (UniFi may send latest_fullfov.jpg, latest_heatmap.jpg, etc. but Frigate only has latest.jpg)
-        if final_query:
-            snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{final_query}"
-        else:
-            snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
+        Args:
+            snapshot_url: URL to fetch snapshot from
+            upload_uri: UniFi Protect upload endpoint
+            form_fields: Additional form fields for upload
+            snapshot_type: Type of snapshot for logging
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                    if response.status != 200:
+                        error_body = await response.text()
+                        self.logger.warning(
+                            f"Failed to fetch {snapshot_type}: HTTP {response.status}, {error_body}"
+                        )
+                        return False
+                    
+                    image_data = await response.read()
+                    self.logger.info(f"Fetched {snapshot_type} from Frigate ({len(image_data)} bytes)")
+                    
+                    # Upload to UniFi Protect
+                    files = {"payload": image_data}
+                    files.update(form_fields)
+                    
+                    await session.post(upload_uri, data=files, ssl=self._ssl_context)
+                    self.logger.debug(f"Uploaded {snapshot_type}")
+                    return True
+                    
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Timeout fetching {snapshot_type}")
+            return False
+        except aiohttp.ClientError:
+            self.logger.exception(f"Failed to fetch/upload {snapshot_type}")
+            return False
+
+    async def _upload_file_to_protect(
+        self, 
+        file_path: Optional[Path], 
+        upload_uri: str, 
+        form_fields: dict[str, Any], 
+        snapshot_type: str
+    ) -> bool:
+        """
+        Upload a file from disk to UniFi Protect.
         
+        Args:
+            file_path: Path to snapshot file
+            upload_uri: UniFi Protect upload endpoint
+            form_fields: Additional form fields for upload
+            snapshot_type: Type of snapshot for logging
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not file_path or not file_path.exists():
+            self.logger.warning(f"Snapshot file {file_path} not ready for {snapshot_type}")
+            return False
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                files = {"payload": open(file_path, "rb")}
+                files.update(form_fields)
+                await session.post(upload_uri, data=files, ssl=self._ssl_context)
+                self.logger.debug(f"Uploaded {snapshot_type} from {file_path}")
+                return True
+        except aiohttp.ClientError:
+            self.logger.exception(f"Failed to upload {snapshot_type}")
+            return False
+
+    async def _process_frigate_snapshot(
+        self, msg: dict[str, Any], snapshot_type: str, filename: str = ""
+    ) -> None:
+        """
+        Process snapshot request using Frigate API.
+        
+        Args:
+            msg: Message from UniFi Protect
+            snapshot_type: Type of snapshot requested
+            filename: Filename from request (may contain event_id or timestamp)
+        """
+        snapshot_url = self._build_frigate_url(snapshot_type, filename)
         self.logger.info(f"Fetching {snapshot_type} from Frigate: {snapshot_url}")
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Fetch from Frigate
-                async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                    if response.status == 200:
-                        image_data = await response.read()
-                        self.logger.info(f"Fetched {snapshot_type} from Frigate ({len(image_data)} bytes)")
-                        
-                        # Upload to UniFi Protect
-                        files = {"payload": image_data}
-                        files.update(msg["payload"].get("formFields", {}))
-                        
-                        try:
-                            await session.post(
-                                msg["payload"]["uri"],
-                                data=files,
-                                ssl=self._ssl_context,
-                            )
-                            self.logger.debug(f"Uploaded {snapshot_type} from Frigate URL")
-                        except aiohttp.ClientError:
-                            self.logger.exception("Failed to upload snapshot to UniFi Protect")
-                    else:
-                        error_body = await response.text()
-                        self.logger.warning(
-                            f"Failed to fetch {snapshot_type} from Frigate: "
-                            f"HTTP {response.status}, Response: {error_body}"
-                        )
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching {snapshot_type} from Frigate")
-        except Exception as e:
-            self.logger.error(f"Error fetching {snapshot_type} from Frigate: {e}")
-
-    async def _process_frigate_regular_snapshot(self, msg: dict[str, Any]) -> None:
-        """Process regular snapshot request with Frigate integration"""
-        # Determine query parameters based on quality
-        quality_param = msg["payload"].get("quality", "medium")
-        
-        # Map UniFi quality levels to height parameters
-        if quality_param == "high":
-            query_params = "height=1080&quality=95"
-        elif quality_param == "medium":
-            query_params = "height=720&quality=85"
-        elif quality_param == "low":
-            query_params = "height=360&quality=70"
-        else:
-            # Default to medium quality
-            query_params = "height=720&quality=85"
-        
-        # Build the full URL to Frigate
-        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{query_params}"
-        
-        self.logger.info(f"Fetching snapshot (quality={quality_param}) from Frigate: {snapshot_url}")
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Fetch from Frigate
-                async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                    if response.status == 200:
-                        image_data = await response.read()
-                        self.logger.info(f"Fetched snapshot from Frigate ({len(image_data)} bytes)")
-                        
-                        # Upload to UniFi Protect
-                        files = {"payload": image_data}
-                        files.update(msg["payload"].get("formFields", {}))
-                        
-                        try:
-                            await session.post(
-                                msg["payload"]["uri"],
-                                data=files,
-                                ssl=self._ssl_context,
-                            )
-                            self.logger.debug(f"Uploaded snapshot from Frigate")
-                        except aiohttp.ClientError:
-                            self.logger.exception("Failed to upload snapshot to UniFi Protect")
-                    else:
-                        error_body = await response.text()
-                        self.logger.warning(
-                            f"Failed to fetch snapshot from Frigate: "
-                            f"HTTP {response.status}, Response: {error_body}"
-                        )
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching snapshot from Frigate")
-        except Exception as e:
-            self.logger.error(f"Error fetching snapshot from Frigate: {e}")
-
-    async def _process_legacy_snapshot(self, msg: dict[str, Any]) -> None:
-        """Process snapshot using legacy get_snapshot method"""
-        path = await self.get_snapshot()
-        if path and path.exists():
-            async with aiohttp.ClientSession() as session:
-                files = {"payload": open(path, "rb")}
-                files.update(msg["payload"].get("formFields", {}))
-                try:
-                    await session.post(
-                        msg["payload"]["uri"],
-                        data=files,
-                        ssl=self._ssl_context,
-                    )
-                    self.logger.debug(f"Uploaded snapshot from {path}")
-                except aiohttp.ClientError:
-                    self.logger.exception("Failed to upload snapshot")
-        else:
-            self.logger.warning(f"Snapshot file {path} is not ready yet, skipping upload")
+        await self._fetch_and_upload_snapshot(
+            snapshot_url,
+            msg["payload"]["uri"],
+            msg["payload"].get("formFields", {}),
+            snapshot_type
+        )
 
     async def _process_motion_event_snapshot(
         self, msg: dict[str, Any], snapshot_type: str
     ) -> None:
-        """Process motion event snapshot (crop, FoV, heatmap)"""
+        """
+        Process motion event snapshot (crop, FoV, heatmap).
+        
+        Args:
+            msg: Message from UniFi Protect
+            snapshot_type: Type of snapshot requested
+        """
         # Select appropriate snapshot based on request type
         if snapshot_type == "motionSnapshot":
             # Cropped image with bounding box
@@ -255,20 +245,9 @@ class SnapshotHandlers:
             # Regular snapshot request (fallback to get_snapshot method)
             path = await self.get_snapshot()
 
-        if path and path.exists():
-            async with aiohttp.ClientSession() as session:
-                files = {"payload": open(path, "rb")}
-                files.update(msg["payload"].get("formFields", {}))
-                try:
-                    await session.post(
-                        msg["payload"]["uri"],
-                        data=files,
-                        ssl=self._ssl_context,
-                    )
-                    self.logger.debug(f"Uploaded {snapshot_type} from {path}")
-                except aiohttp.ClientError:
-                    self.logger.exception("Failed to upload snapshot")
-        else:
-            self.logger.warning(
-                f"Snapshot file {path} is not ready yet, skipping upload for {snapshot_type}"
-            )
+        await self._upload_file_to_protect(
+            path,
+            msg["payload"]["uri"],
+            msg["payload"].get("formFields", {}),
+            snapshot_type
+        )

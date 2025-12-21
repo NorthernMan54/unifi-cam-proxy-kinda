@@ -53,14 +53,16 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 _motion_heatmap: Motion heatmap visualization (falls back to FoV if unavailable)
             Event Tracking:
                 _motion_event_id (int): Sequential identifier for motion events
-                # Structure: Optional[dict[str, Any]] with keys:
+                # Structure: dict[int, dict[str, Any]] - keyed by event_id, values contain:
                 #   - event_id (int): Unique event identifier
                 #   - start_time (float): Event start time
+                #   - end_time (Optional[float]): Event end time (None if still active)
                 #   - event_timestamp (Optional[float]): Event timestamp
                 #   - snapshot_filename (Optional[str]): Filename for motionSnapshot
                 #   - snapshot_fov_filename (Optional[str]): Filename for motionSnapshotFullFoV
                 #   - heatmap_filename (Optional[str]): Filename for motionHeatmap
-                _active_analytics_event: Current generic motion (EventAnalytics) event state
+                _analytics_event_history: History of all analytics events (kept for 1 hour after completion)
+                _active_analytics_event_id: ID of current active analytics event (None if no active event)
                 # Structure: dict[int, dict[str, Any]] - keyed by event_id, values contain:
                 #   - event_id (int): Unique event identifier
                 #   - object_type (SmartDetectObjectType): Detected object classification
@@ -103,7 +105,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         # Enhanced event tracking to support overlapping events
         # Track both generic motion (EventAnalytics) and smart detect events (EventSmartDetect)
-        self._active_analytics_event: Optional[dict[str, Any]] = None  # Generic motion event
+        # Store all events (active and completed) for 1 hour to support snapshot retrieval
+        self._analytics_event_history: dict[int, dict[str, Any]] = {}  # All analytics events by event_id
+        self._active_analytics_event_id: Optional[int] = None  # Current active analytics event ID
         self._active_smart_events: dict[int, dict[str, Any]] = {}  # Smart detect events by event_id
         
         # Legacy compatibility (deprecated, use _active_* instead)
@@ -266,6 +270,37 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     # idleSinceTimeMs: a.default.number().finite().optional()
     ###
 
+
+    # API for subclasses - Smart Detect Events
+    def _cleanup_old_analytics_events(self) -> None:
+        """
+        Remove analytics events older than 1 hour from history.
+        Called at the start of each new motion event to keep memory usage bounded.
+        """
+        current_time = time.time()
+        one_hour_ago = current_time - 3600  # 1 hour in seconds
+        
+        # Find events to remove
+        events_to_remove = []
+        for event_id, event_data in self._analytics_event_history.items():
+            # Use end_time if event is completed, otherwise use start_time
+            event_time = event_data.get('end_time') or event_data.get('start_time', 0)
+            if event_time < one_hour_ago:
+                events_to_remove.append(event_id)
+        
+        # Remove old events
+        for event_id in events_to_remove:
+            del self._analytics_event_history[event_id]
+            self.logger.debug(
+                f"Cleaned up analytics event {event_id} "
+                f"(age: {(current_time - self._analytics_event_history.get(event_id, {}).get('end_time', current_time)) / 60:.1f} minutes)"
+            )
+        
+        if events_to_remove:
+            self.logger.info(
+                f"Cleaned up {len(events_to_remove)} old analytics events. "
+                f"Remaining in history: {len(self._analytics_event_history)}"
+            )
 
     # API for subclasses - Smart Detect Events
     async def trigger_smart_detect_start(
@@ -508,7 +543,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self._motion_object_type = None
             self._motion_last_descriptor = None
             # Only clear motion_event_ts if no analytics event is active
-            if self._active_analytics_event is None:
+            if self._active_analytics_event_id is None:
                 self._motion_event_ts = None
 
     # API for subclasses - Analytics (Motion) Events
@@ -522,6 +557,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         Args:
             event_timestamp: Optional timestamp for the event
         """
+        # Clean up old events before starting a new one
+        self._cleanup_old_analytics_events()
+        
         current_time = time.time()
         
         # Get the next available event ID and increment counter
@@ -530,14 +568,16 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         self._motion_event_id += 1
         
         # Check if we already have an active analytics event
-        if self._active_analytics_event is not None:
-            existing_start = self._active_analytics_event['start_time']
-            self.logger.warning(
-                f"Analytics event {self._active_analytics_event['event_id']} already active "
-                f"(started: {current_time - existing_start:.1f}s ago). "
-                f"Ignoring duplicate start."
-            )
-            return
+        if self._active_analytics_event_id is not None:
+            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+            if active_event:
+                existing_start = active_event['start_time']
+                self.logger.warning(
+                    f"Analytics event {self._active_analytics_event_id} already active "
+                    f"(started: {current_time - existing_start:.1f}s ago). "
+                    f"Ignoring duplicate start."
+                )
+                return
         
         payload: dict[str, Any] = {
             "clockBestMonotonic": 0,
@@ -563,16 +603,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self.gen_response("EventAnalytics", payload=payload)
         )
         
-        # Track this analytics event
-        self._active_analytics_event = {
+        # Track this analytics event in history
+        self._analytics_event_history[event_id] = {
             "event_id": event_id,
             "start_time": current_time,
+            "end_time": None,  # Will be set when event stops
             "event_timestamp": event_timestamp,
             # Snapshot filenames to be used in EventAnalytics stop payload
             "snapshot_filename": None,
             "snapshot_fov_filename": None,
             "heatmap_filename": None,
         }
+        self._active_analytics_event_id = event_id
         
         # Update legacy compatibility fields
         if not self._motion_event_ts:  # Only set if not already set by smart detect
@@ -589,30 +631,38 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             event_timestamp: Optional timestamp for the event
         """
         # Get the event ID from the active analytics event
-        if self._active_analytics_event is None:
+        if self._active_analytics_event_id is None:
             self.logger.warning(
                 f"trigger_analytics_stop called but no active event found. "
                 f"Event may have already ended or never started. Ignoring."
             )
             return
         
-        event_id = self._active_analytics_event["event_id"]
+        event_id = self._active_analytics_event_id
+        active_event = self._analytics_event_history.get(event_id)
+        
+        if not active_event:
+            self.logger.warning(
+                f"trigger_analytics_stop called for event {event_id} but event not found in history. Ignoring."
+            )
+            self._active_analytics_event_id = None
+            return
         
         # Generate URL-based filenames using Frigate API pattern
         # UniFi expects different filename for FoV, but same base for snapshot and heatmap
-        current_timestamp = int(time.time())
-        snapshot_filename = f"latest.jpg?timestamp={current_timestamp}"
-        snapshot_fov_filename = f"latest_fullfov.jpg?timestamp={current_timestamp}"
-        heatmap_filename = f"latest.jpg?timestamp={current_timestamp}"
+        snapshot_filename = f"latest.jpg?event_id={event_id}"
+        snapshot_fov_filename = f"latest_fullfov.jpg?event_id={event_id}"
+        heatmap_filename = f"latest.jpg?event_id={event_id}"
         
-        # Store filenames in the active event for later retrieval
-        self._active_analytics_event["snapshot_filename"] = snapshot_filename
-        self._active_analytics_event["snapshot_fov_filename"] = snapshot_fov_filename
-        self._active_analytics_event["heatmap_filename"] = heatmap_filename
+        # Store filenames and end time in the event history
+        active_event["snapshot_filename"] = snapshot_filename
+        active_event["snapshot_fov_filename"] = snapshot_fov_filename
+        active_event["heatmap_filename"] = heatmap_filename
+        active_event["end_time"] = time.time()
         
         payload: dict[str, Any] = {
             "clockBestMonotonic": int(self.get_uptime()),
-            "clockBestWall": int(round(self._active_analytics_event["start_time"] * 1000)),
+            "clockBestWall": int(round(active_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
@@ -626,17 +676,20 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "motionSnapshotFullFoV": snapshot_fov_filename,
         }
         
-        duration = time.time() - self._active_analytics_event["start_time"]
+        duration = time.time() - active_event["start_time"]
         self.logger.info(
             f"Stopping analytics event {event_id} (duration: {duration:.1f}s)"
+        )
+        self.logger.debug(
+            f"Analytics event details: {active_event}"
         )
         
         await self.send(
             self.gen_response("EventAnalytics", payload=payload)
         )
         
-        # Clean up analytics event
-        self._active_analytics_event = None
+        # Mark as no longer active (but keep in history for snapshot retrieval)
+        self._active_analytics_event_id = None
         
         # Update legacy compatibility fields
         if not self._active_smart_events:
@@ -722,12 +775,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         Get a summary of currently active motion events.
         Useful for debugging and monitoring event state.
         """
+        active_analytics = self._analytics_event_history.get(self._active_analytics_event_id) if self._active_analytics_event_id else None
+        
         return {
             "analytics_event": {
-                "active": self._active_analytics_event is not None,
-                "event_id": self._active_analytics_event["event_id"] if self._active_analytics_event else None,
-                "duration": time.time() - self._active_analytics_event["start_time"] 
-                    if self._active_analytics_event else None,
+                "active": self._active_analytics_event_id is not None,
+                "event_id": self._active_analytics_event_id,
+                "duration": time.time() - active_analytics["start_time"] 
+                    if active_analytics else None,
             },
             "smart_detect_events": {
                 event_id: {
@@ -740,7 +795,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 }
                 for event_id, event in self._active_smart_events.items()
             },
-            "total_active_events": (1 if self._active_analytics_event else 0) + len(self._active_smart_events),
+            "total_active_events": (1 if self._active_analytics_event_id else 0) + len(self._active_smart_events),
+            "analytics_history_count": len(self._analytics_event_history),
         }
     
     async def stop_all_motion_events(self) -> None:
@@ -764,7 +820,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 )
         
         # Stop analytics event if active
-        if self._active_analytics_event is not None:
+        if self._active_analytics_event_id is not None:
             self.logger.info("Force stopping analytics event")
             try:
                 await self.trigger_motion_stop()
