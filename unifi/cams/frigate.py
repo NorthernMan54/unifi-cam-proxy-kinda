@@ -705,19 +705,8 @@ class FrigateCam(RTSPCam):
                         await self.trigger_smart_detect_stop(old_event["object_type"])
                     del self.frigate_to_unifi_event_map[event_id]
                 
-                # Get the current UniFi event ID (from the motion event Frigate already started)
-                unifi_event_id = self._motion_event_id
-                
-                # Store mapping from Frigate event ID to UniFi event ID
-                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
-                
                 # Create snapshot ready event for this Frigate event
                 self.event_snapshot_ready[event_id] = asyncio.Event()
-                
-                self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
-                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
-                )
                 
                 # Send smart detect event as update to existing motion event
                 # Build custom descriptor from Frigate data
@@ -725,7 +714,15 @@ class FrigateCam(RTSPCam):
                     frigate_msg, object_type
                 )
                 start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)
-                await self.trigger_smart_detect_start(object_type, custom_descriptor, start_time_ms)
+                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, start_time_ms)
+                
+                # Store mapping from Frigate event ID to UniFi event ID
+                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
+                
+                self.logger.info(
+                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
+                )
                 
                 # Fetch snapshots if available
                 has_snapshot = after_data.get('has_snapshot', False)
@@ -753,6 +750,7 @@ class FrigateCam(RTSPCam):
                         self.logger.warning(
                             f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
                             f"but that event is not active. Skipping update."
+                            f"active _active_smart_events: {list(self._active_smart_events.keys())}"
                         )
                         return
                     
@@ -761,7 +759,7 @@ class FrigateCam(RTSPCam):
                         frigate_msg, object_type
                     )
 
-                    frame_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000)   
+                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)   
                     # Send moving update with updated bounding box
                     await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
                     

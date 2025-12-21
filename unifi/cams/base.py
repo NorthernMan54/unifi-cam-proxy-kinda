@@ -19,6 +19,7 @@ import aiohttp
 import websockets
 
 from unifi.core import RetryableError
+from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers
 
 AVClientRequest = AVClientResponse = dict[str, Any]
 
@@ -28,7 +29,7 @@ class SmartDetectObjectType(Enum):
     VEHICLE = "vehicle"
 
 
-class UnifiCamBase(metaclass=ABCMeta):
+class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, metaclass=ABCMeta):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         """
         Initialize the camera base with configuration and state management.
@@ -199,9 +200,6 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def get_stream_source(self, stream_index: str) -> str:
         raise NotImplementedError("You need to write this!")
 
-    def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
-        return self.args.ffmpeg_args
-
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
             "mic": True,
@@ -275,7 +273,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
-    ) -> None:
+    ) -> int:
         """
         Start a smart detect event for a specific object type.
         
@@ -283,11 +281,17 @@ class UnifiCamBase(metaclass=ABCMeta):
             object_type: The type of object detected (person, vehicle, etc.)
             custom_descriptor: Optional descriptor data (bounding box, etc.)
             event_timestamp: Optional timestamp for the event
+            
+        Returns:
+            The UniFi event ID for this smart detect event
         """
         current_time = time.time()
         
-        # Get the next available event ID and increment counter
-        event_id = self._motion_event_id
+        # Compose a globally-unique event ID using epoch milliseconds plus a local counter.
+        # Embedding time reduces collisions across restarts/instances while keeping a small
+        # incrementing counter for uniqueness within the same millisecond.
+        epoch_ms = int(time.time() * 1000)
+        event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
         self._motion_event_id += 1
         
         # Check if we already have an active smart detect event with this event_id
@@ -299,7 +303,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f"started: {current_time - existing_event['start_time']:.1f}s ago). "
                 f"Ignoring duplicate start for {object_type.value}."
             )
-            return
+            return event_id
         
         # Build descriptors array
         descriptors = []
@@ -318,7 +322,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "levels": {"0": 99},
             "objectTypes": [object_type.value],
-            "zonesStatus": {"0": {"score": 99}},
+            "zonesStatus": {"1": {"score": 99}},
             "smartDetectSnapshot": "smartDetectSnapshotline209.png",
             "displayTimeoutMSec": 5000,
             "motionHeatmap": "motionHeatmapline211.png",
@@ -353,6 +357,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_event_ts = current_time
         self._motion_object_type = object_type
         self._motion_last_descriptor = custom_descriptor
+        
+        return event_id
 
     async def trigger_smart_detect_update(
         self,
@@ -393,8 +399,8 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._motion_last_descriptor = custom_descriptor  # Legacy compatibility
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
+            "clockBestMonotonic": int(self.get_uptime()),
+            "clockBestWall": int(round(active_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
@@ -404,13 +410,13 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "levels": {"0": 48},
             "objectTypes": [object_type.value],
-            "zonesStatus": {"0": {"score": 48}},
+            "zonesStatus": {"1": {"score": 75}},
             "smartDetectSnapshot": "smartDetectSnapshotline399.png",
             "displayTimeoutMSec": 10000,
             "descriptors": descriptors,
             "motionHeatmap": "motionHeatmapline402.png",
             "motionSnapshot": "motionSnapshotline403.png",
-             "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline413.png",
+            "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline413.png",
             "snapshot": "smartDetectSnapshotline414.png",
         }
         
@@ -461,8 +467,8 @@ class UnifiCamBase(metaclass=ABCMeta):
             descriptors = [active_event["last_descriptor"]]
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
+            "clockBestMonotonic": int(self.get_uptime()),
+            "clockBestWall": int(round(active_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
@@ -472,7 +478,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "levels": {"0": 49},
             "objectTypes": [object_type.value],
-            "zonesStatus": {"0": {"score": 48}},
+            "zonesStatus": {"1": {"score": 75}},
             "smartDetectSnapshot": "smartDetectSnapshotline472.jpg",
             "displayTimeoutMSec": 1000,
             "descriptors": descriptors,
@@ -519,7 +525,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         current_time = time.time()
         
         # Get the next available event ID and increment counter
-        event_id = self._motion_event_id
+        epoch_ms = int(time.time() * 1000)
+        event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
         self._motion_event_id += 1
         
         # Check if we already have an active analytics event
@@ -604,12 +611,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._active_analytics_event["heatmap_filename"] = heatmap_filename
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
+            "clockBestMonotonic": int(self.get_uptime()),
+            "clockBestWall": int(round(self._active_analytics_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
-            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "clockWall": int(round(time.time() * 1000)),
             "edgeType": "stop",
             "eventId": event_id,
             "eventType": "motion",
@@ -710,39 +717,6 @@ class UnifiCamBase(metaclass=ABCMeta):
         else:
             await self.trigger_analytics_stop(event_timestamp)
 
-    def update_motion_snapshot(self, path: Path) -> None:
-        """
-        Update motion snapshot (legacy method).
-        By default, updates all three snapshot types to the same path.
-        For more granular control, use update_motion_snapshots().
-        """
-        self._motion_snapshot = path
-        self._motion_snapshot_crop = path
-        self._motion_snapshot_fov = path
-        self._motion_heatmap = path
-    
-    def update_motion_snapshots(
-        self,
-        crop: Optional[Path] = None,
-        fov: Optional[Path] = None,
-        heatmap: Optional[Path] = None,
-    ) -> None:
-        """
-        Update specific motion snapshot types.
-        
-        Args:
-            crop: Path to cropped snapshot with bounding box (motionSnapshot)
-            fov: Path to full field-of-view snapshot with bounding box (motionSnapshotFullFoV)
-            heatmap: Path to heatmap visualization (motionHeatmap)
-        """
-        if crop is not None:
-            self._motion_snapshot_crop = crop
-            self._motion_snapshot = crop  # Update legacy field
-        if fov is not None:
-            self._motion_snapshot_fov = fov
-        if heatmap is not None:
-            self._motion_heatmap = heatmap
-    
     def get_active_events_summary(self) -> dict[str, Any]:
         """
         Get a summary of currently active motion events.
@@ -814,48 +788,6 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._msg_id += 1
         return self._msg_id
 
-    def probe_video_resolution(self, stream_index: str, source_url: str) -> tuple[int, int]:
-        """Probe video source to detect width and height using ffprobe"""
-        # Get default resolution for this stream
-        default_width, default_height = self._detected_resolutions[stream_index]
-        
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height',
-                '-of', 'json',
-                '-rtsp_transport', self.args.rtsp_transport,
-                source_url
-            ]
-            self.logger.info(f"Probing {stream_index} source: {source_url}")
-            result = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
-                timeout=15
-            )
-            
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                if data.get('streams') and len(data['streams']) > 0:
-                    width = data['streams'][0].get('width', default_width)
-                    height = data['streams'][0].get('height', default_height)
-                    self.logger.info(f"Detected {stream_index} resolution: {width}x{height}")
-                    return width, height
-                    
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"{stream_index} probe timed out after 15 seconds, using defaults")
-        except json.JSONDecodeError as e:
-            self.logger.warning(f"Could not parse ffprobe output for {stream_index}: {e}, using defaults")
-        except Exception as e:
-            self.logger.warning(f"Could not probe {stream_index} source: {e}, using defaults")
-        
-        # Fallback to defaults for this stream
-        self.logger.info(f"Using default resolution for {stream_index}: {default_width}x{default_height}")
-        return default_width, default_height
-
     async def init_adoption(self) -> None:
         self.logger.info(
             f"Adopting with token [{self.args.token}] and mac [{self.args.mac}]"
@@ -919,19 +851,6 @@ class UnifiCamBase(metaclass=ABCMeta):
             ),
         )
 
-    async def process_hello(self, msg: AVClientRequest) -> None:
-        pass
-
-    async def process_param_agreement(self, msg: AVClientRequest) -> AVClientResponse:
-        return self.gen_response(
-            "ubnt_avclient_paramAgreement",
-            msg["messageId"],
-            {
-                "authToken": self.args.token,
-                "features": await self.get_feature_flags(),
-            },
-        )
-
     async def process_upgrade(self, msg: AVClientRequest) -> None:
         url = msg["payload"]["uri"]
         headers = {"Range": "bytes=0-100"}
@@ -947,721 +866,6 @@ class UnifiCamBase(metaclass=ABCMeta):
                 self.logger.debug(f"Pretending to upgrade to: {version}")
                 self.args.fw_version = version
 
-    async def process_isp_settings(self, msg: AVClientRequest) -> AVClientResponse:
-        payload = {
-            "aeMode": "auto",
-            "aeTargetPercent": 50,
-            "aggressiveAntiFlicker": 0,
-            "brightness": 50,
-            "contrast": 50,
-            "criticalTmpOfProtect": 40,
-            "darkAreaCompensateLevel": 0,
-            "denoise": 50,
-            "enable3dnr": 1,
-            "enableMicroTmpProtect": 1,
-            "enablePauseMotion": 0,
-            "flip": 0,
-            "focusMode": "ztrig",
-            "focusPosition": 0,
-            "forceFilterIrSwitchEvents": 0,
-            "hue": 50,
-            "icrLightSensorNightThd": 0,
-            "icrSensitivity": 0,
-            "irLedLevel": 215,
-            "irLedMode": "auto",
-            "irOnStsBrightness": 0,
-            "irOnStsContrast": 0,
-            "irOnStsDenoise": 0,
-            "irOnStsHue": 0,
-            "irOnStsSaturation": 0,
-            "irOnStsSharpness": 0,
-            "irOnStsWdr": 0,
-            "irOnValBrightness": 50,
-            "irOnValContrast": 50,
-            "irOnValDenoise": 50,
-            "irOnValHue": 50,
-            "irOnValSaturation": 50,
-            "irOnValSharpness": 50,
-            "irOnValWdr": 1,
-            "mirror": 0,
-            "queryIrLedStatus": 0,
-            "saturation": 50,
-            "sharpness": 50,
-            "touchFocusX": 1001,
-            "touchFocusY": 1001,
-            "wdr": 1,
-            "zoomPosition": 0,
-        }
-        payload.update(await self.get_video_settings())
-        return self.gen_response(
-            "ResetIspSettings",
-            msg["messageId"],
-            payload,
-        )
-  
-    async def process_video_settings(self, msg: AVClientRequest) -> AVClientResponse:
-        vid_dst = {
-            "video1": ["file:///dev/null"],
-            "video2": ["file:///dev/null"],
-            "video3": ["file:///dev/null"],
-        }
-
-        if msg["payload"] is not None and "video" in msg["payload"]:
-            for k, v in msg["payload"]["video"].items():
-                if v:
-                    if "avSerializer" in v:
-                        vid_dst[k] = v["avSerializer"]["destinations"]
-                        # Check if any destination contains /dev/null (means stop stream)
-                        if any("/dev/null" in dest for dest in vid_dst[k]):
-                            self.stop_video_stream(k)
-                            # Remove stream from tracking when stopping
-                            if k in self._streams:
-                                del self._streams[k]
-                        elif "parameters" in v["avSerializer"]:
-                            self._streams[k] = stream = v["avSerializer"]["parameters"][
-                                "streamName"
-                            ]
-                            try:
-                                host, port = urlparse(
-                                    v["avSerializer"]["destinations"][0]
-                                ).netloc.split(":")
-                                await self.start_video_stream(
-                                    k, stream, destination=(host, int(port))
-                                )
-                            except ValueError:
-                                pass
-
-        return self.gen_response(
-            "ChangeVideoSettings",
-            msg["messageId"],
-            {
-                "audio": {
-                    "bitRate": 32000,
-                    "channels": 1,
-                    "description": "audio track",
-                    "enableTemporalNoiseShaping": False,
-                    "enabled": True,
-                    "mode": 0,
-                    "quality": 0,
-                    "sampleRate": 11025,
-                    "type": "aac",
-                    "volume": 0,
-                },
-                "firmwarePath": "/lib/firmware/",
-                "video": {
-                    "enableHrd": False,
-                    "hdrMode": 0,
-                    "lowDelay": False,
-                    "videoMode": "default",
-                    "mjpg": {
-                        "avSerializer": {
-                            "destinations": [
-                                "file:///tmp/snap.jpeg",
-                                "file:///tmp/snap_av.jpg",
-                            ],
-                            "parameters": {
-                                "audioId": 1000,
-                                "enableTimestampsOverlapAvoidance": False,
-                                "suppressAudio": True,
-                                "suppressVideo": False,
-                                "videoId": 1001,
-                            },
-                            "type": "mjpg",
-                        },
-                        "bitRateCbrAvg": 500000,
-                        "bitRateVbrMax": 500000,
-                        "bitRateVbrMin": None,
-                        "description": "JPEG pictures",
-                        "enabled": True,
-                        "fps": 5,
-                        "height": 720,
-                        "isCbr": False,
-                        "maxFps": 5,
-                        "minClientAdaptiveBitRate": 0,
-                        "minMotionAdaptiveBitRate": 0,
-                        "nMultiplier": None,
-                        "name": "mjpg",
-                        "quality": 80,
-                        "sourceId": 3,
-                        "streamId": 8,
-                        "streamOrdinal": 3,
-                        "type": "mjpg",
-                        "validBitrateRangeMax": 6000000,
-                        "validBitrateRangeMin": 32000,
-                        "width": 1280,
-                    },
-                    "video1": {
-                        "M": 1,
-                        "N": 30,
-                        "avSerializer": {
-                            "destinations": vid_dst["video1"],
-                            "parameters": (
-                                None
-                                if "video1" not in self._streams
-                                else {
-                                    "audioId": None,
-                                    "streamName": self._streams["video1"],
-                                    "suppressAudio": None,
-                                    "suppressVideo": None,
-                                    "videoId": None,
-                                }
-                            ),
-                            "type": "extendedFlv",
-                        },
-                        "bitRateCbrAvg": 8192000,
-                        "bitRateVbrMax": 2800000,
-                        "bitRateVbrMin": 48000,
-                        "description": "Hi quality video track",
-                        "enabled": True,
-                        "fps": 20,
-                        "gopModel": 0,
-                        "height": self._detected_resolutions["video1"][1],
-                        "horizontalFlip": False,
-                        "isCbr": False,
-                        "maxFps": 30,
-                        "minClientAdaptiveBitRate": 0,
-                        "minMotionAdaptiveBitRate": 0,
-                        "nMultiplier": 6,
-                        "name": "video1",
-                        "sourceId": 0,
-                        "streamId": 1,
-                        "streamOrdinal": 0,
-                        "type": "h264",
-                        "validBitrateRangeMax": 2800000,
-                        "validBitrateRangeMin": 32000,
-                        "validFpsValues": [
-                            1,
-                            2,
-                            3,
-                            4,
-                            5,
-                            6,
-                            8,
-                            9,
-                            10,
-                            12,
-                            15,
-                            16,
-                            18,
-                            20,
-                            24,
-                            25,
-                            30,
-                        ],
-                        "verticalFlip": False,
-                        "width": self._detected_resolutions["video1"][0],
-                    },
-                    "video2": {
-                        "M": 1,
-                        "N": 30,
-                        "avSerializer": {
-                            "destinations": vid_dst["video2"],
-                            "parameters": (
-                                None
-                                if "video2" not in self._streams
-                                else {
-                                    "audioId": None,
-                                    "streamName": self._streams["video2"],
-                                    "suppressAudio": None,
-                                    "suppressVideo": None,
-                                    "videoId": None,
-                                }
-                            ),
-                            "type": "extendedFlv",
-                        },
-                        "bitRateCbrAvg": 1024000,
-                        "bitRateVbrMax": 1200000,
-                        "bitRateVbrMin": 48000,
-                        "currentVbrBitrate": 1200000,
-                        "description": "Medium quality video track",
-                        "enabled": True,
-                        "fps": 10,
-                        "gopModel": 0,
-                        "height": self._detected_resolutions["video2"][1],
-                        "horizontalFlip": False,
-                        "isCbr": False,
-                        "maxFps": 30,
-                        "minClientAdaptiveBitRate": 0,
-                        "minMotionAdaptiveBitRate": 0,
-                        "nMultiplier": 6,
-                        "name": "video2",
-                        "sourceId": 1,
-                        "streamId": 2,
-                        "streamOrdinal": 1,
-                        "type": "h264",
-                        "validBitrateRangeMax": 1500000,
-                        "validBitrateRangeMin": 32000,
-                        "validFpsValues": [
-                            1,
-                            2,
-                            3,
-                            4,
-                            5,
-                            6,
-                            8,
-                            9,
-                            10,
-                            12,
-                            15,
-                            16,
-                            18,
-                            20,
-                            24,
-                            25,
-                            30,
-                        ],
-                        "verticalFlip": False,
-                        "width": self._detected_resolutions["video2"][0],
-                    },
-                    "video3": {
-                        "M": 1,
-                        "N": 30,
-                        "avSerializer": {
-                            "destinations": vid_dst["video3"],
-                            "parameters": (
-                                None
-                                if "video3" not in self._streams
-                                else {
-                                    "audioId": None,
-                                    "streamName": self._streams["video3"],
-                                    "suppressAudio": None,
-                                    "suppressVideo": None,
-                                    "videoId": None,
-                                }
-                            ),
-                            "type": "extendedFlv",
-                        },
-                        "bitRateCbrAvg": 300000,
-                        "bitRateVbrMax": 200000,
-                        "bitRateVbrMin": 48000,
-                        "currentVbrBitrate": 200000,
-                        "description": "Low quality video track",
-                        "enabled": True,
-                        "fps": 15,
-                        "gopModel": 0,
-                        "height": self._detected_resolutions["video3"][1],
-                        "horizontalFlip": False,
-                        "isCbr": False,
-                        "maxFps": 30,
-                        "minClientAdaptiveBitRate": 0,
-                        "minMotionAdaptiveBitRate": 0,
-                        "nMultiplier": 6,
-                        "name": "video3",
-                        "sourceId": 2,
-                        "streamId": 4,
-                        "streamOrdinal": 2,
-                        "type": "h264",
-                        "validBitrateRangeMax": 750000,
-                        "validBitrateRangeMin": 32000,
-                        "validFpsValues": [
-                            1,
-                            2,
-                            3,
-                            4,
-                            5,
-                            6,
-                            8,
-                            9,
-                            10,
-                            12,
-                            15,
-                            16,
-                            18,
-                            20,
-                            24,
-                            25,
-                            30,
-                        ],
-                        "verticalFlip": False,
-                        "width": self._detected_resolutions["video3"][0],
-                    },
-                    "vinFps": 30,
-                },
-            },
-        )
-
-    async def process_device_settings(self, msg: AVClientRequest) -> AVClientResponse:
-        return self.gen_response(
-            "ChangeDeviceSettings",
-            msg["messageId"],
-            {
-                "name": self.args.name,
-                "timezone": "PST8PDT,M3.2.0,M11.1.0",
-            },
-        )
-
-    async def process_osd_settings(self, msg: AVClientRequest) -> AVClientResponse:
-        return self.gen_response(
-            "ChangeOsdSettings",
-            msg["messageId"],
-            {
-                "_1": {
-                    "enableDate": 1,
-                    "enableLogo": 1,
-                    "enableReportdStatsLevel": 0,
-                    "enableStreamerStatsLevel": 0,
-                    "tag": self.args.name,
-                },
-                "_2": {
-                    "enableDate": 1,
-                    "enableLogo": 1,
-                    "enableReportdStatsLevel": 0,
-                    "enableStreamerStatsLevel": 0,
-                    "tag": self.args.name,
-                },
-                "_3": {
-                    "enableDate": 1,
-                    "enableLogo": 1,
-                    "enableReportdStatsLevel": 0,
-                    "enableStreamerStatsLevel": 0,
-                    "tag": self.args.name,
-                },
-                "_4": {
-                    "enableDate": 1,
-                    "enableLogo": 1,
-                    "enableReportdStatsLevel": 0,
-                    "enableStreamerStatsLevel": 0,
-                    "tag": self.args.name,
-                },
-                "enableOverlay": 1,
-                "logoScale": 50,
-                "overlayColorId": 0,
-                "textScale": 50,
-                "useCustomLogo": 0,
-            },
-        )
-
-    async def process_network_status(self, msg: AVClientRequest) -> AVClientResponse:
-        return self.gen_response(
-            "NetworkStatus",
-            msg["messageId"],
-            {
-                "connectionState": 2,
-                "connectionStateDescription": "CONNECTED",
-                "defaultInterface": "eth0",
-                "dhcpLeasetime": 86400,
-                "dnsServer": "8.8.8.8 4.2.2.2",
-                "gateway": "192.168.103.1",
-                "ipAddress": self.args.ip,
-                "linkDuplex": 1,
-                "linkSpeedMbps": 100,
-                "mode": "dhcp",
-                "networkMask": "255.255.255.0",
-            },
-        )
-
-    async def process_sound_led_settings(
-        self, msg: AVClientRequest
-    ) -> AVClientResponse:
-        return self.gen_response(
-            "ChangeSoundLedSettings",
-            msg["messageId"],
-            {
-                "ledFaceAlwaysOnWhenManaged": 1,
-                "ledFaceEnabled": 1,
-                "speakerEnabled": 1,
-                "speakerVolume": 100,
-                "systemSoundsEnabled": 1,
-                "userLedBlinkPeriodMs": 0,
-                "userLedColorFg": "blue",
-                "userLedOnNoff": 1,
-            },
-        )
-
-    async def process_change_isp_settings(
-        self, msg: AVClientRequest
-    ) -> AVClientResponse:
-        payload = {
-            "aeMode": "auto",
-            "aeTargetPercent": 50,
-            "aggressiveAntiFlicker": 0,
-            "brightness": 50,
-            "contrast": 50,
-            "criticalTmpOfProtect": 40,
-            "dZoomCenterX": 50,
-            "dZoomCenterY": 50,
-            "dZoomScale": 0,
-            "dZoomStreamId": 4,
-            "darkAreaCompensateLevel": 0,
-            "denoise": 50,
-            "enable3dnr": 1,
-            "enableExternalIr": 0,
-            "enableMicroTmpProtect": 1,
-            "enablePauseMotion": 0,
-            "flip": 0,
-            "focusMode": "ztrig",
-            "focusPosition": 0,
-            "forceFilterIrSwitchEvents": 0,
-            "hue": 50,
-            "icrLightSensorNightThd": 0,
-            "icrSensitivity": 0,
-            "irLedLevel": 215,
-            "irLedMode": "auto",
-            "irOnStsBrightness": 0,
-            "irOnStsContrast": 0,
-            "irOnStsDenoise": 0,
-            "irOnStsHue": 0,
-            "irOnStsSaturation": 0,
-            "irOnStsSharpness": 0,
-            "irOnStsWdr": 0,
-            "irOnValBrightness": 50,
-            "irOnValContrast": 50,
-            "irOnValDenoise": 50,
-            "irOnValHue": 50,
-            "irOnValSaturation": 50,
-            "irOnValSharpness": 50,
-            "irOnValWdr": 1,
-            "lensDistortionCorrection": 1,
-            "masks": None,
-            "mirror": 0,
-            "queryIrLedStatus": 0,
-            "saturation": 50,
-            "sharpness": 50,
-            "touchFocusX": 1001,
-            "touchFocusY": 1001,
-            "wdr": 1,
-            "zoomPosition": 0,
-        }
-
-        if msg["payload"]:
-            await self.change_video_settings(msg["payload"])
-
-        payload.update(await self.get_video_settings())
-        return self.gen_response("ChangeIspSettings", msg["messageId"], payload)
-
-    async def process_analytics_settings(
-        self, msg: AVClientRequest
-    ) -> AVClientResponse:
-        return self.gen_response(
-            "ChangeAnalyticsSettings", msg["messageId"], msg["payload"]
-        )
-
-    async def process_snapshot_request(
-        self, msg: AVClientRequest
-    ) -> Optional[AVClientResponse]:
-        snapshot_type = msg["payload"]["what"]
-        filename = msg["payload"].get("filename", "")
-        
-        self.logger.debug(f"Snapshot request: type={snapshot_type}, filename={filename}")
-        
-        # Check if filename contains URL parameters (indicates Frigate API URL)
-        if filename and ("?" in filename or filename.startswith("latest.jpg")):
-            # This is a URL-based filename, fetch from Frigate API
-            if hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera'):
-                if self.args.frigate_http_url:
-                    # Determine query parameters based on snapshot type
-                    # motionSnapshot: 360p thumbnail with crop
-                    # motionSnapshotFullFoV: full resolution
-                    # motionHeatmap: full resolution (same as FoV)
-                    if snapshot_type == "motionSnapshot":
-                        # Thumbnail version with height and quality parameters
-                        query_params = "height=360&quality=80"
-                    elif snapshot_type == "motionSnapshotFullFoV":
-                        # Full resolution, no additional parameters beyond timestamp
-                        query_params = ""
-                    elif snapshot_type == "motionHeatmap":
-                        # Heatmap uses full resolution
-                        query_params = ""
-                    else:
-                        # Default to no extra parameters
-                        query_params = ""
-                    
-                    # Extract timestamp from filename if present
-                    timestamp_param = ""
-                    if "timestamp=" in filename:
-                        # Extract existing timestamp parameter
-                        timestamp_param = filename.split("?", 1)[1] if "?" in filename else ""
-                    
-                    # Build final query string
-                    if query_params and timestamp_param:
-                        final_query = f"{query_params}&{timestamp_param}"
-                    elif query_params:
-                        final_query = query_params
-                    elif timestamp_param:
-                        final_query = timestamp_param
-                    else:
-                        final_query = ""
-                    
-                    # Build the full URL to Frigate
-                    # Always use 'latest.jpg' as the base - Frigate API endpoint
-                    # (UniFi may send latest_fullfov.jpg, latest_heatmap.jpg, etc. but Frigate only has latest.jpg)
-                    if final_query:
-                        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{final_query}"
-                    else:
-                        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
-                    
-                    self.logger.info(f"Fetching {snapshot_type} from Frigate: {snapshot_url}")
-                    
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            # Fetch from Frigate
-                            async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                                if response.status == 200:
-                                    image_data = await response.read()
-                                    self.logger.info(f"Fetched {snapshot_type} from Frigate ({len(image_data)} bytes)")
-                                    
-                                    # Upload to UniFi Protect
-                                    files = {"payload": image_data}
-                                    files.update(msg["payload"].get("formFields", {}))
-                                    
-                                    try:
-                                        await session.post(
-                                            msg["payload"]["uri"],
-                                            data=files,
-                                            ssl=self._ssl_context,
-                                        )
-                                        self.logger.debug(f"Uploaded {snapshot_type} from Frigate URL")
-                                    except aiohttp.ClientError:
-                                        self.logger.exception("Failed to upload snapshot to UniFi Protect")
-                                else:
-                                    error_body = await response.text()
-                                    self.logger.warning(
-                                        f"Failed to fetch {snapshot_type} from Frigate: "
-                                        f"HTTP {response.status}, Response: {error_body}"
-                                    )
-                    except asyncio.TimeoutError:
-                        self.logger.warning(f"Timeout fetching {snapshot_type} from Frigate")
-                    except Exception as e:
-                        self.logger.error(f"Error fetching {snapshot_type} from Frigate: {e}")
-                else:
-                    self.logger.warning(f"URL-based filename but frigate_http_url not configured")
-            else:
-                self.logger.warning(f"URL-based filename but Frigate configuration not available")
-        else:
-            # Check if this is a regular snapshot request and Frigate is configured
-            if snapshot_type == "snapshot" and hasattr(self.args, 'frigate_http_url') and hasattr(self.args, 'frigate_camera'):
-                if self.args.frigate_http_url:
-                    # Determine query parameters based on quality
-                    quality_param = msg["payload"].get("quality", "medium")
-                    
-                    # Map UniFi quality levels to height parameters
-                    if quality_param == "high":
-                        query_params = "height=1080&quality=95"
-                    elif quality_param == "medium":
-                        query_params = "height=720&quality=85"
-                    elif quality_param == "low":
-                        query_params = "height=360&quality=70"
-                    else:
-                        # Default to medium quality
-                        query_params = "height=720&quality=85"
-                    
-                    # Build the full URL to Frigate
-                    snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg?{query_params}"
-                    
-                    self.logger.info(f"Fetching snapshot (quality={quality_param}) from Frigate: {snapshot_url}")
-                    
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            # Fetch from Frigate
-                            async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                                if response.status == 200:
-                                    image_data = await response.read()
-                                    self.logger.info(f"Fetched snapshot from Frigate ({len(image_data)} bytes)")
-                                    
-                                    # Upload to UniFi Protect
-                                    files = {"payload": image_data}
-                                    files.update(msg["payload"].get("formFields", {}))
-                                    
-                                    try:
-                                        await session.post(
-                                            msg["payload"]["uri"],
-                                            data=files,
-                                            ssl=self._ssl_context,
-                                        )
-                                        self.logger.debug(f"Uploaded snapshot from Frigate")
-                                    except aiohttp.ClientError:
-                                        self.logger.exception("Failed to upload snapshot to UniFi Protect")
-                                else:
-                                    error_body = await response.text()
-                                    self.logger.warning(
-                                        f"Failed to fetch snapshot from Frigate: "
-                                        f"HTTP {response.status}, Response: {error_body}"
-                                    )
-                    except asyncio.TimeoutError:
-                        self.logger.warning(f"Timeout fetching snapshot from Frigate")
-                    except Exception as e:
-                        self.logger.error(f"Error fetching snapshot from Frigate: {e}")
-                else:
-                    # Fall back to legacy method if frigate_http_url not configured
-                    path = await self.get_snapshot()
-                    if path and path.exists():
-                        async with aiohttp.ClientSession() as session:
-                            files = {"payload": open(path, "rb")}
-                            files.update(msg["payload"].get("formFields", {}))
-                            try:
-                                await session.post(
-                                    msg["payload"]["uri"],
-                                    data=files,
-                                    ssl=self._ssl_context,
-                                )
-                                self.logger.debug(f"Uploaded snapshot from {path}")
-                            except aiohttp.ClientError:
-                                self.logger.exception("Failed to upload snapshot")
-                    else:
-                        self.logger.warning(f"Snapshot file {path} is not ready yet, skipping upload")
-            else:
-                # Legacy path-based snapshot handling for motion events
-                # Select appropriate snapshot based on request type
-                if snapshot_type == "motionSnapshot":
-                    # Cropped image with bounding box
-                    path = self._motion_snapshot_crop or self._motion_snapshot
-                elif snapshot_type == "motionSnapshotFullFoV":
-                    # Full field of view image with bounding box
-                    path = self._motion_snapshot_fov or self._motion_snapshot
-                elif snapshot_type == "motionHeatmap":
-                    # Heatmap visualization (use FoV as fallback)
-                    path = self._motion_heatmap or self._motion_snapshot_fov or self._motion_snapshot
-                elif snapshot_type == "smartDetectZoneSnapshot":
-                    # Smart detect zone snapshot (use crop)
-                    path = self._motion_snapshot_crop or self._motion_snapshot
-                else:
-                    # Regular snapshot request (fallback to get_snapshot method)
-                    path = await self.get_snapshot()
-
-                if path and path.exists():
-                    async with aiohttp.ClientSession() as session:
-                        files = {"payload": open(path, "rb")}
-                        files.update(msg["payload"].get("formFields", {}))
-                        try:
-                            await session.post(
-                                msg["payload"]["uri"],
-                                data=files,
-                                ssl=self._ssl_context,
-                            )
-                            self.logger.debug(f"Uploaded {snapshot_type} from {path}")
-                        except aiohttp.ClientError:
-                            self.logger.exception("Failed to upload snapshot")
-                else:
-                    self.logger.warning(
-                        f"Snapshot file {path} is not ready yet, skipping upload for {snapshot_type}"
-                    )
-
-        if msg["responseExpected"]:
-            return self.gen_response("GetRequest", response_to=msg["messageId"])
-
-    async def process_time(self, msg: AVClientRequest) -> AVClientResponse:
-        return self.gen_response(
-            "ubnt_avclient_paramAgreement",
-            msg["messageId"],
-            {
-                "monotonicMs": self.get_uptime(),
-                "wallMs": int(round(time.time() * 1000)),
-                "features": {},
-            },
-        )
-
-    async def process_continuous_move(self, msg: AVClientRequest) -> None:
-        return
-
-    async def process_update_face_db(self, msg: AVClientRequest) -> AVClientResponse:
-        # Return empty response to indicate no face database is available
-        # This prevents UniFi Protect from trying to fetch a non-existent file
-        return self.gen_response(
-            "UpdateFaceDBRequest",
-            msg["messageId"],
-            {},
-        )
-    
     def gen_response(
         self, name: str, response_to: int = 0, payload: Optional[dict[str, Any]] = None
     ) -> AVClientResponse:
@@ -1787,113 +991,8 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         return False
 
-    def get_base_ffmpeg_args(self, stream_index: str = "") -> str:
-        if self.args.ffmpeg_base_args is not None:
-            return self.args.ffmpeg_base_args
-
-        base_args = [
-            "-avoid_negative_ts",
-            "make_zero",
-            "-fflags",
-            "+genpts+discardcorrupt",
-            "-use_wallclock_as_timestamps 1",
-        ]
-
-        try:
-            output = subprocess.check_output(["ffmpeg", "-h", "full"])
-            if b"stimeout" in output:
-                base_args.append("-stimeout 15000000")
-            else:
-                base_args.append("-timeout 15000000")
-        except subprocess.CalledProcessError:
-            self.logger.exception("Could not check for ffmpeg options")
-
-        return " ".join(base_args)
-
-    async def start_video_stream(
-        self, stream_index: str, stream_name: str, destination: tuple[str, int]
-    ):
-        has_spawned = stream_index in self._ffmpeg_handles
-        is_dead = has_spawned and self._ffmpeg_handles[stream_index].poll() is not None
-
-        if not has_spawned or is_dead:
-            source = await self.get_stream_source(stream_index)
-            cmd = (
-                f"AV_LOG_FORCE_NOCOLOR=1 ffmpeg -nostdin -loglevel level+{self.args.loglevel} -y"
-                f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
-                f' {self.args.rtsp_transport} -i "{source}"'
-                f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
-                f" streamName={stream_name} -f {self.args.format} - "
-                f" | {sys.executable} -m unifi.clock_sync --timestamp-modifier {self.args.timestamp_modifier}"
-                f" | nc"
-                f" {destination[0]} {destination[1]}"
-            )
-
-            if is_dead:
-                exit_code = self._ffmpeg_handles[stream_index].poll()
-                self.logger.warning(f"Previous ffmpeg process for {stream_index} died with exit code {exit_code}.")
-
-            self.logger.info(
-                f"Spawning ffmpeg for {stream_index} ({stream_name}): {cmd}"
-            )
-            # Start process in a new process group so we can kill the entire pipeline
-            import os
-            self._ffmpeg_handles[stream_index] = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.DEVNULL, 
-                shell=True,
-                preexec_fn=os.setsid  # Create new process group
-            )
-
-    def stop_video_stream(self, stream_index: str):
-        if stream_index in self._ffmpeg_handles:
-            self.logger.info(f"Stopping stream {stream_index}")
-            proc = self._ffmpeg_handles[stream_index]
-            
-            # Check if process is already dead
-            if proc.poll() is not None:
-                self.logger.debug(f"Process for {stream_index} already terminated with code {proc.poll()}")
-                del self._ffmpeg_handles[stream_index]
-                return
-            
-            try:
-                # Terminate the process group to kill all processes in the pipeline
-                import os
-                import signal
-                pgid = os.getpgid(proc.pid)
-                self.logger.debug(f"Sending SIGTERM to process group {pgid} for {stream_index}")
-                os.killpg(pgid, signal.SIGTERM)
-                
-                # Wait for graceful shutdown
-                try:
-                    proc.wait(timeout=2)
-                    self.logger.debug(f"Stream {stream_index} terminated gracefully")
-                except subprocess.TimeoutExpired:
-                    self.logger.warning(f"Stream {stream_index} did not terminate gracefully, sending SIGKILL")
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                        proc.wait(timeout=1)
-                    except (ProcessLookupError, subprocess.TimeoutExpired):
-                        pass
-                        
-            except (ProcessLookupError, PermissionError, AttributeError, OSError) as e:
-                self.logger.debug(f"Error stopping {stream_index}: {e}, trying proc.kill()")
-                # Fall back to killing just the parent process
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
-            
-            # Remove from handles
-            del self._ffmpeg_handles[stream_index]
-
     async def close(self):
         self.logger.info("Cleaning up instance")
         await self.stop_all_motion_events()
         self.close_streams()
 
-    def close_streams(self):
-        for stream in self._ffmpeg_handles:
-            self.stop_video_stream(stream)
