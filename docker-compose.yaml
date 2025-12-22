@@ -5,6 +5,7 @@ services:
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -12,14 +13,16 @@ services:
       --mac 'AA:BB:CC:33:44:66'
       --ip 192.168.1.26
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "Backyard"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/backyard/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera backyard
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
+      --frigate-http-url http://192.168.1.3:5000
       -s rtsp://192.168.1.26/live0
 
   unifi-cam-side-door:
@@ -28,6 +31,7 @@ services:
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -35,14 +39,16 @@ services:
       --mac 'AA:BB:CC:33:44:77'
       --ip 192.168.1.24
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "Side Door"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/side_door/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera side_door
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
+      --frigate-http-url http://192.168.1.3:5000
       -s rtsp://192.168.1.24/live0
 
   unifi-cam-driveway:
@@ -51,6 +57,7 @@ services:
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -58,17 +65,21 @@ services:
       --mac 'AA:BB:CC:33:44:CC'
       --ip 192.168.254.7
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "Driveway"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/driveway/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera driveway
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
-      -s rtsp://192.168.1.3:8554/driveway_src
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/driveway_src
+      --video3 rtsp://192.168.1.3:8554/driveway_video3
 
 # --ffmpeg-args='-c:v libx264 -preset veryfast -tune zerolatency -b:v 1200k -maxrate 2000k -bufsize 2400k -c:a aac -b:a 32k -ar 32000 -ac 1'
 
@@ -78,6 +89,7 @@ services:
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -85,17 +97,21 @@ services:
       --mac 'AA:BB:CC:33:44:99'
       --ip 192.168.254.4
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "Canoe"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/canoe/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera canoe
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
-      -s rtsp://Camera:w6m-3pw-jEh-NFH@192.168.254.4:554/Streaming/Channels/101
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/canoe_src
+      --video3 rtsp://192.168.1.3:8554/canoe_video3
 #
   unifi-cam-porch:
     container_name: unifi-cam-porch
@@ -103,6 +119,7 @@ services:
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -110,24 +127,28 @@ services:
       --mac 'AA:BB:CC:33:44:AA'
       --ip 192.168.254.6
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "Porch"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/porch/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera porch
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
-      -s rtsp://Camera:w6m-3pw-jEh-NFH@192.168.254.6:554/Streaming/Channels/101
-#
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/porch_src
+      --video3 rtsp://192.168.1.3:8554/porch_video3
   unifi-cam-north-sidewalk:
     container_name: unifi-cam-north-sidewalk
     restart: unless-stopped
     build: .
     volumes:
       - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
     command: >-
       unifi-cam-proxy
       --verbose
@@ -135,14 +156,18 @@ services:
       --mac 'AA:BB:CC:33:44:BB'
       --ip 192.168.254.10
       --cert /client.pem
-      --token "O4uEAqb9Ipg2tRSWaUTq9fN8tl3of40R"
+      --token "WakWvvTwFLc8QjU7i2pO6C3R9saKjGcA"
       --name "North Sidewalk"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
       frigate
+      --timestamp-modifier 90
       --snapshot-url "http://192.168.1.3:5000/api/north_sidewalk/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
       --frigate-camera north_sidewalk
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
-      -s rtsp://Camera:w6m-3pw-jEh-NFH@192.168.254.10:554/Streaming/Channels/101
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/north_sidewalk_src
+      --video3 rtsp://192.168.1.3:8554/north_sidewalk_video3
