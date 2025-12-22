@@ -24,7 +24,9 @@ class FrigateCam(RTSPCam):
         self.frigate_to_unifi_event_map: dict[str, int] = {}
         # Store snapshot readiness per Frigate event ID
         self.event_snapshot_ready: dict[str, asyncio.Event] = {}
-        self.event_timeout_seconds = 60
+        # Track last update time for each event (for timeout detection)
+        self.event_last_update: dict[int, float] = {}
+        self.event_timeout_seconds = 600  # Timeout after 600 seconds (10 minutes) without updates
 
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
@@ -617,17 +619,20 @@ class FrigateCam(RTSPCam):
         return (snapshot_full, snapshot_crop, heatmap)
 
     async def monitor_event_timeouts(self) -> None:
-        """Monitor active events and end those that haven't received updates in 60 seconds"""
+        """Monitor active events and end those that haven't received updates in 600 seconds"""
         while True:
-            await asyncio.sleep(5)  # Check every 5 seconds
+            await asyncio.sleep(30)  # Check every 30 seconds
             current_time = time.time()
             expired_frigate_events = []
             
             # Check all active smart detect events (from base class)
             for unifi_event_id, event_data in list(self._active_smart_events.items()):
-                time_since_start = current_time - event_data["start_time"]
-                # Use a longer timeout since we don't track last_update in base class
-                if time_since_start > self.event_timeout_seconds:
+                # Get last update time, defaulting to start time if no updates yet
+                last_update = self.event_last_update.get(unifi_event_id, event_data["start_time"])
+                time_since_update = current_time - last_update
+                
+                # Only timeout if no update for over 600 seconds
+                if time_since_update > self.event_timeout_seconds:
                     # Find the Frigate event ID that maps to this UniFi event ID
                     frigate_event_id = None
                     for fid, uid in self.frigate_to_unifi_event_map.items():
@@ -638,8 +643,8 @@ class FrigateCam(RTSPCam):
                     expired_frigate_events.append((frigate_event_id, unifi_event_id))
                     self.logger.warning(
                         f"EVENT TIMEOUT: Event {unifi_event_id} (Frigate: {frigate_event_id}, "
-                        f"{event_data['object_type'].value}) has been active for "
-                        f"{time_since_start:.1f}s. Force ending event."
+                        f"{event_data['object_type'].value}) has not been updated for "
+                        f"{time_since_update:.1f}s (timeout: {self.event_timeout_seconds}s). Force ending event."
                     )
             
             # End expired events
@@ -659,6 +664,8 @@ class FrigateCam(RTSPCam):
                         del self.frigate_to_unifi_event_map[frigate_event_id]
                     if frigate_event_id and frigate_event_id in self.event_snapshot_ready:
                         del self.event_snapshot_ready[frigate_event_id]
+                    if unifi_event_id in self.event_last_update:
+                        del self.event_last_update[unifi_event_id]
 
     async def handle_detection_event(self, message: Message) -> None:
         if not isinstance(message.payload, bytes):
@@ -740,6 +747,9 @@ class FrigateCam(RTSPCam):
                 # Store mapping from Frigate event ID to UniFi event ID
                 self.frigate_to_unifi_event_map[event_id] = unifi_event_id
                 
+                # Track event creation time as last update
+                self.event_last_update[unifi_event_id] = time.time()
+                
                 self.logger.info(
                     f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
@@ -783,6 +793,9 @@ class FrigateCam(RTSPCam):
                     frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     # Send moving update with updated bounding box
                     await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
+                    
+                    # Update last update time for timeout tracking
+                    self.event_last_update[unifi_event_id] = time.time()
                     
                     # Fetch updated snapshots if available
                     has_snapshot = after_data.get('has_snapshot', False)
@@ -892,6 +905,8 @@ class FrigateCam(RTSPCam):
                     del self.frigate_to_unifi_event_map[event_id]
                     if event_id in self.event_snapshot_ready:
                         del self.event_snapshot_ready[event_id]
+                    if unifi_event_id in self.event_last_update:
+                        del self.event_last_update[unifi_event_id]
                     
                     self.logger.info(
                         f"Frigate: Event {event_id} ended. "
