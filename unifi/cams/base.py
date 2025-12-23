@@ -468,6 +468,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
+        event_id: Optional[int] = None,
     ) -> None:
         """
         Stop a smart detect event for a specific object type.
@@ -476,22 +477,33 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             object_type: The type of object to stop detecting
             custom_descriptor: Optional final descriptor data
             event_timestamp: Optional timestamp for the event
+            event_id: Optional specific event ID to stop. If not provided, stops the first active event of the given object type.
         """
-        # Find the active smart detect event by object type
-        event_id = None
-        for eid, event in self._active_smart_events.items():
-            if event["object_type"] == object_type:
-                event_id = eid
-                break
+        # Find the active smart detect event
+        target_event_id = event_id
         
-        if event_id is None:
+        if target_event_id is None:
+            # Fallback to finding by object type (legacy behavior)
+            for eid, event in self._active_smart_events.items():
+                if event["object_type"] == object_type:
+                    target_event_id = eid
+                    break
+        
+        if target_event_id is None:
             self.logger.warning(
                 f"trigger_smart_detect_stop called for {object_type.value} "
                 f"but no active event found. Event may have already ended or never started. Ignoring."
             )
             return
+            
+        if target_event_id not in self._active_smart_events:
+            self.logger.warning(
+                f"trigger_smart_detect_stop called for event {target_event_id} "
+                f"but it is not in active events list. Ignoring."
+            )
+            return
         
-        active_event = self._active_smart_events[event_id]
+        active_event = self._active_smart_events[target_event_id]
         
         # Build descriptors array - use custom_descriptor if provided, 
         # otherwise fall back to last saved descriptor for this event
@@ -509,7 +521,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "edgeType": "leave",
-            "eventId": event_id,
+            "eventId": target_event_id,
             "eventType": "motion",
             "levels": {"0": 49},
             "objectTypes": [object_type.value],
@@ -525,7 +537,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         duration = time.time() - active_event["start_time"]
         self.logger.info(
-            f"Stopping smart detect event {event_id} for {object_type.value} "
+            f"Stopping smart detect event {target_event_id} for {object_type.value} "
             f"(duration: {duration:.1f}s, remaining smart events: "
             f"{len(self._active_smart_events) - 1})"
         )
@@ -535,7 +547,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         )
         
         # Clean up this smart detect event
-        del self._active_smart_events[event_id]
+        del self._active_smart_events[target_event_id]
         
         # Update legacy compatibility fields
         if not self._active_smart_events:

@@ -655,7 +655,7 @@ class FrigateCam(RTSPCam):
                     
                 try:
                     # End smart detect event (motion event will end separately)
-                    await self.trigger_smart_detect_stop(event_data["object_type"])
+                    await self.trigger_smart_detect_stop(event_data["object_type"], event_id=unifi_event_id)
                 except Exception as e:
                     self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
                 finally:
@@ -730,7 +730,7 @@ class FrigateCam(RTSPCam):
                     old_unifi_id = self.frigate_to_unifi_event_map[event_id]
                     if old_unifi_id in self._active_smart_events:
                         old_event = self._active_smart_events[old_unifi_id]
-                        await self.trigger_smart_detect_stop(old_event["object_type"])
+                        await self.trigger_smart_detect_stop(old_event["object_type"], event_id=old_unifi_id)
                     del self.frigate_to_unifi_event_map[event_id]
                 
                 # Create snapshot ready event for this Frigate event
@@ -899,7 +899,7 @@ class FrigateCam(RTSPCam):
                     )
                     
                     # End the smart detect event (motion event will end when Frigate sends motion OFF)
-                    await self.trigger_smart_detect_stop(object_type, final_descriptor, end_time_ms)
+                    await self.trigger_smart_detect_stop(object_type, final_descriptor, end_time_ms, event_id=unifi_event_id)
                     
                     # Clean up mappings
                     del self.frigate_to_unifi_event_map[event_id]
