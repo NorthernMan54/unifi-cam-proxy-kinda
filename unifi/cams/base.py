@@ -69,7 +69,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 #   - object_type (SmartDetectObjectType): Detected object classification
                 #   - timestamp (float): Event start time
                 #   - descriptor (dict): Additional event metadata
-                _active_smart_events: Active smart detection events supporting concurrent detections
+                _active_smart_events: Smart detection events (active and ended, kept for 60 minutes after end)
                 # Legacy fields (deprecated - use _active_* instead):
                 _motion_event_ts (Optional[float]): Timestamp of last motion event
                 _motion_object_type (Optional[SmartDetectObjectType]): Last detected object type
@@ -205,6 +205,25 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     async def get_stream_source(self, stream_index: str) -> str:
         raise NotImplementedError("You need to write this!")
 
+    async def fetch_snapshots_for_event(
+        self, event_id: int, event_type: str = "analytics"
+    ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
+        """
+        Fetch and cache all three snapshot types for an event.
+        Subclasses can override this to provide event-specific snapshot fetching.
+        
+        Args:
+            event_id: The event ID (analytics or smart detect)
+            event_type: "analytics" or "smart_detect"
+            
+        Returns:
+            Tuple of (crop_path, fov_path, heatmap_path) - paths to cached snapshot files
+        """
+        # Default implementation: fetch current snapshot
+        # Subclasses (like FrigateCam) should override this
+        snapshot = await self.get_snapshot()
+        return (snapshot, snapshot, snapshot)
+
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
             "mic": True,
@@ -276,6 +295,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     def _cleanup_old_analytics_events(self) -> None:
         """
         Remove analytics events older than 1 hour from history.
+        Also deletes cached snapshot files for old events.
         Called at the start of each new motion event to keep memory usage bounded.
         """
         current_time = time.time()
@@ -289,18 +309,72 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             if event_time < one_hour_ago:
                 events_to_remove.append(event_id)
         
-        # Remove old events
+        # Remove old events and delete their cached snapshot files
         for event_id in events_to_remove:
+            event_data = self._analytics_event_history[event_id]
+            
+            # Delete cached snapshot files
+            for snapshot_key in ['snapshot_crop_path', 'snapshot_fov_path', 'heatmap_path']:
+                snapshot_path = event_data.get(snapshot_key)
+                if snapshot_path and isinstance(snapshot_path, Path) and snapshot_path.exists():
+                    try:
+                        snapshot_path.unlink()
+                        self.logger.debug(f"Deleted cached snapshot: {snapshot_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to delete cached snapshot {snapshot_path}: {e}")
+            
             del self._analytics_event_history[event_id]
             self.logger.debug(
                 f"Cleaned up analytics event {event_id} "
-                f"(age: {(current_time - self._analytics_event_history.get(event_id, {}).get('end_time', current_time)) / 60:.1f} minutes)"
+                f"(age: {(current_time - event_data.get('end_time', current_time)) / 60:.1f} minutes)"
             )
         
         if events_to_remove:
             self.logger.info(
                 f"Cleaned up {len(events_to_remove)} old analytics events. "
                 f"Remaining in history: {len(self._analytics_event_history)}"
+            )
+
+    def _cleanup_old_smart_events(self) -> None:
+        """
+        Clean up smart detect events that ended more than 60 minutes ago.
+        Called lazily when new smart detect events are added.
+        """
+        current_time = time.time()
+        sixty_minutes_ago = current_time - 3600  # 60 minutes in seconds
+        
+        # Find ended events to remove
+        events_to_remove = []
+        for event_id, event_data in self._active_smart_events.items():
+            end_time = event_data.get('end_time')
+            # Only clean up events that have ended and are older than 60 minutes
+            if end_time and end_time < sixty_minutes_ago:
+                events_to_remove.append(event_id)
+        
+        # Remove old events and delete their cached snapshot files
+        for event_id in events_to_remove:
+            event_data = self._active_smart_events[event_id]
+            
+            # Delete cached snapshot files
+            for snapshot_key in ['snapshot_crop_path', 'snapshot_fov_path', 'heatmap_path']:
+                snapshot_path = event_data.get(snapshot_key)
+                if snapshot_path and isinstance(snapshot_path, Path) and snapshot_path.exists():
+                    try:
+                        snapshot_path.unlink()
+                        self.logger.debug(f"Deleted cached snapshot: {snapshot_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to delete cached snapshot {snapshot_path}: {e}")
+            
+            del self._active_smart_events[event_id]
+            self.logger.debug(
+                f"Cleaned up smart detect event {event_id} "
+                f"(age: {(current_time - end_time) / 60:.1f} minutes)"
+            )
+        
+        if events_to_remove:
+            self.logger.info(
+                f"Cleaned up {len(events_to_remove)} old smart detect events. "
+                f"Remaining: {len(self._active_smart_events)}"
             )
 
     # API for subclasses - Smart Detect Events
@@ -377,16 +451,20 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self.gen_response("EventSmartDetect", payload=payload)
         )
         
+        # Clean up old smart detect events (keep for 60 minutes after end)
+        self._cleanup_old_smart_events()
+        
         # Track this smart detect event
         self._active_smart_events[event_id] = {
             "object_type": object_type,
             "start_time": current_time,
+            "end_time": None,  # Will be set when event ends
             "event_timestamp": event_timestamp,
             "last_descriptor": custom_descriptor,
-            # UniFi Protect requests three snapshot types:
-            "snapshot_crop": None,  # motionSnapshot - cropped with bounding box
-            "snapshot_fov": None,   # motionSnapshotFullFoV - full size with bounding box
-            "heatmap": None,        # motionHeatmap - heatmap visualization
+            # UniFi Protect requests three snapshot types - store cached file paths:
+            "snapshot_crop_path": None,  # motionSnapshot - cropped with bounding box
+            "snapshot_fov_path": None,   # motionSnapshotFullFoV - full size with bounding box
+            "heatmap_path": None,        # motionHeatmap - heatmap visualization
         }
         
         # If there's an active analytics event, associate this smart detect event with it
@@ -551,20 +629,22 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         duration = time.time() - active_event["start_time"]
         self.logger.info(
             f"Stopping smart detect event {target_event_id} for {object_type.value} "
-            f"(duration: {duration:.1f}s, remaining smart events: "
-            f"{len(self._active_smart_events) - 1})"
+            f"(duration: {duration:.1f}s, active smart events: "
+            f"{len([e for e in self._active_smart_events.values() if e.get('end_time') is None])})"
         )
         
         await self.send(
             self.gen_response("EventSmartDetect", payload=payload)
         )
         
-        # Clean up this smart detect event
-        del self._active_smart_events[target_event_id]
+        # Mark this smart detect event as ended (keep in memory for 60 minutes)
+        active_event["end_time"] = time.time()
         
         # Update legacy compatibility fields
-        if not self._active_smart_events:
-            # No more smart detect events
+        # Check if there are any other active (not ended) smart detect events
+        active_smart_events = [e for e in self._active_smart_events.values() if e.get("end_time") is None]
+        if not active_smart_events:
+            # No more active smart detect events
             self._motion_object_type = None
             self._motion_last_descriptor = None
             # Only clear motion_event_ts if no analytics event is active
@@ -638,6 +718,10 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "snapshot_filename": None,
             "snapshot_fov_filename": None,
             "heatmap_filename": None,
+            # Cached snapshot file paths for serving GetRequest
+            "snapshot_crop_path": None,
+            "snapshot_fov_path": None,
+            "heatmap_path": None,
             # Track smart detect events that occurred during this analytics event
             "smart_detect_event_ids": [],
         }
@@ -653,6 +737,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     ) -> None:
         """
         Stop the active analytics motion event.
+        
+        Handles snapshot caching:
+        - If smart detect events occurred during this analytics event, uses the most recent
+          smart detect event's cached snapshots
+        - Otherwise, fetches fresh snapshots and caches them
         
         Args:
             event_timestamp: Optional timestamp for the event
@@ -675,11 +764,63 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self._active_analytics_event_id = None
             return
         
-        # Generate URL-based filenames using Frigate API pattern
-        # UniFi expects different filename for FoV, but same base for snapshot and heatmap
-        snapshot_filename = f"latest.jpg?event_id={event_id}"
-        snapshot_fov_filename = f"latest_fullfov.jpg?event_id={event_id}"
-        heatmap_filename = f"latest.jpg?event_id={event_id}"
+        # Determine which snapshots to use
+        snapshot_crop_path = None
+        snapshot_fov_path = None
+        heatmap_path = None
+        
+        # Check if any smart detect events occurred during this analytics event
+        smart_detect_ids = active_event.get("smart_detect_event_ids", [])
+        if smart_detect_ids:
+            # Use snapshots from the most recent smart detect event
+            most_recent_smart_id = smart_detect_ids[-1]  # Last element is most recent
+            
+            # Look up in _active_smart_events (includes ended events kept for 60 min)
+            smart_event = self._active_smart_events.get(most_recent_smart_id)
+            if smart_event:
+                snapshot_crop_path = smart_event.get("snapshot_crop_path")
+                snapshot_fov_path = smart_event.get("snapshot_fov_path")
+                heatmap_path = smart_event.get("heatmap_path")
+                self.logger.info(
+                    f"Using snapshots from smart detect event {most_recent_smart_id} "
+                    f"for analytics event {event_id}"
+                )
+            else:
+                self.logger.warning(
+                    f"Smart detect event {most_recent_smart_id} not found in history "
+                    f"(may have been cleaned up after 60 minutes)"
+                )
+        
+        # If no smart detect snapshots available, fetch fresh snapshots
+        if not snapshot_crop_path or not snapshot_fov_path or not heatmap_path:
+            self.logger.info(
+                f"No smart detect snapshots available for analytics event {event_id}, "
+                f"fetching fresh snapshots"
+            )
+            try:
+                snapshot_crop_path, snapshot_fov_path, heatmap_path = await self.fetch_snapshots_for_event(
+                    event_id, "analytics"
+                )
+                self.logger.info(
+                    f"Fetched fresh snapshots for analytics event {event_id}: "
+                    f"crop={snapshot_crop_path is not None}, "
+                    f"fov={snapshot_fov_path is not None}, "
+                    f"heatmap={heatmap_path is not None}"
+                )
+            except Exception as e:
+                self.logger.error(f"Error fetching snapshots for analytics event {event_id}: {e}")
+                # Continue without snapshots
+        
+        # Store cached paths in the event history for later GetRequest handling
+        active_event["snapshot_crop_path"] = snapshot_crop_path
+        active_event["snapshot_fov_path"] = snapshot_fov_path
+        active_event["heatmap_path"] = heatmap_path
+        
+        # Generate filenames using the cached file paths
+        # These will be passed to UniFi Protect and then matched in GetRequest
+        snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"snapshot_{event_id}.jpg"
+        snapshot_fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"snapshot_fov_{event_id}.jpg"
+        heatmap_filename = str(heatmap_path) if heatmap_path else f"heatmap_{event_id}.jpg"
         
         # Store filenames and end time in the event history
         active_event["snapshot_filename"] = snapshot_filename
@@ -705,10 +846,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         duration = time.time() - active_event["start_time"]
         self.logger.info(
-            f"Stopping analytics event {event_id} (duration: {duration:.1f}s)"
+            f"Stopping analytics event {event_id} (duration: {duration:.1f}s, "
+            f"smart_detect_events: {len(smart_detect_ids)})"
         )
         self.logger.debug(
-            f"Analytics event details: {active_event}"
+            f"Analytics event snapshots: crop={snapshot_filename}, fov={snapshot_fov_filename}, heatmap={heatmap_filename}"
         )
         
         await self.send(
@@ -745,9 +887,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     "object_type": event["object_type"].value,
                     "duration": time.time() - event["start_time"],
                     "has_descriptor": event["last_descriptor"] is not None,
-                    "has_snapshot_crop": event["snapshot_crop"] is not None,
-                    "has_snapshot_fov": event["snapshot_fov"] is not None,
-                    "has_heatmap": event["heatmap"] is not None,
+                    "has_snapshot_crop": event["snapshot_crop_path"] is not None,
+                    "has_snapshot_fov": event["snapshot_fov_path"] is not None,
+                    "has_heatmap": event["heatmap_path"] is not None,
                 }
                 for event_id, event in self._active_smart_events.items()
             },

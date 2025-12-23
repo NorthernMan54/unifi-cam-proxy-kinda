@@ -191,127 +191,96 @@ class FrigateCam(RTSPCam):
         
         return descriptor
 
-    async def fetch_snapshot_from_api(
-        self, event_id: str, snapshot_type: str = "snapshot", timestamp: Optional[float] = None
-    ) -> Optional[Path]:
-        """
-        Fetch a specific snapshot type from Frigate HTTP API.
-        
-        Args:
-            event_id: Frigate event ID
-            snapshot_type: Type of snapshot - "snapshot" (full), "thumbnail" (360p), or "clip"
-            timestamp: Optional Unix timestamp for the snapshot (typically event midpoint)
-        
-        Returns:
-            Path to temporary file with snapshot, or None if fetch failed.
-        """
-        if not self.args.frigate_http_url:
-            return None
-        
-        # Frigate API endpoints for different snapshot types
-        if snapshot_type == "thumbnail":
-            # Use 360p height for thumbnail to ensure fast processing by UniFi Protect
-            url = f"{self.args.frigate_http_url}/api/events/{event_id}/snapshot.jpg?height=360&quality=80"
-        elif snapshot_type == "clip":
-            url = f"{self.args.frigate_http_url}/api/events/{event_id}/clip.mp4"
-        else:  # snapshot (full resolution)
-            # Use full resolution for FoV snapshot
-            url = f"{self.args.frigate_http_url}/api/events/{event_id}/snapshot.jpg"
-        
-        # Add timestamp parameter if provided (for all snapshot types)
-        if timestamp is not None:
-            separator = "&" if "?" in url else "?"
-            # Frigate API expects integer timestamp (seconds since epoch)
-            url = f"{url}{separator}timestamp={int(timestamp)}"
-        
-        self.logger.debug(f"Fetching {snapshot_type} for event {event_id} from {url}")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                    if response.status == 200:
-                        image_data = await response.read()
-                        suffix = ".mp4" if snapshot_type == "clip" else ".jpg"
-                        f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                        f.write(image_data)
-                        f.close()
-                        self.logger.info(
-                            f"Successfully fetched {snapshot_type} for event {event_id} from API "
-                            f"({len(image_data)} bytes) -> {f.name}"
-                        )
-                        return Path(f.name)
-                    else:
-                        # Log error response body for debugging
-                        error_body = await response.text()
-                        self.logger.warning(
-                            f"Failed to fetch {snapshot_type} for event {event_id}: "
-                            f"HTTP {response.status}, Response: {error_body}"
-                        )
-                        return None
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching {snapshot_type} for event {event_id}")
-            return None
-        except Exception as e:
-            self.logger.warning(f"Error fetching {snapshot_type} for event {event_id}: {e}")
-            return None
-
-    async def fetch_all_snapshots_from_api(
-        self, event_id: str
+    async def fetch_snapshots_for_event(
+        self, event_id: int, event_type: str = "analytics"
     ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
         """
-        Fetch all three snapshot types from Frigate HTTP API.
-        Uses timestamp from active analytics event to get snapshot at event midpoint.
+        Fetch and cache all three snapshot types for an event from Frigate.
         
         Args:
-            event_id: Frigate event ID
-        
+            event_id: The event ID (analytics or smart detect)
+            event_type: "analytics" or "smart_detect"
+            
         Returns:
-            Tuple of (snapshot_full, snapshot_crop/thumbnail, heatmap)
-            - snapshot_full: Full resolution snapshot (for FoV)
-            - snapshot_crop: Thumbnail/cropped version (for cropped view)
-            - heatmap: Use full snapshot as heatmap (Frigate doesn't provide separate heatmap)
+            Tuple of (crop_path, fov_path, heatmap_path) - paths to cached snapshot files
         """
         if not self.args.frigate_http_url:
+            self.logger.warning("Cannot fetch snapshots: frigate_http_url not configured")
             return (None, None, None)
         
-        # Calculate midpoint timestamp from active analytics event
+        # Calculate timestamp from event if available
         timestamp = None
-        if self._active_analytics_event_id is not None:
-            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
-            if active_event:
-                start_time = active_event.get('start_time')
-                if start_time is not None:
-                    current_time = time.time()
-                    # Frigate API expects integer timestamp (seconds since epoch)
-                    timestamp = int((start_time + current_time) / 2)
-                    self.logger.debug(
-                        f"Using event midpoint timestamp for snapshots: {timestamp} "
-                        f"(start={start_time}, current={current_time})"
-                    )
+        if event_type == "analytics" and event_id in self._analytics_event_history:
+            event_data = self._analytics_event_history[event_id]
+            start_time = event_data.get('start_time')
+            if start_time is not None:
+                timestamp = int(start_time)
         
-        if timestamp is None:
-            self.logger.debug(f"No active analytics event, fetching snapshots without timestamp")
+        # Build URLs for snapshots from latest frame endpoint
+        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
         
-        # Fetch both full snapshot and thumbnail in parallel
+        # Full resolution snapshot
+        full_url = base_url
+        if timestamp is not None:
+            full_url = f"{full_url}?timestamp={timestamp}"
+        
+        # Thumbnail snapshot (360p for fast UniFi Protect processing)
+        thumbnail_url = f"{base_url}?height=360&quality=80"
+        if timestamp is not None:
+            thumbnail_url = f"{thumbnail_url}&timestamp={timestamp}"
+        
+        self.logger.debug(f"Fetching snapshots for event {event_id}: full={full_url}, thumbnail={thumbnail_url}")
+        
+        # Fetch both snapshots in parallel
+        async def fetch_url(url: str, snapshot_type: str) -> Optional[Path]:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                        if response.status == 200:
+                            image_data = await response.read()
+                            f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                            f.write(image_data)
+                            f.close()
+                            self.logger.debug(
+                                f"Fetched {snapshot_type} snapshot for event {event_id} "
+                                f"({len(image_data)} bytes) -> {f.name}"
+                            )
+                            return Path(f.name)
+                        else:
+                            error_body = await response.text()
+                            self.logger.warning(
+                                f"Failed to fetch {snapshot_type} snapshot: "
+                                f"HTTP {response.status}, Response: {error_body}"
+                            )
+                            return None
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Timeout fetching {snapshot_type} snapshot")
+                return None
+            except Exception as e:
+                self.logger.error(f"Error fetching {snapshot_type} snapshot: {e}")
+                return None
+        
+        # Fetch both in parallel
         results = await asyncio.gather(
-            self.fetch_snapshot_from_api(event_id, "snapshot", timestamp),
-            self.fetch_snapshot_from_api(event_id, "thumbnail", timestamp),
+            fetch_url(full_url, "full"),
+            fetch_url(thumbnail_url, "thumbnail"),
             return_exceptions=True
         )
         
-        snapshot_full = results[0] if not isinstance(results[0], Exception) else None
+        snapshot_fov = results[0] if not isinstance(results[0], Exception) else None
         snapshot_crop = results[1] if not isinstance(results[1], Exception) else None
         
-        # Use full snapshot as heatmap (Frigate doesn't provide separate heatmap)
-        heatmap = snapshot_full
+        # Use full snapshot as heatmap
+        heatmap = snapshot_fov
         
         self.logger.info(
             f"Fetched snapshots for event {event_id}: "
-            f"full={'✓' if snapshot_full else '✗'}, "
             f"crop={'✓' if snapshot_crop else '✗'}, "
+            f"fov={'✓' if snapshot_fov else '✗'}, "
             f"heatmap={'✓' if heatmap else '✗'}"
         )
         
-        return (snapshot_full, snapshot_crop, heatmap)
+        return (snapshot_crop, snapshot_fov, heatmap)
 
     async def run(self) -> None:
         has_connected = False
@@ -366,259 +335,6 @@ class FrigateCam(RTSPCam):
         elif msg == "OFF":
             self.logger.debug("Frigate motion event: OFF")
             await self.trigger_analytics_stop()
-
-    async def grab_most_recent_event_snapshot(self) -> Optional[Path]:
-        """
-        Grab the most recent snapshot based on event API.
-        Queries Frigate's events API to find the most recent event with a snapshot,
-        then fetches the snapshot image.
-        """
-        if not self.args.frigate_http_url:
-            self.logger.warning("Cannot grab recent event snapshot: frigate_http_url not configured")
-            return None
-        
-        # Build the events API URL
-        events_url = f"{self.args.frigate_http_url}/api/events"
-        params = {
-            "camera": self.args.frigate_camera,
-            "limit": 1,
-            "has_snapshot": 1
-        }
-        
-        self.logger.debug(f"Fetching most recent event from {events_url} with params {params}")
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Fetch the most recent event
-                async with session.get(
-                    events_url, 
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=5.0)
-                ) as response:
-                    if response.status != 200:
-                        self.logger.warning(
-                            f"Failed to fetch recent events: HTTP {response.status}"
-                        )
-                        return None
-                    
-                    events = await response.json()
-                    
-                    if not events or len(events) == 0:
-                        self.logger.warning("No recent events with snapshots found")
-                        return None
-                    
-                    # Get the most recent event
-                    most_recent_event = events[0]
-                    event_id = most_recent_event.get("id")
-                    
-                    if not event_id:
-                        self.logger.warning("Most recent event missing 'id' field")
-                        return None
-                    
-                    # Log full event details
-                    # self.logger.debug(f"Most recent event details: {json.dumps(most_recent_event, indent=2)}")
-                    
-                    # Log summary
-                    start_time = most_recent_event.get("start_time")
-                    end_time = most_recent_event.get("end_time")
-                    event_data = most_recent_event.get("data", {})
-                    
-                    self.logger.info(
-                        f"Event summary: id={event_id}, "
-                        f"label={most_recent_event.get('label')}, "
-                        f"camera={most_recent_event.get('camera')}, "
-                        f"start_time={start_time}, "
-                        f"end_time={end_time}, "
-                        f"score={event_data.get('score')}, "
-                        f"top_score={event_data.get('top_score')}, "
-                        f"box={event_data.get('box')}"
-                    )
-                    
-                    # Calculate midpoint timestamp from active analytics event if available
-                    timestamp = None
-                    if self._active_analytics_event_id is not None:
-                        active_event = self._analytics_event_history.get(self._active_analytics_event_id)
-                        if active_event:
-                            event_start = active_event.get('start_time')
-                            if event_start is not None:
-                                current_time = time.time()
-                                # Frigate API expects integer timestamp (seconds since epoch)
-                                timestamp = int((event_start + current_time) / 2)
-                    
-                    # Now fetch the snapshot for this event
-                    snapshot_path = await self.fetch_snapshot_from_api(event_id, "snapshot", timestamp)
-                    
-                    if snapshot_path:
-                        self.logger.info(
-                            f"Successfully retrieved snapshot for most recent event {event_id}"
-                        )
-                    
-                    return snapshot_path
-                    
-        except asyncio.TimeoutError:
-            self.logger.warning("Timeout fetching most recent event")
-            return None
-        except Exception as e:
-            self.logger.error(f"Error fetching most recent event snapshot: {e}")
-            return None
-
-    async def grab_most_recent_motion_snapshot(self) -> Optional[Path]:
-        """
-        Grab the most recent motion snapshot from Frigate's latest frame API.
-        This is a simple snapshot fetch without event context, suitable for generic motion events.
-        Uses the /api/<camera>/latest.jpg endpoint with timestamp from active analytics event.
-        """
-        if not self.args.frigate_http_url:
-            self.logger.warning("Cannot grab motion snapshot: frigate_http_url not configured")
-            return None
-        
-        # Use Frigate's latest frame endpoint
-        snapshot_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
-        
-        # Add timestamp parameter from active analytics event if available
-        if self._active_analytics_event_id is not None:
-            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
-            if active_event:
-                start_time = active_event.get('start_time')
-                if start_time is not None:
-                    current_time = time.time()
-                    timestamp = (start_time + current_time) / 2
-                    # Frigate API expects integer timestamp (seconds since epoch)
-                    snapshot_url = f"{snapshot_url}?timestamp={int(timestamp)}"
-                    self.logger.debug(
-                        f"Using event midpoint timestamp for motion snapshot: {int(timestamp)} "
-                        f"(start={start_time}, current={current_time})"
-                    )
-        
-        self.logger.debug(f"Fetching latest motion snapshot from {snapshot_url}")
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    snapshot_url,
-                    timeout=aiohttp.ClientTimeout(total=5.0)
-                ) as response:
-                    if response.status == 200:
-                        image_data = await response.read()
-                        f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                        f.write(image_data)
-                        f.close()
-                        self.logger.info(
-                            f"Successfully fetched latest motion snapshot "
-                            f"({len(image_data)} bytes) -> {f.name}"
-                        )
-                        return Path(f.name)
-                    else:
-                        # Log error response body for debugging
-                        error_body = await response.text()
-                        self.logger.warning(
-                            f"Failed to fetch latest snapshot: HTTP {response.status}, "
-                            f"Response: {error_body}"
-                        )
-                        return None
-                    
-        except asyncio.TimeoutError:
-            self.logger.warning("Timeout fetching latest motion snapshot")
-            return None
-        except Exception as e:
-            self.logger.error(f"Error fetching latest motion snapshot: {e}")
-            return None
-
-    async def grab_all_motion_snapshots(self) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
-        """
-        Grab all three snapshot types for generic motion events from Frigate's latest frame API.
-        Fetches full resolution, thumbnail (360p), and heatmap snapshots using timestamp from active analytics event.
-        
-        Returns:
-            Tuple of (snapshot_full, snapshot_crop/thumbnail, heatmap)
-            - snapshot_full: Full resolution snapshot (for FoV)
-            - snapshot_crop: Thumbnail/cropped version (360p for fast processing)
-            - heatmap: Use full snapshot as heatmap
-        """
-        if not self.args.frigate_http_url:
-            self.logger.warning("Cannot grab motion snapshots: frigate_http_url not configured")
-            return (None, None, None)
-        
-        # Calculate midpoint timestamp from active analytics event
-        timestamp = None
-        if self._active_analytics_event_id is not None:
-            active_event = self._analytics_event_history.get(self._active_analytics_event_id)
-            if active_event:
-                start_time = active_event.get('start_time')
-                if start_time is not None:
-                    current_time = time.time()
-                    timestamp = int((start_time + current_time) / 2)
-                    self.logger.debug(
-                        f"Using event midpoint timestamp for motion snapshots: {timestamp} "
-                        f"(start={start_time}, current={current_time})"
-                    )
-        
-        # Build URLs for full and thumbnail snapshots
-        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
-        
-        # Full resolution snapshot
-        full_url = base_url
-        if timestamp is not None:
-            full_url = f"{full_url}?timestamp={timestamp}"
-        
-        # Thumbnail snapshot (360p for fast UniFi Protect processing)
-        thumbnail_url = f"{base_url}?height=360&quality=80"
-        if timestamp is not None:
-            thumbnail_url = f"{thumbnail_url}&timestamp={timestamp}"
-        
-        self.logger.debug(f"Fetching motion snapshots: full={full_url}, thumbnail={thumbnail_url}")
-        
-        # Fetch both snapshots in parallel
-        async def fetch_url(url: str, snapshot_type: str) -> Optional[Path]:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                        if response.status == 200:
-                            image_data = await response.read()
-                            f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                            f.write(image_data)
-                            f.close()
-                            self.logger.info(
-                                f"Successfully fetched {snapshot_type} motion snapshot "
-                                f"({len(image_data)} bytes) -> {f.name}"
-                            )
-                            return Path(f.name)
-                        else:
-                            # Log error response body for debugging
-                            error_body = await response.text()
-                            self.logger.warning(
-                                f"Failed to fetch {snapshot_type} motion snapshot: "
-                                f"HTTP {response.status}, Response: {error_body}"
-                            )
-                            return None
-            except asyncio.TimeoutError:
-                self.logger.warning(f"Timeout fetching {snapshot_type} motion snapshot")
-                return None
-            except Exception as e:
-                self.logger.error(f"Error fetching {snapshot_type} motion snapshot: {e}")
-                return None
-        
-        # Fetch both in parallel
-        results = await asyncio.gather(
-            fetch_url(full_url, "full"),
-            fetch_url(thumbnail_url, "thumbnail"),
-            return_exceptions=True
-        )
-        
-        snapshot_full = results[0] if not isinstance(results[0], Exception) else None
-        snapshot_crop = results[1] if not isinstance(results[1], Exception) else None
-        
-        # Use full snapshot as heatmap
-        heatmap = snapshot_full
-        
-        self.logger.info(
-            f"Fetched motion snapshots: "
-            f"full={'✓' if snapshot_full else '✗'}, "
-            f"crop={'✓' if snapshot_crop else '✗'}, "
-            f"heatmap={'✓' if heatmap else '✗'}"
-        )
-        
-        return (snapshot_full, snapshot_crop, heatmap)
 
     async def monitor_event_timeouts(self) -> None:
         """Monitor active events and end those that haven't received updates in 600 seconds"""
@@ -757,22 +473,10 @@ class FrigateCam(RTSPCam):
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
                 )
                 
-                # Fetch snapshots if available
-                has_snapshot = after_data.get('has_snapshot', False)
-                if has_snapshot and self.args.frigate_http_url:
-                    self.logger.debug(f"Event {event_id} has snapshot, fetching all types...")
-                    snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
-                    if snapshot_full or snapshot_crop or heatmap:
-                        self.update_motion_snapshots(
-                            crop=snapshot_crop,
-                            fov=snapshot_full,
-                            heatmap=heatmap
-                        )
-                        self.logger.info(
-                            f"Updated snapshots for smart event {event_id}: "
-                            f"crop={snapshot_crop}, fov={snapshot_full}, "
-                            f"heatmap={heatmap}"
-                        )
+                self.logger.info(
+                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
+                )
 
             elif event_type == "update":
                 if event_id in self.frigate_to_unifi_event_map:
@@ -799,22 +503,31 @@ class FrigateCam(RTSPCam):
                     # Update last update time for timeout tracking
                     self.event_last_update[unifi_event_id] = time.time()
                     
-                    # Fetch updated snapshots if available
+                    # Fetch and cache snapshots if available
                     has_snapshot = after_data.get('has_snapshot', False)
                     if has_snapshot and self.args.frigate_http_url:
-                        self.logger.debug(f"Event {event_id} has updated snapshot, fetching all types...")
-                        snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
-                        if snapshot_full or snapshot_crop or heatmap:
-                            self.update_motion_snapshots(
-                                crop=snapshot_crop,
-                                fov=snapshot_full,
-                                heatmap=heatmap
+                        self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
+                        try:
+                            # Fetch snapshots using the UniFi event ID
+                            snapshot_crop, snapshot_fov, heatmap = await self.fetch_snapshots_for_event(
+                                unifi_event_id, "smart_detect"
                             )
+                            
+                            # Cache snapshots in the smart detect event data
+                            event_data = self._active_smart_events[unifi_event_id]
+                            if snapshot_crop:
+                                event_data["snapshot_crop_path"] = snapshot_crop
+                            if snapshot_fov:
+                                event_data["snapshot_fov_path"] = snapshot_fov
+                            if heatmap:
+                                event_data["heatmap_path"] = heatmap
+                            
                             self.logger.debug(
-                                f"Updated snapshots for smart event {event_id}: "
-                                f"crop={snapshot_crop}, fov={snapshot_full}, "
-                                f"heatmap={heatmap}"
+                                f"Cached snapshots for smart event {unifi_event_id}: "
+                                f"crop={snapshot_crop}, fov={snapshot_fov}, heatmap={heatmap}"
                             )
+                        except Exception as e:
+                            self.logger.error(f"Error fetching/caching snapshots for event {unifi_event_id}: {e}")
                     
                     event_data = self._active_smart_events[unifi_event_id]
                     event_age = time.time() - event_data["start_time"]
@@ -854,42 +567,10 @@ class FrigateCam(RTSPCam):
                         return
                     
                     # Build final descriptor from end event data
-                    # This will be included in the "leave" event by trigger_motion_stop
                     final_descriptor = self.build_descriptor_from_frigate_msg(
                         frigate_msg, object_type
                     )
                     end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                    
-                    # Fetch all snapshot types - try HTTP API first, fall back to MQTT
-                    if self.args.frigate_http_url:
-                        has_snapshot = after_data.get('has_snapshot', False)
-                        if has_snapshot:
-                            self.logger.info(f"Fetching final snapshots for event {event_id}...")
-                            snapshot_full, snapshot_crop, heatmap = await self.fetch_all_snapshots_from_api(event_id)
-                            if snapshot_full or snapshot_crop or heatmap:
-                                self.update_motion_snapshots(
-                                    crop=snapshot_crop,
-                                    fov=snapshot_full,
-                                    heatmap=heatmap
-                                )
-                                self.logger.info(
-                                    f"Updated final snapshots for event {event_id}: "
-                                    f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
-                                    f"heatmap={heatmap is not None}"
-                                )
-                        else:
-                            self.logger.warning(f"Event {event_id} ended but has_snapshot=False")
-                    else:
-                        # Fall back to MQTT snapshot wait
-                        if event_id in self.event_snapshot_ready:
-                            snapshot_ready = self.event_snapshot_ready[event_id]
-                            self.logger.info(f"Frigate: Awaiting snapshot via MQTT (Frigate: {event_id})")
-                            try:
-                                await asyncio.wait_for(snapshot_ready.wait(), timeout=10.0)
-                            except asyncio.TimeoutError:
-                                self.logger.warning(
-                                    f"Snapshot wait timeout for Frigate event {event_id}. Proceeding without snapshot."
-                                )
                     
                     event_duration = time.time() - event_data["start_time"]
                     self.logger.info(

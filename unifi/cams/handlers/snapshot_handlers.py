@@ -48,73 +48,118 @@ class SnapshotHandlers:
         """
         Process a snapshot request from UniFi Protect.
         
-        Handles URL-based snapshots (Frigate), regular snapshots, and motion event snapshots.
+        Handles cached snapshot files (from motion events) and fallback to Frigate API.
         """
         snapshot_type = msg["payload"]["what"]
         filename = msg["payload"].get("filename", "")
         
         self.logger.debug(f"Snapshot request: type={snapshot_type}, filename={filename}")
         
-        # Use Frigate if configured and either URL-based or regular snapshot
-        use_frigate = (
-            hasattr(self.args, 'frigate_http_url') and 
-            self.args.frigate_http_url and
-            (filename and "?" in filename or snapshot_type == "snapshot")
-        )
+        # Try to find cached snapshot file from event history
+        cached_path = self._find_cached_snapshot(filename, snapshot_type)
         
-        if use_frigate:
-            await self._process_frigate_snapshot(msg, snapshot_type, filename)
+        if cached_path and cached_path.exists():
+            # Serve cached snapshot
+            self.logger.info(f"Serving cached {snapshot_type} from {cached_path}")
+            await self._upload_file_to_protect(
+                cached_path,
+                msg["payload"]["uri"],
+                msg["payload"].get("formFields", {}),
+                snapshot_type
+            )
         else:
-            await self._process_motion_event_snapshot(msg, snapshot_type)
+            # Fallback to Frigate API or regular snapshot
+            use_frigate = (
+                hasattr(self.args, 'frigate_http_url') and 
+                self.args.frigate_http_url
+            )
+            
+            if use_frigate:
+                # Fetch from Frigate latest.jpg endpoint
+                snapshot_url = self._build_frigate_fallback_url(snapshot_type)
+                self.logger.info(f"Fetching {snapshot_type} from Frigate (no cached): {snapshot_url}")
+                await self._fetch_and_upload_snapshot(
+                    snapshot_url,
+                    msg["payload"]["uri"],
+                    msg["payload"].get("formFields", {}),
+                    snapshot_type
+                )
+            else:
+                # Use regular snapshot method
+                await self._process_motion_event_snapshot(msg, snapshot_type)
         
         if msg["responseExpected"]:
             return self.gen_response("GetRequest", response_to=msg["messageId"])
 
-    def _build_frigate_url(self, snapshot_type: str, filename: str) -> str:
+    def _find_cached_snapshot(self, filename: str, snapshot_type: str) -> Optional[Path]:
         """
-        Build Frigate snapshot URL with appropriate parameters.
+        Find cached snapshot file from event history.
         
         Args:
-            snapshot_type: Type of snapshot (motionSnapshot, motionSnapshotFullFoV, etc.)
-            filename: Filename from UniFi request (may contain event_id or timestamp)
+            filename: Filename from GetRequest (is actually a file path in our implementation)
+            snapshot_type: Type of snapshot requested
             
         Returns:
-            Complete URL to fetch snapshot from Frigate
+            Path to cached snapshot file, or None if not found
+        """
+        # UniFi Protect modifies filenames for FoV snapshots by appending _fullfov before extension
+        # e.g., /tmp/tmpvgwqfkeo.jpg -> /tmp/tmpvgwqfkeo_fullfov.jpg
+        # Strip this suffix to find the original cached file
+        original_filename = filename
+        if filename and snapshot_type == "motionSnapshotFullFoV" and "_fullfov" in filename:
+            # Remove _fullfov suffix to get original filename
+            original_filename = filename.replace("_fullfov", "")
+            self.logger.debug(
+                f"UniFi modified FoV filename: {filename} -> looking for original: {original_filename}"
+            )
+        
+        # The filename is actually the cached file path that we set in trigger_analytics_stop
+        if original_filename and "/" in original_filename:
+            # It's a file path - try to use it directly
+            path = Path(original_filename)
+            if path.exists():
+                self.logger.debug(f"Found cached snapshot at original path: {path}")
+                return path
+        
+        # Fallback: search through event history for matching snapshots
+        # This handles edge cases where filename doesn't match expected format
+        for event_data in self._analytics_event_history.values():
+            # Match based on snapshot type
+            if snapshot_type == "motionSnapshot":
+                cached_path = event_data.get("snapshot_crop_path")
+            elif snapshot_type == "motionSnapshotFullFoV":
+                cached_path = event_data.get("snapshot_fov_path")
+            elif snapshot_type == "motionHeatmap":
+                cached_path = event_data.get("heatmap_path")
+            else:
+                continue
+            
+            if cached_path and isinstance(cached_path, Path) and cached_path.exists():
+                # Check if this matches the requested filename (original or modified)
+                if (filename and str(cached_path) == filename) or \
+                   (original_filename and str(cached_path) == original_filename):
+                    return cached_path
+        
+        return None
+
+    def _build_frigate_fallback_url(self, snapshot_type: str) -> str:
+        """
+        Build Frigate fallback URL for latest snapshot.
+        
+        Args:
+            snapshot_type: Type of snapshot requested
+            
+        Returns:
+            URL to Frigate's latest.jpg endpoint
         """
         base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
         
-        params = []
-        
         # Add quality params for thumbnails
         if snapshot_type == "motionSnapshot":
-            params.extend(["height=360", "quality=80"])
+            return f"{base_url}?height=360&quality=80"
         
-        # Extract and convert event_id to timestamp
-        if "event_id=" in filename:
-            event_id_str = filename.split("event_id=", 1)[1].split("&", 1)[0]
-            try:
-                event_id = int(event_id_str)
-                event_data = self._analytics_event_history.get(event_id)
-                if event_data and event_data.get("start_time"):
-                    params.append(f"timestamp={int(event_data['start_time'])}")
-                    self.logger.debug(
-                        f"Converted event_id {event_id} to timestamp {int(event_data['start_time'])} "
-                        f"from analytics event history"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Event ID {event_id} not found in analytics event history "
-                        f"(history size: {len(self._analytics_event_history)})"
-                    )
-            except ValueError:
-                self.logger.warning(f"Invalid event_id in filename: {event_id_str}")
-        elif "timestamp=" in filename:
-            # Preserve existing timestamp parameter
-            timestamp_part = filename.split("?", 1)[1] if "?" in filename else ""
-            if timestamp_part:
-                params.append(timestamp_part)
-        
-        return f"{base_url}?{('&'.join(params))}" if params else base_url
+        return base_url
+
 
     async def _fetch_and_upload_snapshot(
         self, 
@@ -197,26 +242,6 @@ class SnapshotHandlers:
             self.logger.exception(f"Failed to upload {snapshot_type}")
             return False
 
-    async def _process_frigate_snapshot(
-        self, msg: dict[str, Any], snapshot_type: str, filename: str = ""
-    ) -> None:
-        """
-        Process snapshot request using Frigate API.
-        
-        Args:
-            msg: Message from UniFi Protect
-            snapshot_type: Type of snapshot requested
-            filename: Filename from request (may contain event_id or timestamp)
-        """
-        snapshot_url = self._build_frigate_url(snapshot_type, filename)
-        self.logger.info(f"Fetching {snapshot_type} from Frigate: {snapshot_url}")
-        
-        await self._fetch_and_upload_snapshot(
-            snapshot_url,
-            msg["payload"]["uri"],
-            msg["payload"].get("formFields", {}),
-            snapshot_type
-        )
 
     async def _process_motion_event_snapshot(
         self, msg: dict[str, Any], snapshot_type: str
