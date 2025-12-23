@@ -701,13 +701,13 @@ class FrigateCam(RTSPCam):
             before_data = frigate_msg.get('before', {})
             after_data = frigate_msg.get('after', {})
             
-            self.logger.debug(
-                f"Times - before: frame={before_data.get('frame_time', 'N/A')}, snapshot_frame={before_snapshot_time}, start={before_data.get('start_time', 'N/A')}, end={before_data.get('end_time', 'N/A')} | after: frame={after_data.get('frame_time', 'N/A')}, snapshot_frame={after_snapshot_time}, start={after_data.get('start_time', 'N/A')}, end={after_data.get('end_time', 'N/A')}"
-            )
+            #self.logger.debug(
+            #    f"Times - before: frame={before_data.get('frame_time', 'N/A')}, snapshot_frame={before_snapshot_time}, start={before_data.get('start_time', 'N/A')}, end={before_data.get('end_time', 'N/A')} | after: frame={after_data.get('frame_time', 'N/A')}, snapshot_frame={after_snapshot_time}, start={after_data.get('start_time', 'N/A')}, end={after_data.get('end_time', 'N/A')}"
+            #)
 
-            self.logger.debug(
-                f"{before_data.get('frame_time', 'N/A')},{before_snapshot_time},{before_data.get('start_time', 'N/A')},{before_data.get('end_time', 'N/A')},{after_data.get('frame_time', 'N/A')},{after_snapshot_time},{after_data.get('start_time', 'N/A')},{after_data.get('end_time', 'N/A')}"
-            )
+            #self.logger.debug(
+            #    f"{before_data.get('frame_time', 'N/A')},{before_snapshot_time},{before_data.get('start_time', 'N/A')},{before_data.get('end_time', 'N/A')},{after_data.get('frame_time', 'N/A')},{after_snapshot_time},{after_data.get('start_time', 'N/A')},{after_data.get('end_time', 'N/A')}"
+            #)
 
             object_type = self.label_to_object_type(label)
             if not object_type:
@@ -769,9 +769,9 @@ class FrigateCam(RTSPCam):
                             heatmap=heatmap
                         )
                         self.logger.info(
-                            f"Updated snapshots for event {event_id}: "
-                            f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
-                            f"heatmap={heatmap is not None}"
+                            f"Updated snapshots for smart event {event_id}: "
+                            f"crop={snapshot_crop}, fov={snapshot_full}, "
+                            f"heatmap={heatmap}"
                         )
 
             elif event_type == "update":
@@ -811,9 +811,9 @@ class FrigateCam(RTSPCam):
                                 heatmap=heatmap
                             )
                             self.logger.debug(
-                                f"Updated snapshots for event {event_id}: "
-                                f"crop={snapshot_crop is not None}, fov={snapshot_full is not None}, "
-                                f"heatmap={heatmap is not None}"
+                                f"Updated snapshots for smart event {event_id}: "
+                                f"crop={snapshot_crop}, fov={snapshot_full}, "
+                                f"heatmap={heatmap}"
                             )
                     
                     event_data = self._active_smart_events[unifi_event_id]

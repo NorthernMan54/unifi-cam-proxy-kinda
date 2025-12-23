@@ -61,6 +61,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 #   - snapshot_filename (Optional[str]): Filename for motionSnapshot
                 #   - snapshot_fov_filename (Optional[str]): Filename for motionSnapshotFullFoV
                 #   - heatmap_filename (Optional[str]): Filename for motionHeatmap
+                #   - smart_detect_event_ids (list[int]): Array of smart detect event IDs that occurred during this analytics event
                 _analytics_event_history: History of all analytics events (kept for 1 hour after completion)
                 _active_analytics_event_id: ID of current active analytics event (None if no active event)
                 # Structure: dict[int, dict[str, Any]] - keyed by event_id, values contain:
@@ -388,6 +389,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "heatmap": None,        # motionHeatmap - heatmap visualization
         }
         
+        # If there's an active analytics event, associate this smart detect event with it
+        if self._active_analytics_event_id is not None:
+            active_analytics = self._analytics_event_history.get(self._active_analytics_event_id)
+            if active_analytics:
+                active_analytics["smart_detect_event_ids"].append(event_id)
+                self.logger.debug(
+                    f"Associated smart detect event {event_id} ({object_type.value}) "
+                    f"with analytics event {self._active_analytics_event_id}. "
+                    f"Total smart detects for this analytics event: "
+                    f"{len(active_analytics['smart_detect_event_ids'])}"
+                )
+        
         # Update legacy compatibility fields
         self._motion_event_ts = current_time
         self._motion_object_type = object_type
@@ -625,6 +638,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "snapshot_filename": None,
             "snapshot_fov_filename": None,
             "heatmap_filename": None,
+            # Track smart detect events that occurred during this analytics event
+            "smart_detect_event_ids": [],
         }
         self._active_analytics_event_id = event_id
         
@@ -708,79 +723,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             # No smart detect events either, fully clear state
             self._motion_event_ts = None
 
-    # Legacy API for subclasses - backwards compatibility
-    async def trigger_motion_start(
-        self,
-        object_type: Optional[SmartDetectObjectType] = None,
-        custom_descriptor: Optional[dict[str, Any]] = None,
-        event_timestamp: Optional[float] = None,
-    ) -> None:
-        """
-        Start a motion event. Supports both generic motion (EventAnalytics) and 
-        smart detect events (EventSmartDetect with object_type).
-        
-        DEPRECATED: Use trigger_analytics_start() or trigger_smart_detect_start() instead.
-        
-        All events use a globally unique event ID counter that increments
-        for each new event regardless of type.
-        """
-        if object_type:
-            await self.trigger_smart_detect_start(object_type, custom_descriptor, event_timestamp)
-        else:
-            await self.trigger_analytics_start(event_timestamp)
-
-    async def trigger_motion_update(
-        self,
-        custom_descriptor: Optional[dict[str, Any]] = None,
-        event_timestamp: Optional[float] = None,
-        object_type: Optional[SmartDetectObjectType] = None,
-    ) -> None:
-        """
-        Send a motion update (moving) event with updated descriptor information.
-        Only applicable to SmartDetect events (not generic EventAnalytics).
-        
-        DEPRECATED: Use trigger_smart_detect_update() instead.
-        
-        Args:
-            custom_descriptor: Updated descriptor data (bounding box, etc.)
-            event_timestamp: Optional timestamp for the event
-            object_type: Optional object type to update. If not provided, uses the
-                        most recent active smart detect event (legacy behavior).
-        """
-        # Determine which event to update
-        target_object_type = object_type or self._motion_object_type
-        
-        if not target_object_type:
-            self.logger.warning(
-                "trigger_motion_update called but no object_type specified and "
-                "no active smart detect event found. Ignoring."
-            )
-            return
-        
-        await self.trigger_smart_detect_update(target_object_type, custom_descriptor, event_timestamp)
-
-    async def trigger_motion_stop(
-        self,
-        custom_descriptor: Optional[dict[str, Any]] = None,
-        event_timestamp: Optional[float] = None,
-        object_type: Optional[SmartDetectObjectType] = None,
-    ) -> None:
-        """
-        Stop a motion event. Can stop either a generic motion event (EventAnalytics) 
-        or a specific smart detect event (EventSmartDetect).
-        
-        DEPRECATED: Use trigger_analytics_stop() or trigger_smart_detect_stop() instead.
-        
-        Args:
-            custom_descriptor: Optional final descriptor data
-            event_timestamp: Optional timestamp for the event
-            object_type: If provided, stops a specific smart detect event. 
-                        If None, stops the generic analytics event.
-        """
-        if object_type:
-            await self.trigger_smart_detect_stop(object_type, custom_descriptor, event_timestamp)
-        else:
-            await self.trigger_analytics_stop(event_timestamp)
 
     def get_active_events_summary(self) -> dict[str, Any]:
         """
@@ -795,6 +737,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "event_id": self._active_analytics_event_id,
                 "duration": time.time() - active_analytics["start_time"] 
                     if active_analytics else None,
+                "smart_detect_event_ids": active_analytics["smart_detect_event_ids"] 
+                    if active_analytics else [],
             },
             "smart_detect_events": {
                 event_id: {
@@ -1064,3 +1008,77 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         await self.stop_all_motion_events()
         self.close_streams()
 
+
+    # Legacy API for subclasses - backwards compatibility
+    async def trigger_motion_start(
+        self,
+        object_type: Optional[SmartDetectObjectType] = None,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Start a motion event. Supports both generic motion (EventAnalytics) and 
+        smart detect events (EventSmartDetect with object_type).
+        
+        DEPRECATED: Use trigger_analytics_start() or trigger_smart_detect_start() instead.
+        
+        All events use a globally unique event ID counter that increments
+        for each new event regardless of type.
+        """
+        if object_type:
+            await self.trigger_smart_detect_start(object_type, custom_descriptor, event_timestamp)
+        else:
+            await self.trigger_analytics_start(event_timestamp)
+
+    async def trigger_motion_update(
+        self,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+        object_type: Optional[SmartDetectObjectType] = None,
+    ) -> None:
+        """
+        Send a motion update (moving) event with updated descriptor information.
+        Only applicable to SmartDetect events (not generic EventAnalytics).
+        
+        DEPRECATED: Use trigger_smart_detect_update() instead.
+        
+        Args:
+            custom_descriptor: Updated descriptor data (bounding box, etc.)
+            event_timestamp: Optional timestamp for the event
+            object_type: Optional object type to update. If not provided, uses the
+                        most recent active smart detect event (legacy behavior).
+        """
+        # Determine which event to update
+        target_object_type = object_type or self._motion_object_type
+        
+        if not target_object_type:
+            self.logger.warning(
+                "trigger_motion_update called but no object_type specified and "
+                "no active smart detect event found. Ignoring."
+            )
+            return
+        
+        await self.trigger_smart_detect_update(target_object_type, custom_descriptor, event_timestamp)
+
+    async def trigger_motion_stop(
+        self,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+        object_type: Optional[SmartDetectObjectType] = None,
+    ) -> None:
+        """
+        Stop a motion event. Can stop either a generic motion event (EventAnalytics) 
+        or a specific smart detect event (EventSmartDetect).
+        
+        DEPRECATED: Use trigger_analytics_stop() or trigger_smart_detect_stop() instead.
+        
+        Args:
+            custom_descriptor: Optional final descriptor data
+            event_timestamp: Optional timestamp for the event
+            object_type: If provided, stops a specific smart detect event. 
+                        If None, stops the generic analytics event.
+        """
+        if object_type:
+            await self.trigger_smart_detect_stop(object_type, custom_descriptor, event_timestamp)
+        else:
+            await self.trigger_analytics_stop(event_timestamp)
