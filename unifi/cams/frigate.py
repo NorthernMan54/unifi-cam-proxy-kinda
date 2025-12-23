@@ -180,6 +180,8 @@ class FrigateCam(RTSPCam):
             "coord3d": [0, 0, 0],  # Required field: no 3D coordinates available
             "depth": None,  # Optional depth information
             "speed": speed,  # Average estimated speed from Frigate
+            # "firstShownTimeMs": a.default.number().finite().optional(),
+            # "idleSinceTimeMs": a.default.number().finite().optional()
         }
         
         self.logger.debug(
@@ -683,10 +685,10 @@ class FrigateCam(RTSPCam):
             label = frigate_msg.get("after", {}).get("label")
             
             if camera != self.args.frigate_camera:
-                self.logger.debug(
-                    f"Frigate: Ignoring Frigate event for different camera: {camera} "
-                    f"(expecting {self.args.frigate_camera})"
-                )
+                #self.logger.debug(
+                #    f"Frigate: Ignoring Frigate event for different camera: {camera} "
+                #    f"(expecting {self.args.frigate_camera})"
+                #)
                 return
             
             self.logger.debug(
