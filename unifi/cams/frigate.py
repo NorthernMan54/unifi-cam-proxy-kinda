@@ -345,6 +345,10 @@ class FrigateCam(RTSPCam):
             
             # Check all active smart detect events (from base class)
             for unifi_event_id, event_data in list(self._active_smart_events.items()):
+                # Skip events that have already ended
+                if event_data.get("end_time") is not None:
+                    continue
+                    
                 # Get last update time, defaulting to start time if no updates yet
                 last_update = self.event_last_update.get(unifi_event_id, event_data["start_time"])
                 time_since_update = current_time - last_update
