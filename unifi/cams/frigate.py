@@ -169,21 +169,24 @@ class FrigateCam(RTSPCam):
         speed = float(average_speed) if average_speed > 0 else None
         
         descriptor = {
-            "trackerID": tracker_id,
-            "name": object_type.value,
-            "confidenceLevel": confidence_level,
-            "coord": coord,
-            "objectType": object_type.value,
-            "zones": zones,
-            "lines": [],  # Required field: no line crossing detection
-            "loiterZones": [],  # Optional but included for completeness
-            "stationary": stationary,
-            "attributes": {},  # Optional but included for completeness
-            "coord3d": [0, 0, 0],  # Required field: no 3D coordinates available
+            "attributes": None,  # Optional and validated
+            "boxColor": "red", # validated
+            "confidenceLevel": confidence_level, # validated
+            "coord": coord, # validated
+            "coord3d": [-1,-1],  # validated Required field: no 3D coordinates available
             "depth": None,  # Optional depth information
+            "firstShownTimeMs": int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms,  # validated
+            "idleSinceTimeMs": int(frigate_msg.get('after', {}).get('motionless_count', 0) * 1000), # validated
+            "lines": [],  # validated Required field: no line crossing detection
+            "loiterZones": [],  # validated Optional but included for completeness
+            "name": "Named by Frigate", # validated
+            "objectType": object_type.value, # validated
+            "secondLensZones": [],  # validated Optional but included for completeness
             "speed": speed,  # Average estimated speed from Frigate
-            # "firstShownTimeMs": a.default.number().finite().optional(),
-            # "idleSinceTimeMs": a.default.number().finite().optional()
+            "stationary": stationary, # validated
+            "tag": "Tagged by Frigate",  # validated
+            "trackerID": tracker_id, # validated
+            "zones": zones, # validated
         }
         
         self.logger.debug(

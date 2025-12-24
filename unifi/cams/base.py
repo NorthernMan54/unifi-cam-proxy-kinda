@@ -414,7 +414,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"Ignoring duplicate start for {object_type.value}."
             )
             return event_id
-        zonesStatus = {"1": {"score": 75}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 60, "status": "enter"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -424,27 +424,23 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"score": score}}
+                zonesStatus = {"1": {"level": score, "status": "enter"}}
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "descriptors": descriptors,
+            "displayTimeoutMSec": 10000,
             "edgeType": "enter",
             "eventId": event_id,
-            "eventType": "motion",
-            "levels": {"0": 99},
             "objectTypes": [object_type.value],
+                "smartDetectSnapshotFullFoV": "",
+                "smartDetectSnapshotFullFoVHeight": 0,
+                "smartDetectSnapshotFullFoVWidth": 0,
+                "smartDetectSnapshots": [],
             "zonesStatus": zonesStatus,
-            "displayTimeoutMSec": 10000,
-            "descriptors": descriptors,
-            # "motionHeatmap": "motionHeatmapline211.png",
-            # "motionSnapshot": "motionSnapshotline212.png",
-            # "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline326.png",
-            # "snapshot": "smartDetectSnapshotline326.png",
         }
         
         self.logger.info(
@@ -520,7 +516,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[event_id]
-        zonesStatus = {"1": {"score": 75}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 75, "status": "moving"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -533,23 +529,23 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"score": score}}
+                zonesStatus = {"1": {"level": score, "status": "moving"}}
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": int(self.get_uptime()),
-            "clockBestWall": int(round(active_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "descriptors": descriptors,
+            "displayTimeoutMSec": 10000,
             "edgeType": "moving",
             "eventId": event_id,
-            "eventType": "motion",
-            "levels": {"0": 48},
             "objectTypes": [object_type.value],
+            "smartDetectSnapshotFullFoV": "",
+            "smartDetectSnapshotFullFoVHeight": 0,
+            "smartDetectSnapshotFullFoVWidth": 0,
+            "smartDetectSnapshots": [],
             "zonesStatus": zonesStatus,
-            "displayTimeoutMSec": 10000,
-            "descriptors": descriptors,
         }
         
         self.logger.debug(
@@ -601,7 +597,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[target_event_id]
-        zonesStatus = {"1": {"score": 75}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
         # Build descriptors array - use custom_descriptor if provided, 
         # otherwise fall back to last saved descriptor for this event
         descriptors = []
@@ -612,27 +608,60 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"score": score}}
+                zonesStatus = {"1": {"level": score, "status": "leave"}}
         elif active_event["last_descriptor"]:
             descriptors = [active_event["last_descriptor"]]
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": int(self.get_uptime()),
-            "clockBestWall": int(round(active_event["start_time"] * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "descriptors": [],         # This is empty on stop events
+            "displayTimeoutMSec": 2000,
             "edgeType": "leave",
             "eventId": target_event_id,
-            "eventType": "motion",
-            "levels": {"0": 49},
             "objectTypes": [object_type.value],
+            "smartDetectSnapshotFullFoV": "smartdetectsnap_zone_00000001_fullfov.jpg",
+            "smartDetectSnapshotFullFoVHeight": 360,
+            "smartDetectSnapshotFullFoVWidth": 640,
+            "smartDetectSnapshots": [
+                {
+                    "clockBestMonotonic": 51810,
+                    "clockBestWall": 1766543821684,
+                    "smartDetectSnapshot": "smartdetectsnap_zone_21766543821684.jpg",
+                    "smartDetectSnapshotHeight": 360,
+                    "smartDetectSnapshotName": "",
+                    "smartDetectSnapshotType": "person",
+                    "smartDetectSnapshotWidth": 360,
+                    "trackerID": 2
+                },
+                {
+                    "clockBestMonotonic": 56908,
+                    "clockBestWall": 1766543826781,
+                    "smartDetectSnapshot": "smartdetectsnap_zone_31766543826781.jpg",
+                    "smartDetectSnapshotHeight": 360,
+                    "smartDetectSnapshotName": "",
+                    "smartDetectSnapshotType": "person",
+                    "smartDetectSnapshotWidth": 360,
+                    "trackerID": 3
+                },
+            ],
+            "trackerIDAttrMap": {
+                "2": {
+                    "objectType": "person",
+                    "zone": [
+                    2
+                    ]
+                },
+                "3": {
+                    "objectType": "person",
+                    "zone": [
+                    2
+                    ]
+                }
+            },
             "zonesStatus": zonesStatus,
-            "displayTimeoutMSec": 2000,
-            "descriptors": descriptors,
-            "smartDetectZoneSnapshot": "smartDetectZoneSnapshotline481.png",
-            "smartDetectZoneSnapshotFullFoV": "smartDetectZoneSnapshotFullFoVline481.png",
         }
         
         duration = time.time() - active_event["start_time"]
