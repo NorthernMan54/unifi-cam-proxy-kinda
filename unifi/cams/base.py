@@ -223,6 +223,37 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         # Subclasses (like FrigateCam) should override this
         snapshot = await self.get_snapshot()
         return (snapshot, snapshot, snapshot)
+    
+    def update_snapshot_dimensions_from_file(self, event_id: int, snapshot_path: Optional[Path]) -> None:
+        """
+        Update the snapshot dimensions in the descriptor history based on the actual image file.
+        Should be called by subclasses after fetching snapshots.
+        
+        Args:
+            event_id: The smart detect event ID
+            snapshot_path: Path to the snapshot image file
+        """
+        if event_id not in self._active_smart_events:
+            return
+            
+        if snapshot_path:
+            width, height = self._get_image_dimensions(snapshot_path)
+            
+            # Update the stored dimensions for this event
+            self._active_smart_events[event_id]["snapshot_width"] = width
+            self._active_smart_events[event_id]["snapshot_height"] = height
+            
+            # Update ALL descriptor history entries with the actual snapshot dimensions
+            # since they all reference the same cropped snapshot image
+            descriptor_history = self._active_smart_events[event_id]["descriptor_history"]
+            for desc_entry in descriptor_history:
+                desc_entry["snapshot_width"] = width
+                desc_entry["snapshot_height"] = height
+            
+            self.logger.debug(
+                f"Updated snapshot dimensions for event {event_id}: {width}x{height} from file {snapshot_path} "
+                f"(updated {len(descriptor_history)} descriptor entries)"
+            )
 
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
@@ -377,6 +408,97 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"Remaining: {len(self._active_smart_events)}"
             )
 
+    def _get_image_dimensions(self, image_path: Optional[Path]) -> tuple[int, int]:
+        """
+        Get the dimensions of an image file.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            Tuple of (width, height) for the image, or (640, 360) as fallback
+        """
+        if not image_path or not image_path.exists():
+            return (640, 360)
+        
+        try:
+            # Try to read image dimensions without loading the entire image
+            # This works with PIL/Pillow if available
+            try:
+                from PIL import Image
+                with Image.open(image_path) as img:
+                    return img.size  # Returns (width, height)
+            except ImportError:
+                # PIL not available, try alternative method using basic file reading
+                # Read just enough bytes to get dimensions from common image formats
+                with image_path.open('rb') as f:
+                    # Try PNG format
+                    header = f.read(24)
+                    if header[:8] == b'\x89PNG\r\n\x1a\n':
+                        # PNG format: width and height are at bytes 16-23
+                        f.seek(16)
+                        width_bytes = f.read(4)
+                        height_bytes = f.read(4)
+                        width = int.from_bytes(width_bytes, byteorder='big')
+                        height = int.from_bytes(height_bytes, byteorder='big')
+                        return (width, height)
+                    # Try JPEG format
+                    elif header[:2] == b'\xff\xd8':
+                        f.seek(0)
+                        # JPEG dimensions are more complex to parse
+                        # For now, fall back to default
+                        self.logger.debug("JPEG format detected but dimensions parsing not implemented without PIL")
+                        return (640, 360)
+                    else:
+                        self.logger.debug(f"Unknown image format for {image_path}")
+                        return (640, 360)
+        except Exception as e:
+            self.logger.debug(f"Could not read image dimensions from {image_path}: {e}")
+            return (640, 360)
+
+    def _calculate_snapshot_dimensions(self, descriptor: dict[str, Any], snapshot_path: Optional[Path] = None) -> tuple[int, int]:
+        """
+        Calculate snapshot dimensions from the actual snapshot image file.
+        Falls back to bounding box calculation if image not available.
+        
+        Args:
+            descriptor: Descriptor dictionary containing coordinate information
+            snapshot_path: Optional path to the snapshot image file
+            
+        Returns:
+            Tuple of (width, height) for the snapshot
+        """
+        # First try to get dimensions from the actual snapshot file
+        if snapshot_path:
+            width, height = self._get_image_dimensions(snapshot_path)
+            if (width, height) != (640, 360):  # If we got real dimensions (not the default)
+                return (width, height)
+        
+        # Fallback: Try to calculate from bounding box coordinates
+        coord = descriptor.get("coord")
+        if coord and len(coord) >= 4:
+            try:
+                # Assuming coord is normalized [x1, y1, x2, y2]
+                x1, y1, x2, y2 = coord[0], coord[1], coord[2], coord[3]
+                
+                # Get the video stream resolution (use video3/low quality as default for snapshots)
+                stream_width, stream_height = self._detected_resolutions.get("video3", (640, 360))
+                
+                # Calculate absolute bounding box dimensions
+                bbox_width = abs(x2 - x1) * stream_width
+                bbox_height = abs(y2 - y1) * stream_height
+                
+                # Round to integers and ensure minimum size
+                width = max(int(bbox_width), 100)  # Minimum 100px
+                height = max(int(bbox_height), 100)  # Minimum 100px
+                
+                return (width, height)
+            except (ValueError, TypeError, IndexError) as e:
+                self.logger.debug(f"Could not parse coord from descriptor: {e}")
+        
+        # Final fallback to default dimensions
+        return (640, 360)
+
     # API for subclasses - Smart Detect Events
     async def trigger_smart_detect_start(
         self,
@@ -462,11 +584,29 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "end_time": None,  # Will be set when event ends
             "event_timestamp": event_timestamp,
             "last_descriptor": custom_descriptor,
+            "descriptor_history": [],  # Track all descriptors with timestamps for building snapshot array
             # UniFi Protect requests three snapshot types - store cached file paths:
             "snapshot_crop_path": None,  # motionSnapshot - cropped with bounding box
             "snapshot_fov_path": None,   # motionSnapshotFullFoV - full size with bounding box
             "heatmap_path": None,        # motionHeatmap - heatmap visualization
+            "snapshot_width": None,  # Actual snapshot dimensions
+            "snapshot_height": None,
         }
+        
+        # Add the initial descriptor to history if provided
+        if custom_descriptor:
+            # Use default dimensions initially - subclasses should call
+            # update_snapshot_dimensions_from_file() after fetching snapshots
+            # to get actual dimensions from the image file
+            snapshot_width, snapshot_height = (640, 360)  # Default dimensions
+            
+            self._active_smart_events[event_id]["descriptor_history"].append({
+                "descriptor": custom_descriptor,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": snapshot_width,
+                "snapshot_height": snapshot_height,
+            })
         
         # If there's an active analytics event, associate this smart detect event with it
         if self._active_analytics_event_id is not None:
@@ -524,6 +664,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             # Update the stored descriptor for this event
             active_event["last_descriptor"] = custom_descriptor
             self._motion_last_descriptor = custom_descriptor  # Legacy compatibility
+            # Add to descriptor history
+            # Use default dimensions initially - subclasses should call
+            # update_snapshot_dimensions_from_file() after fetching snapshots
+            snapshot_width, snapshot_height = (640, 360)  # Default dimensions
+            
+            active_event["descriptor_history"].append({
+                "descriptor": custom_descriptor,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": snapshot_width,
+                "snapshot_height": snapshot_height,
+            })
             if custom_descriptor and "confidenceLevel" in custom_descriptor:
                 try:
                     score = int(custom_descriptor.get("confidenceLevel"))
@@ -612,6 +764,104 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         elif active_event["last_descriptor"]:
             descriptors = [active_event["last_descriptor"]]
         
+        # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
+        smart_detect_snapshots = []
+        tracker_id_attr_map = {}
+        
+        # Use descriptor history if available, otherwise use last descriptor
+        descriptors_to_process = active_event.get("descriptor_history", [])
+        if not descriptors_to_process and custom_descriptor:
+            # Fallback: create a single entry from the final descriptor
+            snapshot_width, snapshot_height = self._calculate_snapshot_dimensions(custom_descriptor)
+            descriptors_to_process = [{
+                "descriptor": custom_descriptor,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": snapshot_width,
+                "snapshot_height": snapshot_height,
+            }]
+        elif not descriptors_to_process and active_event.get("last_descriptor"):
+            # Further fallback: use last stored descriptor
+            last_desc = active_event["last_descriptor"]
+            snapshot_width, snapshot_height = self._calculate_snapshot_dimensions(last_desc)
+            descriptors_to_process = [{
+                "descriptor": last_desc,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": snapshot_width,
+                "snapshot_height": snapshot_height,
+            }]
+        
+        # Process each descriptor to build snapshot entries
+        for desc_entry in descriptors_to_process:
+            descriptor = desc_entry["descriptor"]
+            tracker_id = descriptor.get("trackerID", 1)
+            zones = descriptor.get("zones", [1])
+            
+            # Use per-descriptor snapshot dimensions if available, otherwise use event-level defaults
+            snapshot_width = desc_entry.get("snapshot_width") or active_event.get("snapshot_width") or 640
+            snapshot_height = desc_entry.get("snapshot_height") or active_event.get("snapshot_height") or 360
+            
+            # Use the actual cached snapshot path as the filename
+            # UniFi Protect will request this file via GetRequest
+            snapshot_crop_path = active_event.get("snapshot_crop_path")
+            snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{tracker_id}_{desc_entry['timestamp_ms']}.jpg"
+            
+            # Build smartDetectSnapshots entry
+            smart_detect_snapshots.append({
+                "clockBestMonotonic": desc_entry["monotonic"],
+                "clockBestWall": desc_entry["timestamp_ms"],
+                "smartDetectSnapshot": snapshot_filename,
+                "smartDetectSnapshotHeight": snapshot_height,
+                "smartDetectSnapshotName": descriptor.get("name", ""),
+                "smartDetectSnapshotType": object_type.value,
+                "smartDetectSnapshotWidth": snapshot_width,
+                "trackerID": tracker_id
+            })
+            
+            # Build trackerIDAttrMap entry (use latest zones for each tracker)
+            tracker_id_attr_map[str(tracker_id)] = {
+                "objectType": object_type.value,
+                "zone": zones if zones else [1]
+            }
+        
+        # If no descriptors were processed, create a minimal default entry
+        if not smart_detect_snapshots:
+            default_tracker_id = 1
+            default_timestamp_ms = event_timestamp or int(round(time.time() * 1000))
+            default_monotonic = int(self.get_uptime())
+            
+            # Use the actual cached snapshot path as the filename
+            snapshot_crop_path = active_event.get("snapshot_crop_path")
+            snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{default_tracker_id}_{default_timestamp_ms}.jpg"
+            
+            smart_detect_snapshots.append({
+                "clockBestMonotonic": default_monotonic,
+                "clockBestWall": default_timestamp_ms,
+                "smartDetectSnapshot": snapshot_filename,
+                "smartDetectSnapshotHeight": snapshot_height,
+                "smartDetectSnapshotName": "",
+                "smartDetectSnapshotType": object_type.value,
+                "smartDetectSnapshotWidth": snapshot_width,
+                "trackerID": default_tracker_id
+            })
+            tracker_id_attr_map[str(default_tracker_id)] = {
+                "objectType": object_type.value,
+                "zone": [1]
+            }
+        
+        # Get the full FoV snapshot path and dimensions from the event
+        snapshot_fov_path = active_event.get("snapshot_fov_path")
+        fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"smartdetectsnap_{target_event_id}_fullfov.jpg"
+        
+        # Get FoV dimensions - try to read from the actual FoV file if available
+        if snapshot_fov_path:
+            fov_width, fov_height = self._get_image_dimensions(snapshot_fov_path)
+        else:
+            # Fall back to event-level dimensions or defaults
+            fov_width = active_event.get("snapshot_width") or 640
+            fov_height = active_event.get("snapshot_height") or 360
+        
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
@@ -622,45 +872,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "edgeType": "leave",
             "eventId": target_event_id,
             "objectTypes": [object_type.value],
-            "smartDetectSnapshotFullFoV": "smartdetectsnap_zone_00000001_fullfov.jpg",
-            "smartDetectSnapshotFullFoVHeight": 360,
-            "smartDetectSnapshotFullFoVWidth": 640,
-            "smartDetectSnapshots": [
-                {
-                    "clockBestMonotonic": 51810,
-                    "clockBestWall": 1766543821684,
-                    "smartDetectSnapshot": "smartdetectsnap_zone_21766543821684.jpg",
-                    "smartDetectSnapshotHeight": 360,
-                    "smartDetectSnapshotName": "",
-                    "smartDetectSnapshotType": "person",
-                    "smartDetectSnapshotWidth": 360,
-                    "trackerID": 2
-                },
-                {
-                    "clockBestMonotonic": 56908,
-                    "clockBestWall": 1766543826781,
-                    "smartDetectSnapshot": "smartdetectsnap_zone_31766543826781.jpg",
-                    "smartDetectSnapshotHeight": 360,
-                    "smartDetectSnapshotName": "",
-                    "smartDetectSnapshotType": "person",
-                    "smartDetectSnapshotWidth": 360,
-                    "trackerID": 3
-                },
-            ],
-            "trackerIDAttrMap": {
-                "2": {
-                    "objectType": "person",
-                    "zone": [
-                    2
-                    ]
-                },
-                "3": {
-                    "objectType": "person",
-                    "zone": [
-                    2
-                    ]
-                }
-            },
+            "smartDetectSnapshotFullFoV": fov_filename,
+            "smartDetectSnapshotFullFoVHeight": fov_height,
+            "smartDetectSnapshotFullFoVWidth": fov_width,
+            "smartDetectSnapshots": smart_detect_snapshots,
+            "trackerIDAttrMap": tracker_id_attr_map,
             "zonesStatus": zonesStatus,
         }
         

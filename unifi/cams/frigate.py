@@ -213,26 +213,48 @@ class FrigateCam(RTSPCam):
             self.logger.warning("Cannot fetch snapshots: frigate_http_url not configured")
             return (None, None, None)
         
-        # Calculate timestamp from event if available
-        timestamp = None
-        if event_type == "analytics" and event_id in self._analytics_event_history:
-            event_data = self._analytics_event_history[event_id]
-            start_time = event_data.get('start_time')
-            if start_time is not None:
-                timestamp = int(start_time)
+        # For smart detect events, try to find the corresponding Frigate event ID
+        frigate_event_id = None
+        if event_type == "smart_detect":
+            # Look up Frigate event ID by searching the mapping
+            for frig_id, unifi_id in self.frigate_to_unifi_event_map.items():
+                if unifi_id == event_id:
+                    frigate_event_id = frig_id
+                    break
         
-        # Build URLs for snapshots from latest frame endpoint
-        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
-        
-        # Full resolution snapshot
-        full_url = base_url
-        if timestamp is not None:
-            full_url = f"{full_url}?timestamp={timestamp}"
-        
-        # Thumbnail snapshot (360p for fast UniFi Protect processing)
-        thumbnail_url = f"{base_url}?height=360&quality=80"
-        if timestamp is not None:
-            thumbnail_url = f"{thumbnail_url}&timestamp={timestamp}"
+        # Build URLs based on whether we have a Frigate event ID
+        if frigate_event_id:
+            # Use event-specific snapshot endpoint for smart detect events
+            # https://demo.frigate.video/api/events/:event_id/snapshot.jpg
+            base_url = f"{self.args.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
+            full_url = base_url
+            thumbnail_url = f"{base_url}?crop=1&quality=80"  # Crop gives bounding box snapshot
+            
+            self.logger.debug(
+                f"Using Frigate event-specific snapshot URLs for event {event_id} "
+                f"(Frigate: {frigate_event_id}): {base_url}"
+            )
+        else:
+            # Fallback to latest.jpg endpoint with timestamp for analytics events
+            timestamp = None
+            if event_type == "analytics" and event_id in self._analytics_event_history:
+                event_data = self._analytics_event_history[event_id]
+                start_time = event_data.get('start_time')
+                if start_time is not None:
+                    timestamp = int(start_time)
+            
+            # Build URLs for snapshots from latest frame endpoint
+            base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
+            
+            # Full resolution snapshot
+            full_url = base_url
+            if timestamp is not None:
+                full_url = f"{full_url}?timestamp={timestamp}"
+            
+            # Thumbnail snapshot (360p for fast UniFi Protect processing)
+            thumbnail_url = f"{base_url}?height=360&quality=80"
+            if timestamp is not None:
+                thumbnail_url = f"{thumbnail_url}&timestamp={timestamp}"
         
         self.logger.debug(f"Fetching snapshots for event {event_id}: full={full_url}, thumbnail={thumbnail_url}")
         

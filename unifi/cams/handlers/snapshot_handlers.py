@@ -57,9 +57,11 @@ class SnapshotHandlers:
         
         # Try to find cached snapshot file from event history
         cached_path = self._find_cached_snapshot(filename, snapshot_type)
+        snapshot_path = None
         
         if cached_path and cached_path.exists():
             # Serve cached snapshot
+            snapshot_path = cached_path
             self.logger.info(f"Serving cached {snapshot_type} from {cached_path}")
             await self._upload_file_to_protect(
                 cached_path,
@@ -86,10 +88,19 @@ class SnapshotHandlers:
                 )
             else:
                 # Use regular snapshot method
-                await self._process_motion_event_snapshot(msg, snapshot_type)
+                snapshot_path = await self._process_motion_event_snapshot(msg, snapshot_type)
         
         if msg["responseExpected"]:
-            return self.gen_response("GetRequest", response_to=msg["messageId"])
+            # Get image dimensions for the response
+            width, height = (640, 360)  # Default dimensions
+            if snapshot_path and hasattr(self, '_get_image_dimensions'):
+                width, height = self._get_image_dimensions(snapshot_path)
+            
+            return self.gen_response(
+                "GetRequest", 
+                response_to=msg["messageId"],
+                payload={"height": height, "width": width}
+            )
 
     def _find_cached_snapshot(self, filename: str, snapshot_type: str) -> Optional[Path]:
         """
@@ -123,6 +134,8 @@ class SnapshotHandlers:
         
         # Fallback: search through event history for matching snapshots
         # This handles edge cases where filename doesn't match expected format
+        
+        # First check analytics events
         for event_data in self._analytics_event_history.values():
             # Match based on snapshot type
             if snapshot_type == "motionSnapshot":
@@ -139,6 +152,18 @@ class SnapshotHandlers:
                 if (filename and str(cached_path) == filename) or \
                    (original_filename and str(cached_path) == original_filename):
                     return cached_path
+        
+        # Also check smart detect events for smartDetectZoneSnapshot requests
+        if snapshot_type == "smartDetectZoneSnapshot" and hasattr(self, '_active_smart_events'):
+            for event_data in self._active_smart_events.values():
+                # For smart detect, use the crop snapshot
+                cached_path = event_data.get("snapshot_crop_path")
+                
+                if cached_path and isinstance(cached_path, Path) and cached_path.exists():
+                    # Check if this matches the requested filename
+                    if (filename and str(cached_path) == filename) or \
+                       (original_filename and str(cached_path) == original_filename):
+                        return cached_path
         
         return None
 
@@ -245,13 +270,16 @@ class SnapshotHandlers:
 
     async def _process_motion_event_snapshot(
         self, msg: dict[str, Any], snapshot_type: str
-    ) -> None:
+    ) -> Optional[Path]:
         """
         Process motion event snapshot (crop, FoV, heatmap).
         
         Args:
             msg: Message from UniFi Protect
             snapshot_type: Type of snapshot requested
+            
+        Returns:
+            Path to the snapshot file that was uploaded
         """
         # Select appropriate snapshot based on request type
         if snapshot_type == "motionSnapshot":
@@ -276,3 +304,5 @@ class SnapshotHandlers:
             msg["payload"].get("formFields", {}),
             snapshot_type
         )
+        
+        return path
