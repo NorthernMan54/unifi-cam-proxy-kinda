@@ -110,6 +110,7 @@ class FrigateCam(RTSPCam):
         Testing with raw pixel values to see UniFi Protect's expected format.
         """
         after = frigate_msg.get("after", {})
+        type = after.get("type", "unknown")
         
         # Extract bounding box if available
         box = after.get("box")
@@ -144,7 +145,8 @@ class FrigateCam(RTSPCam):
             coord = [0, 0, 1920, 1080]
         
         # Extract confidence score (Frigate uses 0.0-1.0, UniFi uses 0-100)
-        score = after.get("score", 0.95)
+        # If type is "end" use after.top_score if available, else after.score
+        score = after.get("top_score" if type == "end" else "score", 0.95)
         confidence_level = int(score * 100)
         
         # Extract tracker ID if available
@@ -464,7 +466,9 @@ class FrigateCam(RTSPCam):
                     frigate_msg, object_type
                 )
                 start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, start_time_ms)
+                frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
+                 
+                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, frame_time_ms)
                 
                 # Store mapping from Frigate event ID to UniFi event ID
                 self.frigate_to_unifi_event_map[event_id] = unifi_event_id
