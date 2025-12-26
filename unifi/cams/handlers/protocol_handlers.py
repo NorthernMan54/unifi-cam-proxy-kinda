@@ -575,3 +575,33 @@ class ProtocolHandlers:
                 },
             },
         )
+
+    async def process_smart_motion_settings(
+        self: "UnifiCamBase", msg: "AVClientRequest"
+    ) -> "AVClientResponse":
+        """Process smart motion settings change request and update lingerEventStart and motionEvents."""
+        payload = msg.get("payload", {})
+        
+        # Update motion event enable/disable flag
+        if "enable" in payload:
+            self.motionEvents = payload["enable"]
+            self.logger.info(
+                f"Motion events {'enabled' if self.motionEvents else 'disabled'} from ChangeSmartMotionSettings"
+            )
+        
+        # Update lingerEventStart if provided in the message
+        if "lingerEventStartMSec" in payload:
+            self.lingerEventStart = payload["lingerEventStartMSec"]
+            self.logger.info(
+                f"Updated lingerEventStart to {self.lingerEventStart}ms from ChangeSmartMotionSettings"
+            )
+        
+        # Log other settings for debugging
+        if "lingerEventStopMSec" in payload:
+            self.logger.debug(f"Received lingerEventStopMSec: {payload['lingerEventStopMSec']}ms")
+        if "eventMaxDurationMSec" in payload:
+            self.logger.debug(f"Received eventMaxDurationMSec: {payload['eventMaxDurationMSec']}ms")
+        
+        return self.gen_response(
+            "ChangeSmartMotionSettings", msg["messageId"], payload
+        )

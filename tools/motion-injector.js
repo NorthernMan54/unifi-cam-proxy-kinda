@@ -27,9 +27,9 @@ async function main() {
         const onTimestamp = new Date().toISOString();
         console.log(`✓ Published motion ON at ${onTimestamp}`);
 
-        // Wait 15 seconds
-        console.log('\n⏳ Waiting 15 seconds...\n');
-        await new Promise(resolve => setTimeout(resolve, 15000));
+        // Wait 3 seconds
+        console.log('\n⏳ Waiting 3 seconds...\n');
+        await new Promise(resolve => setTimeout(resolve, 3000));
 
         // Send motion OFF
         console.log('[2/2] Sending motion OFF...');

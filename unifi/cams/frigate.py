@@ -604,18 +604,26 @@ class FrigateCam(RTSPCam):
                         frigate_msg, object_type
                     )
                     end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
+                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     
                     event_duration = time.time() - event_data["start_time"]
                     self.logger.info(
                         f"Frigate: Ending {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
                         f"Duration: {event_duration:.1f}s"
                     )
-                    self.logger.info(
-                        f"{end_time_ms}, {int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)}"
+                    self.logger.debug(
+                        f"Event timestamps: end_time={end_time_ms}, frame_time={frame_time_ms}"
                     )
                     
                     # End the smart detect event (motion event will end when Frigate sends motion OFF)
-                    await self.trigger_smart_detect_stop(object_type, final_descriptor, end_time_ms, event_id=unifi_event_id)
+                    # Pass both end_time (for stop event) and frame_time (for final update)
+                    await self.trigger_smart_detect_stop(
+                        object_type, 
+                        final_descriptor, 
+                        end_time_ms, 
+                        event_id=unifi_event_id,
+                        frame_time_ms=frame_time_ms
+                    )
                     
                     # Clean up mappings
                     del self.frigate_to_unifi_event_map[event_id]

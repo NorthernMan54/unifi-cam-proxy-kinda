@@ -126,6 +126,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "video3": (640, 360),    # Low quality default
         }
 
+        # Analytics event linger settings
+        # Delay sending EventAnalytics start until the event has been active for this duration (milliseconds)
+        self.lingerEventStart: int = 1000  # 1000ms = 1 second
+        self._analytics_start_task: Optional[asyncio.Task] = None  # Track pending analytics start event
+        
+        # Motion event control
+        self.motionEvents: bool = True  # Enable/disable motion event handling
+
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
         self._ssl_context.check_hostname = False
@@ -714,15 +722,17 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
         event_id: Optional[int] = None,
+        frame_time_ms: Optional[int] = None,
     ) -> None:
         """
         Stop a smart detect event for a specific object type.
         
         Args:
             object_type: The type of object to stop detecting
-            custom_descriptor: Optional final descriptor data
-            event_timestamp: Optional timestamp for the event
+            custom_descriptor: Optional final descriptor data. If provided, sends a final update before stopping.
+            event_timestamp: Optional timestamp for the stop event
             event_id: Optional specific event ID to stop. If not provided, stops the first active event of the given object type.
+            frame_time_ms: Optional frame timestamp for the final update (if custom_descriptor provided)
         """
         # Find the active smart detect event
         target_event_id = event_id
@@ -749,20 +759,20 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[target_event_id]
-        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
-        # Build descriptors array - use custom_descriptor if provided, 
-        # otherwise fall back to last saved descriptor for this event
-        descriptors = []
+        
+        # If a custom_descriptor is provided, send it as a final update first
+        # so UniFi Protect receives the final bounding box and snapshot
         if custom_descriptor:
-            descriptors = [custom_descriptor]
-            if custom_descriptor and "confidenceLevel" in custom_descriptor:
-                try:
-                    score = int(custom_descriptor.get("confidenceLevel"))
-                except Exception:
-                    score = 75
-                zonesStatus = {"1": {"level": score, "status": "leave"}}
-        elif active_event["last_descriptor"]:
-            descriptors = [active_event["last_descriptor"]]
+            self.logger.debug(
+                f"Sending final update with custom descriptor before stopping event {target_event_id}"
+            )
+            await self.trigger_smart_detect_update(
+                object_type,
+                custom_descriptor,
+                frame_time_ms or event_timestamp
+            )
+        
+        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
         
         # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
         smart_detect_snapshots = []
@@ -792,10 +802,26 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "snapshot_height": snapshot_height,
             }]
         
-        # Process each descriptor to build snapshot entries
+        # Group descriptors by tracker ID and select the one with highest confidence for each
+        # Only one snapshot per tracker ID should be in the smartDetectSnapshots array
+        best_descriptors_by_tracker: dict[int, dict[str, Any]] = {}
+        
         for desc_entry in descriptors_to_process:
             descriptor = desc_entry["descriptor"]
             tracker_id = descriptor.get("trackerID", 1)
+            confidence = descriptor.get("confidenceLevel", 0)
+            
+            # Keep only the descriptor with the highest confidence for each tracker ID
+            if tracker_id not in best_descriptors_by_tracker:
+                best_descriptors_by_tracker[tracker_id] = desc_entry
+            else:
+                existing_confidence = best_descriptors_by_tracker[tracker_id]["descriptor"].get("confidenceLevel", 0)
+                if confidence > existing_confidence:
+                    best_descriptors_by_tracker[tracker_id] = desc_entry
+        
+        # Build smartDetectSnapshots array from best descriptors (one per tracker ID)
+        for tracker_id, desc_entry in best_descriptors_by_tracker.items():
+            descriptor = desc_entry["descriptor"]
             zones = descriptor.get("zones", [1])
             
             # Use per-descriptor snapshot dimensions if available, otherwise use event-level defaults
@@ -819,7 +845,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "trackerID": tracker_id
             })
             
-            # Build trackerIDAttrMap entry (use latest zones for each tracker)
+            # Build trackerIDAttrMap entry (use zones from best descriptor for each tracker)
             tracker_id_attr_map[str(tracker_id)] = {
                 "objectType": object_type.value,
                 "zone": zones if zones else [1]
@@ -906,6 +932,62 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 self._motion_event_ts = None
 
     # API for subclasses - Analytics (Motion) Events
+    async def _send_analytics_start_event(
+        self,
+        event_id: int,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """
+        Internal method to actually send the analytics start event after linger period.
+        
+        Args:
+            event_id: The event ID to send
+            event_timestamp: Optional timestamp for the event
+        """
+        # Check if the event was already stopped before we could send it
+        if event_id not in self._analytics_event_history:
+            self.logger.debug(
+                f"Analytics event {event_id} was stopped before linger period elapsed. "
+                f"Not sending start event."
+            )
+            return
+        
+        active_event = self._analytics_event_history[event_id]
+        
+        # Check if it was already ended
+        if active_event.get("end_time") is not None:
+            self.logger.debug(
+                f"Analytics event {event_id} already ended. Not sending start event."
+            )
+            return
+        
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "start",
+            "eventId": event_id,
+            "eventType": "motion",
+            "levels": {"0": 47},
+            "motionHeatmap": "motionHeatmapline101.png",
+            "motionSnapshot": "motionSnapshotline102.png",
+        }
+        
+        self.logger.info(
+            f"Sending analytics start event {event_id} after {self.lingerEventStart}ms linger period "
+            f"(active smart events: {len(self._active_smart_events)})"
+        )
+        
+        await self.send(
+            self.gen_response("EventAnalytics", payload=payload)
+        )
+        
+        # Mark that the start event has been sent
+        active_event["start_event_sent"] = True
+
     async def trigger_analytics_start(
         self,
         event_timestamp: Optional[float] = None,
@@ -913,9 +995,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         """
         Start a generic analytics motion event.
         
+        The actual EventAnalytics message will be delayed by lingerEventStart milliseconds
+        to avoid sending events for very brief motion detections. If trigger_analytics_stop
+        is called before the linger period expires, no start event will be sent.
+        
         Args:
             event_timestamp: Optional timestamp for the event
         """
+        # Check if motion events are disabled
+        if not self.motionEvents:
+            self.logger.debug("Motion events disabled, ignoring trigger_analytics_start")
+            return
+        
         # Clean up old events before starting a new one
         self._cleanup_old_analytics_events()
         
@@ -938,28 +1029,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 )
                 return
         
-        payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
-            "clockStreamRate": 1000,
-            "clockWall": event_timestamp or int(round(time.time() * 1000)),
-            "edgeType": "start",
-            "eventId": event_id,
-            "eventType": "motion",
-            "levels": {"0": 47},
-            "motionHeatmap": "motionHeatmapline101.png",
-            "motionSnapshot": "motionSnapshotline102.png",
-        }
-        
         self.logger.info(
-            f"Starting analytics event {event_id} "
-            f"(active smart events: {len(self._active_smart_events)})"
-        )
-        
-        await self.send(
-            self.gen_response("EventAnalytics", payload=payload)
+            f"Preparing analytics event {event_id}, will send start event after {self.lingerEventStart}ms linger period"
         )
         
         # Track this analytics event in history
@@ -968,6 +1039,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "start_time": current_time,
             "end_time": None,  # Will be set when event stops
             "event_timestamp": event_timestamp,
+            "start_event_sent": False,  # Track whether we actually sent the start event
             # Snapshot filenames to be used in EventAnalytics stop payload
             "snapshot_filename": None,
             "snapshot_fov_filename": None,
@@ -981,9 +1053,36 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         }
         self._active_analytics_event_id = event_id
         
+        # Schedule the actual start event to be sent after linger period
+        linger_seconds = self.lingerEventStart / 1000.0
+        self._analytics_start_task = asyncio.create_task(
+            self._delayed_analytics_start(event_id, event_timestamp, linger_seconds)
+        )
+        
         # Update legacy compatibility fields
         if not self._motion_event_ts:  # Only set if not already set by smart detect
             self._motion_event_ts = current_time
+    
+    async def _delayed_analytics_start(
+        self,
+        event_id: int,
+        event_timestamp: Optional[float],
+        delay_seconds: float,
+    ) -> None:
+        """
+        Helper method to delay sending the analytics start event.
+        
+        Args:
+            event_id: The event ID
+            event_timestamp: Optional timestamp for the event
+            delay_seconds: How long to wait before sending
+        """
+        try:
+            await asyncio.sleep(delay_seconds)
+            await self._send_analytics_start_event(event_id, event_timestamp)
+        except asyncio.CancelledError:
+            self.logger.debug(f"Analytics start event {event_id} was cancelled during linger period")
+            raise
 
     async def trigger_analytics_stop(
         self,
@@ -991,6 +1090,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     ) -> None:
         """
         Stop the active analytics motion event.
+        
+        If the event hasn't been active long enough to send the start event (lingerEventStart),
+        the pending start will be cancelled and no EventAnalytics messages will be sent.
         
         Handles snapshot caching:
         - If smart detect events occurred during this analytics event, uses the most recent
@@ -1017,6 +1119,29 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             )
             self._active_analytics_event_id = None
             return
+        
+        # Cancel the pending start event if it hasn't been sent yet
+        if self._analytics_start_task and not self._analytics_start_task.done():
+            self._analytics_start_task.cancel()
+            try:
+                await self._analytics_start_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.info(
+                f"Analytics event {event_id} stopped before {self.lingerEventStart}ms linger period. "
+                f"No start/stop events will be sent."
+            )
+            # Clean up the event from history since we never sent anything
+            del self._analytics_event_history[event_id]
+            self._active_analytics_event_id = None
+            
+            # Update legacy compatibility fields
+            if not self._active_smart_events:
+                self._motion_event_ts = None
+            
+            return
+        
+        # If we get here, the start event was sent, so we need to send the stop event
         
         # Determine which snapshots to use
         snapshot_crop_path = None
@@ -1371,9 +1496,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "ChangeTalkbackSettings", response_to=m["messageId"]
             )
         elif fn == "ChangeSmartMotionSettings":
-            res = self.gen_response(
-                "ChangeSmartMotionSettings", response_to=m["messageId"]
-            )
+            res = await self.process_smart_motion_settings(m)
         elif fn == "SmartMotionTest":
             res = self.gen_response(
                 "SmartMotionTest", response_to=m["messageId"]
