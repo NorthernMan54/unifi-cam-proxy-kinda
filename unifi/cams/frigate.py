@@ -168,6 +168,20 @@ class FrigateCam(RTSPCam):
         # UniFi Protect expects positive number or null, stored as float
         speed = float(average_speed) if average_speed > 0 else None
         
+        # Extract license plate information if available
+        # Frigate format: ["PLATE-TEXT", confidence_score]
+        license_plate_data = after.get("recognized_license_plate")
+        license_plate = None
+        if license_plate_data and isinstance(license_plate_data, list) and len(license_plate_data) >= 1:
+            license_plate = license_plate_data[0]  # Extract the plate text
+        
+        # Set name based on object type and available data
+        # For vehicles with license plates, use the plate as the name
+        if object_type == SmartDetectObjectType.VEHICLE and license_plate:
+            name = license_plate
+        else:
+            name = "Named by Frigate"
+        
         descriptor = {
             "attributes": None,  # Optional and validated
             "boxColor": "red", # validated
@@ -177,9 +191,10 @@ class FrigateCam(RTSPCam):
             "depth": None,  # Optional depth information
             "firstShownTimeMs": int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms,  # validated
             "idleSinceTimeMs": int(frigate_msg.get('after', {}).get('motionless_count', 0) * 1000), # validated
+            "licensePlate": license_plate,  # Recognized license plate from Frigate
             "lines": [],  # validated Required field: no line crossing detection
             "loiterZones": [],  # validated Optional but included for completeness
-            "name": "Named by Frigate", # validated
+            "name": name, # validated - License plate for vehicles, or default name
             "objectType": object_type.value, # validated
             "secondLensZones": [],  # validated Optional but included for completeness
             "speed": speed,  # Average estimated speed from Frigate
@@ -191,7 +206,7 @@ class FrigateCam(RTSPCam):
         
         self.logger.debug(
             f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
-            f"coord={coord}, stationary={stationary}, speed={speed}"
+            f"coord={coord}, stationary={stationary}, speed={speed}, licensePlate={license_plate}"
         )
         
         return descriptor
