@@ -172,13 +172,21 @@ class FrigateCam(RTSPCam):
         # Frigate format: ["PLATE-TEXT", confidence_score]
         license_plate_data = after.get("recognized_license_plate")
         license_plate = None
+        license_plate_score = None
         if license_plate_data and isinstance(license_plate_data, list) and len(license_plate_data) >= 1:
             license_plate = license_plate_data[0]  # Extract the plate text
+            if len(license_plate_data) >= 2:
+                license_plate_score = license_plate_data[1]  # Extract the confidence score
         
         # Set name based on object type and available data
-        # For vehicles with license plates, use the plate as the name
+        # For vehicles with license plates, use the plate as the name with confidence score
         if object_type == SmartDetectObjectType.VEHICLE and license_plate:
-            name = license_plate
+            if license_plate_score is not None:
+                name = f"{license_plate} ({license_plate_score:.1%})"
+            else:
+                name = license_plate
+        elif object_type == SmartDetectObjectType.VEHICLE:
+            name = "No license plate available"
         else:
             name = "Named by Frigate"
         
@@ -191,7 +199,6 @@ class FrigateCam(RTSPCam):
             "depth": None,  # Optional depth information
             "firstShownTimeMs": int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms,  # validated
             "idleSinceTimeMs": int(frigate_msg.get('after', {}).get('motionless_count', 0) * 1000), # validated
-            "licensePlate": license_plate,  # Recognized license plate from Frigate
             "lines": [],  # validated Required field: no line crossing detection
             "loiterZones": [],  # validated Optional but included for completeness
             "name": name, # validated - License plate for vehicles, or default name
@@ -203,6 +210,10 @@ class FrigateCam(RTSPCam):
             "trackerID": tracker_id, # validated
             "zones": zones, # validated
         }
+        
+        # Only include licensePlate if it has a value
+        if license_plate:
+            descriptor["licensePlate"] = license_plate
         
         self.logger.debug(
             f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
