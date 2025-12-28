@@ -496,6 +496,14 @@ class FrigateCam(RTSPCam):
             )
 
             if event_type == "new":
+                # Ignore new events without snapshots
+                has_snapshot = frigate_msg.get("after", {}).get("has_snapshot", True)
+                if not has_snapshot:
+                    self.logger.debug(
+                        f"Frigate: Ignoring new event {event_id} with has_snapshot=false"
+                    )
+                    return
+                
                 if event_id in self.frigate_to_unifi_event_map:
                     self.logger.warning(
                         f"Received 'new' event for already active Frigate event_id={event_id}. "
