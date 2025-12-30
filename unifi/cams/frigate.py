@@ -186,9 +186,9 @@ class FrigateCam(RTSPCam):
             else:
                 name = license_plate
         elif object_type == SmartDetectObjectType.VEHICLE:
-            name = None # "No license plate available"
+            name = "" # "No license plate available"
         else:
-            name = None # "Named by Frigate"
+            name = "" # "Named by Frigate"
 
         descriptor = {
             "attributes": None,  # Optional and validated
