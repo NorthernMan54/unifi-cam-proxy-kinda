@@ -1484,6 +1484,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "UpdateUsernamePassword", response_to=m["messageId"]
             )
         elif fn == "ChangeSmartDetectSettings":
+            await self.process_smart_detect_settings(m)
             res = self.gen_response(
                 "ChangeSmartDetectSettings", response_to=m["messageId"]
             )

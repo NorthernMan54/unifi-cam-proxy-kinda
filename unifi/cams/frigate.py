@@ -27,6 +27,12 @@ class FrigateCam(RTSPCam):
         # Track last update time for each event (for timeout detection)
         self.event_last_update: dict[int, float] = {}
         self.event_timeout_seconds = 600  # Timeout after 600 seconds (10 minutes) without updates
+        # Store zones received from UniFi Protect via ChangeSmartDetectSettings
+        # Format: { unifi_zone_id_str: { "coord": [...], "objectTypes": [...], ... } }
+        self.unifi_zones: dict[str, Any] = {}
+        # Reverse map: frigate zone name → UniFi zone ID (int)
+        # Built whenever zones are pushed to Frigate
+        self.frigate_zone_to_unifi_id: dict[str, int] = {}
 
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
@@ -94,6 +100,190 @@ class FrigateCam(RTSPCam):
                 ],
             },
         }
+
+    async def process_smart_detect_settings(self, msg: dict[str, Any]) -> None:
+        """Handle ChangeSmartDetectSettings from UniFi Protect.
+
+        Stores the zone definitions and pushes them to Frigate via its config API
+        so that Frigate zone names match UniFi Protect zone IDs.
+        """
+        payload = msg.get("payload", {})
+        zones: dict[str, Any] = payload.get("zones", {})
+
+        if not zones:
+            self.logger.debug("ChangeSmartDetectSettings: no zones in payload, skipping zone sync")
+            return
+
+        self.unifi_zones = zones
+        self.logger.info(
+            f"ChangeSmartDetectSettings: received {len(zones)} zone(s) from UniFi Protect: "
+            f"{list(zones.keys())}"
+        )
+
+        if self.args.frigate_http_url:
+            await self._push_zones_to_frigate(zones)
+        else:
+            self.logger.debug(
+                "ChangeSmartDetectSettings: frigate_http_url not set, skipping zone push to Frigate"
+            )
+
+    async def process_smart_motion_settings(self, msg: dict[str, Any]) -> Any:
+        """Handle ChangeSmartMotionSettings from UniFi Protect.
+
+        Calls the base handler to update motionEvents/lingerEventStart, then
+        syncs the motion zones to Frigate. Motion zones have no objectTypes so
+        Frigate will apply them to all tracked objects on the camera.
+        """
+        # Preserve base behaviour (motionEvents, lingerEventStart, response generation)
+        response = await super().process_smart_motion_settings(msg)
+
+        payload = msg.get("payload", {})
+        zones: dict[str, Any] = payload.get("zones", {})
+
+        if not zones:
+            self.logger.debug("ChangeSmartMotionSettings: no zones in payload, skipping zone sync")
+            return response
+
+        self.unifi_zones = zones
+        self.logger.info(
+            f"ChangeSmartMotionSettings: received {len(zones)} zone(s) from UniFi Protect: "
+            f"{list(zones.keys())}"
+        )
+
+        if self.args.frigate_http_url:
+            await self._push_zones_to_frigate(zones)
+        else:
+            self.logger.debug(
+                "ChangeSmartMotionSettings: frigate_http_url not set, skipping zone push to Frigate"
+            )
+
+        return response
+
+    async def _push_zones_to_frigate(self, unifi_zones: dict[str, Any]) -> None:
+        """Convert UniFi Protect zone definitions and push them to Frigate's config API.
+
+        UniFi zone coord format: flat list [x0,y0, x1,y1, ...] in 0–1000 space.
+        Frigate zone coord format: "x0,y0,x1,y1,..." in 0.0–1.0 normalized space.
+        """
+        # Fetch the camera's tracked objects from Frigate so we don't send zone objects
+        # that aren't tracked (Frigate rejects them with a 400 validation error).
+        camera_tracked: set[str] = set()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.args.frigate_http_url}/api/config"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        cfg = await resp.json()
+                        track_list = (
+                            cfg.get("cameras", {})
+                            .get(self.args.frigate_camera, {})
+                            .get("objects", {})
+                            .get("track", [])
+                        )
+                        camera_tracked = set(track_list)
+                        self.logger.debug(
+                            f"Zone sync: camera '{self.args.frigate_camera}' tracks: {sorted(camera_tracked)}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Zone sync: could not fetch Frigate config (status {resp.status}), "
+                            "zone objects will not be filtered"
+                        )
+        except Exception as e:
+            self.logger.warning(f"Zone sync: failed to fetch Frigate config for object filtering: {e}")
+
+        frigate_zones: dict[str, Any] = {}
+        new_mapping: dict[str, int] = {}
+
+        for zone_id_str, zone_data in unifi_zones.items():
+            try:
+                zone_id = int(zone_id_str)
+            except ValueError:
+                self.logger.warning(f"Zone sync: unexpected non-integer zone id '{zone_id_str}', skipping")
+                continue
+
+            coord = zone_data.get("coord", [])
+            if len(coord) < 4 or len(coord) % 2 != 0:
+                self.logger.warning(f"Zone sync: zone {zone_id_str} has invalid coord {coord}, skipping")
+                continue
+
+            # Convert 0-1000 integer pairs → 0.0-1.0 float pairs as Frigate coordinate string.
+            # IMPORTANT: Frigate detects pixel vs relative coords via string comparison `p > "1.0"`.
+            # "1.0000" > "1.0" is True (lexicographic), so :.4f format incorrectly triggers pixel
+            # mode for boundary values. Use :.4g which produces "1" not "1.0000" for exact 1.0.
+            frigate_coords = ",".join(
+                f"{v / 1000.0:.4g}" for v in coord
+            )
+
+            # Name zones consistently so we can reverse-map them when events fire
+            zone_name = f"unifi_zone_{zone_id}"
+            object_types = zone_data.get("objectTypes", [])
+
+            # Map UniFi object types to Frigate labels
+            frigate_objects = []
+            for ot in object_types:
+                if ot == "person":
+                    frigate_objects.append("person")
+                elif ot == "vehicle":
+                    frigate_objects.extend(["car", "motorcycle", "truck", "bus"])
+                elif ot == "animal":
+                    frigate_objects.extend(["dog", "cat", "bird"])
+                elif ot == "package":
+                    pass  # Frigate doesn't have a direct package object
+
+            # Remove duplicates and filter to only objects the camera actually tracks.
+            # Frigate rejects zone objects not in the camera's objects.track list.
+            filtered_objects = list(dict.fromkeys(
+                obj for obj in frigate_objects
+                if not camera_tracked or obj in camera_tracked
+            ))
+
+            frigate_zones[zone_name] = {
+                "coordinates": frigate_coords,
+                "objects": filtered_objects,
+                "inertia": 3,
+                "loitering_time": 0,
+            }
+            new_mapping[zone_name] = zone_id
+            self.logger.debug(
+                f"Zone sync: unifi zone {zone_id} → '{zone_name}' coords={frigate_coords} "
+                f"objects={filtered_objects}"
+            )
+
+        if not frigate_zones:
+            self.logger.warning("Zone sync: no valid zones to push to Frigate")
+            return
+
+        # PUT to Frigate config/set API: partial JSON update, requires_restart=1
+        # /api/config/save expects raw YAML text; /api/config/set accepts JSON config_data
+        config_payload = {
+            "requires_restart": 1,
+            "config_data": {
+                "cameras": {
+                    self.args.frigate_camera: {
+                        "zones": frigate_zones
+                    }
+                }
+            }
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.args.frigate_http_url}/api/config/set"
+                async with session.put(url, json=config_payload) as resp:
+                    if resp.status == 200:
+                        self.frigate_zone_to_unifi_id = new_mapping
+                        self.logger.info(
+                            f"Zone sync: successfully pushed {len(frigate_zones)} zone(s) to Frigate "
+                            f"camera '{self.args.frigate_camera}': {list(frigate_zones.keys())}"
+                        )
+                    else:
+                        body = await resp.text()
+                        self.logger.error(
+                            f"Zone sync: Frigate config API returned {resp.status}: {body}"
+                        )
+        except Exception as e:
+            self.logger.exception(f"Zone sync: failed to push zones to Frigate: {e}")
 
     @classmethod
     def label_to_object_type(cls, label: str) -> Optional[SmartDetectObjectType]:
@@ -170,7 +360,19 @@ class FrigateCam(RTSPCam):
         
         # Get current position and velocity if available
         current_zones = after.get("current_zones", [])
-        zones = [0] if not current_zones else [0]  # Default to zone 0
+        # Map Frigate zone names → UniFi zone IDs using the stored mapping.
+        # UniFi zone IDs are 1-based integers; fall back to [0] (default/full-frame zone)
+        # if no zones are currently active or the mapping hasn't been populated yet.
+        if current_zones and self.frigate_zone_to_unifi_id:
+            zones = [
+                self.frigate_zone_to_unifi_id[z]
+                for z in current_zones
+                if z in self.frigate_zone_to_unifi_id
+            ]
+            if not zones:
+                zones = [0]  # Object is in a Frigate zone not mapped to UniFi
+        else:
+            zones = [0]  # Default: full-frame zone
         
         # Extract speed information if available (Frigate provides speeds in km/h or mph)
         average_speed = after.get("average_estimated_speed", 0)

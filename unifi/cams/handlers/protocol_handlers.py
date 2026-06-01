@@ -138,6 +138,16 @@ class ProtocolHandlers:
             "ChangeAnalyticsSettings", msg["messageId"], msg["payload"]
         )
 
+    async def process_smart_detect_settings(
+        self: "UnifiCamBase", msg: "AVClientRequest"
+    ) -> None:
+        """Process ChangeSmartDetectSettings from UniFi Protect.
+
+        The base implementation is a no-op. Subclasses (e.g. FrigateCam) can
+        override this to store zones and push them downstream.
+        """
+        pass
+
     async def process_time(
         self: "UnifiCamBase", msg: "AVClientRequest"
     ) -> "AVClientResponse":
