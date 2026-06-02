@@ -7,8 +7,6 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-
 import aiohttp
 import backoff
 from aiomqtt import Client, Message
@@ -99,6 +97,8 @@ class FrigateCam(RTSPCam):
                     "vehicle",
                     "animal",
                     "package",
+                    "face",
+                    "licensePlate",
                 ],
             },
         }
@@ -125,8 +125,10 @@ class FrigateCam(RTSPCam):
             if self.args.frigate_http_url:
                 await self._push_zones_to_frigate(zones)
             else:
-                self.logger.debug(
-                    "ChangeSmartDetectSettings: frigate_http_url not set, skipping zone push to Frigate"
+                self.logger.warning(
+                    "ChangeSmartDetectSettings: frigate_http_url not set, cannot push zones to Frigate. "
+                    "Objects will be reported in default zone (0) only. "
+                    "Set --frigate-http-url to enable zone support."
                 )
         else:
             self.logger.debug("ChangeSmartDetectSettings: no zones in payload, skipping zone sync")
@@ -145,29 +147,19 @@ class FrigateCam(RTSPCam):
         return await super().process_smart_motion_settings(msg)
 
     async def _push_zones_to_frigate(self, unifi_zones: dict[str, Any]) -> None:
-        """Convert UniFi Protect zone definitions and push them to Frigate's config API.
+        """Convert UniFi Protect zone definitions and push them to Frigate via /api/config/set.
 
-        UniFi Protect is the sole source of truth for zones. The entire zones section
-        for this camera is replaced by fetching the raw YAML config file, modifying
-        only the zones key, and saving it back via /api/config/save. This guarantees
-        manually-defined zones are also removed — no stale entries remain.
-
-        We use /api/config/raw (returns JSONResponse(content=<yaml_string>)) for the
-        editable source-of-truth config, and /api/config for the resolved config
-        (to read tracked objects and existing zone names for filtering/logging).
+        UniFi Protect is the sole source of truth for zones. We use the Frigate config API's
+        deep-merge capability to update only the zones section of this camera's config,
+        leaving all other settings untouched.
 
         UniFi zone coord format: flat list [x0,y0, x1,y1, ...] in 0–1000 space.
         Frigate zone coord format: "x0,y0,x1,y1,..." in 0.0–1.0 normalized space.
         """
-        # Fetch both configs in parallel:
-        #   /api/config      → resolved JSON: tracked objects, existing zone names
-        #   /api/config/raw  → raw YAML string (JSON-wrapped): editable source config
+        # Fetch resolved config to get tracked objects for filtering
         camera_tracked: set[str] = set()
-        existing_zone_names: set[str] = set()
-        raw_yaml: Optional[str] = None
         try:
             async with aiohttp.ClientSession() as session:
-                # Resolved config for metadata
                 url = f"{self.args.frigate_http_url}/api/config"
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -175,38 +167,13 @@ class FrigateCam(RTSPCam):
                         cam_cfg = resolved_cfg.get("cameras", {}).get(self.args.frigate_camera, {})
                         track_list = cam_cfg.get("objects", {}).get("track", [])
                         camera_tracked = set(track_list)
-                        existing_zone_names = set(cam_cfg.get("zones", {}).keys())
                         self.logger.debug(
-                            f"Zone sync: camera '{self.args.frigate_camera}' tracks: {sorted(camera_tracked)}, "
-                            f"existing zones: {sorted(existing_zone_names)}"
+                            f"Zone sync: camera '{self.args.frigate_camera}' tracks: {sorted(camera_tracked)}"
                         )
                     else:
                         self.logger.warning(
                             f"Zone sync: could not fetch resolved config (status {resp.status}), "
                             "zone objects will not be filtered"
-                        )
-
-                # Raw YAML config — Frigate serves this as JSONResponse(content=<yaml_string>,
-                # media_type="text/plain"), so the body is a JSON-encoded string but the
-                # Content-Type header says text/plain. Use resp.text() + json.loads() to decode.
-                raw_url = f"{self.args.frigate_http_url}/api/config/raw"
-                async with session.get(raw_url) as resp:
-                    if resp.status == 200:
-                        try:
-                            raw_yaml = json.loads(await resp.text())  # decode JSON-wrapped YAML string
-                        except (json.JSONDecodeError, ValueError) as e:
-                            self.logger.warning(f"Zone sync: could not decode /api/config/raw response: {e}")
-                            raw_yaml = None
-                        if raw_yaml is not None and not isinstance(raw_yaml, str):
-                            self.logger.warning(
-                                f"Zone sync: /api/config/raw returned unexpected type "
-                                f"{type(raw_yaml).__name__!r}, expected str"
-                            )
-                            raw_yaml = None
-                    else:
-                        self.logger.warning(
-                            f"Zone sync: /api/config/raw returned {resp.status}, "
-                            "will fall back to config/set merge"
                         )
         except Exception as e:
             self.logger.warning(f"Zone sync: failed to fetch Frigate config: {e}")
@@ -246,9 +213,13 @@ class FrigateCam(RTSPCam):
                 elif ot == "vehicle":
                     frigate_objects.extend(["car", "motorcycle", "truck", "bus"])
                 elif ot == "animal":
-                    frigate_objects.extend(["dog", "cat", "bird"])
+                    frigate_objects.extend(["dog", "cat", "deer", "horse", "bird", "raccoon", "fox", "bear", "cow", "squirrel", "goat", "rabbit", "skunk", "kangaroo"])
                 elif ot == "package":
-                    pass  # Frigate doesn't have a direct package object
+                    frigate_objects.append("package")
+                elif ot == "face":
+                    frigate_objects.append("face")
+                elif ot == "licensePlate":
+                    frigate_objects.append("license_plate")
 
             # Remove duplicates and filter to only objects the camera actually tracks.
             # Frigate rejects zone objects not in the camera's objects.track list.
@@ -269,75 +240,19 @@ class FrigateCam(RTSPCam):
                 f"objects={filtered_objects}"
             )
 
-        if raw_yaml is not None:
-            # Full-overwrite path: parse the raw YAML, replace only the zones key,
-            # serialise back to YAML, and save. This removes manually-defined zones too.
-            await self._save_zones_via_yaml(raw_yaml, frigate_zones, new_mapping, existing_zone_names)
-        else:
-            # Fallback: deep-merge path (cannot delete zones that already exist)
-            self.logger.warning(
-                "Zone sync: falling back to config/set merge — existing zones will not be removed"
-            )
-            await self._save_zones_via_config_set(frigate_zones, new_mapping)
-
-    async def _save_zones_via_yaml(
-        self,
-        raw_yaml: str,
-        frigate_zones: dict[str, Any],
-        new_mapping: dict[str, int],
-        existing_zone_names: set[str],
-    ) -> None:
-        """Parse the raw YAML config, replace only the camera's zones key, and save back."""
-        try:
-            cfg = yaml.safe_load(raw_yaml) or {}
-        except yaml.YAMLError as e:
-            self.logger.error(f"Zone sync: failed to parse raw YAML config: {e}")
-            return
-
-        if not isinstance(cfg, dict):
-            self.logger.error(
-                f"Zone sync: raw YAML parsed as {type(cfg).__name__!r} not dict — falling back to config/set"
-            )
-            await self._save_zones_via_config_set(frigate_zones, new_mapping)
-            return
-
-        # Replace only the zones key for this camera — everything else stays untouched
-        cam = cfg.setdefault("cameras", {}).setdefault(self.args.frigate_camera, {})
-        if frigate_zones:
-            cam["zones"] = frigate_zones
-        else:
-            cam.pop("zones", None)
-
-        try:
-            new_yaml = yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        except yaml.YAMLError as e:
-            self.logger.error(f"Zone sync: failed to serialise config to YAML: {e}")
-            return
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.args.frigate_http_url}/api/config/save?save_option=saveonly"
-                async with session.post(url, data=new_yaml, headers={"Content-Type": "text/plain"}) as resp:
-                    if resp.status == 200:
-                        self.frigate_zone_to_unifi_id = new_mapping
-                        removed = existing_zone_names - set(new_mapping.keys())
-                        self.logger.info(
-                            f"Zone sync: saved {len(new_mapping)} zone(s) to Frigate "
-                            f"camera '{self.args.frigate_camera}': {list(new_mapping.keys())}"
-                            + (f"; removed zones: {sorted(removed)}" if removed else "")
-                        )
-                    else:
-                        body = await resp.text()
-                        self.logger.error(f"Zone sync: Frigate config/save returned {resp.status}: {body}")
-        except Exception as e:
-            self.logger.exception(f"Zone sync: failed to save YAML config to Frigate: {e}")
+        # Push zones to Frigate using config/set (deep merge - only updates zones)
+        await self._save_zones_via_config_set(frigate_zones, new_mapping)
 
     async def _save_zones_via_config_set(
         self,
         frigate_zones: dict[str, Any],
         new_mapping: dict[str, int],
     ) -> None:
-        """Fallback: push zones via /api/config/set (deep merge — cannot delete zones)."""
+        """Push zones to Frigate via /api/config/set endpoint.
+        
+        This uses the Frigate API's deep-merge capability to update only the zones
+        section of the camera config without touching other settings.
+        """
         if not frigate_zones:
             self.logger.warning("Zone sync: no valid zones to push to Frigate")
             return
@@ -371,16 +286,18 @@ class FrigateCam(RTSPCam):
     @classmethod
     def label_to_object_type(cls, label: str) -> Optional[SmartDetectObjectType]:
         if label == "person":
-            # Available: person, face
             return SmartDetectObjectType.PERSON
-        elif label in {"vehicle", "car", "motorcycle", "school_bus", "license_plate"}:
-            # Available: car, motorcycle, bicycle, boat, school_bus, license_plate
+        elif label == "face":
+            return SmartDetectObjectType.FACE
+        elif label == "license_plate":
+            return SmartDetectObjectType.LICENSEPLATE
+        elif label in {"vehicle", "car", "motorcycle", "truck", "bus", "school_bus", "bicycle", "boat"}:
+            # Available: car, motorcycle, bicycle, boat, school_bus, truck, bus
             return SmartDetectObjectType.VEHICLE
-        elif label in {"cat", "dog", "horse", "rabbit", "squirrel", "goat"}:
+        elif label in {"cat", "dog", "horse", "rabbit", "squirrel", "goat", "deer", "raccoon", "fox", "bear", "cow", "bird", "skunk", "kangaroo"}:
             # Available: dog, cat, deer, horse, bird, raccoon, fox, bear, cow, squirrel, goat, rabbit, skunk, kangaroo
             return SmartDetectObjectType.ANIMAL
-        elif label in {"package"}:
-            # Available: package
+        elif label == "package":
             return SmartDetectObjectType.PACKAGE
 
     def build_descriptor_from_frigate_msg(
@@ -454,8 +371,17 @@ class FrigateCam(RTSPCam):
             ]
             if not zones:
                 zones = [0]  # Object is in a Frigate zone not mapped to UniFi
+                self.logger.debug(
+                    f"Object in Frigate zone(s) {current_zones} but none are mapped to UniFi zones. "
+                    f"Mapping available: {self.frigate_zone_to_unifi_id}"
+                )
         else:
             zones = [0]  # Default: full-frame zone
+            if not self.frigate_zone_to_unifi_id and current_zones:
+                self.logger.debug(
+                    f"Object in Frigate zone(s) {current_zones} but no zone mapping available. "
+                    f"Zones may not have been pushed to Frigate yet (frigate_http_url not configured?)."
+                )
         
         # Extract speed information if available (Frigate provides speeds in km/h or mph)
         average_speed = after.get("average_estimated_speed", 0)
@@ -512,7 +438,7 @@ class FrigateCam(RTSPCam):
         
         self.logger.debug(
             f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
-            f"coord={coord}, stationary={stationary}, speed={speed}, licensePlate={license_plate}"
+            f"coord={coord}, zones={zones}, stationary={stationary}, speed={speed}, licensePlate={license_plate}"
         )
         
         return descriptor
@@ -787,6 +713,7 @@ class FrigateCam(RTSPCam):
 
             self.logger.debug(
                 f"Frigate event: type={event_type}, id={event_id}, label={label}, "
+                f"zones={after_data.get('current_zones', [])}, "
                 f"active_frigate_events={list(self.frigate_to_unifi_event_map.keys())}"
             )
 

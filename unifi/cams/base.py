@@ -29,6 +29,8 @@ class SmartDetectObjectType(Enum):
     VEHICLE = "vehicle"
     ANIMAL = "animal"
     PACKAGE = "package"
+    FACE = "face"
+    LICENSEPLATE = "licensePlate"
 
 
 class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, metaclass=ABCMeta):
@@ -656,17 +658,22 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"Ignoring duplicate start for {object_type.value}."
             )
             return event_id
-        zonesStatus = {"1": {"level": 60, "status": "enter"}}  # Example zonesStatus, can be customized
+        
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
             descriptors = [custom_descriptor]
-            if custom_descriptor and "confidenceLevel" in custom_descriptor:
-                try:
-                    score = int(custom_descriptor.get("confidenceLevel"))
-                except Exception:
-                    score = 75
-                zonesStatus = {"1": {"level": score, "status": "enter"}}
+        
+        # Build zonesStatus from descriptor zones if available
+        if descriptors and descriptors[0]:
+            zonesStatus = self.build_zones_status_from_descriptor(descriptors[0], edge_type="enter")
+        else:
+            zonesStatus = {"0": {"level": 60, "status": "enter"}}  # Fallback
+        
+        # Extract license plate from descriptor if available
+        license_plate = None
+        if descriptors and descriptors[0]:
+            license_plate = descriptors[0].get("licensePlate")
         
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -684,6 +691,10 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "smartDetectSnapshots": [],
             "zonesStatus": zonesStatus,
         }
+        
+        # Add license plate to payload if available
+        if license_plate:
+            payload["licensePlate"] = license_plate
         
         self.logger.info(
             f"Starting smart detect event {event_id} for {object_type.value} "
@@ -776,7 +787,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[event_id]
-        zonesStatus = {"1": {"level": 75, "status": "moving"}}  # Example zonesStatus, can be customized
+        
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -796,12 +807,17 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "snapshot_width": snapshot_width,
                 "snapshot_height": snapshot_height,
             })
-            if custom_descriptor and "confidenceLevel" in custom_descriptor:
-                try:
-                    score = int(custom_descriptor.get("confidenceLevel"))
-                except Exception:
-                    score = 75
-                zonesStatus = {"1": {"level": score, "status": "moving"}}
+        
+        # Build zonesStatus from descriptor zones if available
+        if descriptors and descriptors[0]:
+            zonesStatus = self.build_zones_status_from_descriptor(descriptors[0], edge_type="moving")
+        else:
+            zonesStatus = {"0": {"level": 75, "status": "moving"}}  # Fallback
+        
+        # Extract license plate from descriptor if available
+        license_plate = None
+        if descriptors and descriptors[0]:
+            license_plate = descriptors[0].get("licensePlate")
         
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -819,6 +835,10 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "smartDetectSnapshots": [],
             "zonesStatus": zonesStatus,
         }
+        
+        # Add license plate to payload if available
+        if license_plate:
+            payload["licensePlate"] = license_plate
         
         self.logger.debug(
             f"Updating smart detect event {event_id} for {object_type.value}"
@@ -884,8 +904,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 frame_time_ms or event_timestamp
             )
         
-        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
-        
         # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
         smart_detect_snapshots = []
         tracker_id_attr_map = {}
@@ -913,6 +931,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "snapshot_width": snapshot_width,
                 "snapshot_height": snapshot_height,
             }]
+        
+        # Build zonesStatus from the last descriptor's zones
+        zonesStatus = {"0": {"level": 75, "status": "leave"}}  # Default fallback
+        license_plate = None
+        if descriptors_to_process:
+            last_descriptor = descriptors_to_process[-1]["descriptor"]
+            zonesStatus = self.build_zones_status_from_descriptor(last_descriptor, edge_type="leave")
+            license_plate = last_descriptor.get("licensePlate")
         
         # Group descriptors by tracker ID and select the one with highest confidence for each
         # Only one snapshot per tracker ID should be in the smartDetectSnapshots array
@@ -1017,6 +1043,10 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "trackerIDAttrMap": tracker_id_attr_map,
             "zonesStatus": zonesStatus,
         }
+        
+        # Add license plate to payload if available
+        if license_plate:
+            payload["licensePlate"] = license_plate
         
         duration = time.time() - active_event["start_time"]
         self.logger.info(
@@ -1489,6 +1519,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     "rebootTimeoutSec": 30,
                     "semver": "v4.4.8",
                     "totalLoad": 0.5474,
+                    "type": "camera",
                     "upgradeTimeoutSec": 150,
                     "uptime": int(self.get_uptime()),
                     "features": await self.get_feature_flags(),
@@ -1525,6 +1556,36 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "responseExpected": False,
             "to": "UniFiVideo",
         }
+
+    def build_zones_status_from_descriptor(
+        self, descriptor: dict[str, Any], edge_type: str = "moving"
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Build zonesStatus dict from descriptor zones and confidence level.
+        
+        Args:
+            descriptor: The descriptor containing zones and confidenceLevel
+            edge_type: The edge type ("enter", "moving", "leave")
+            
+        Returns:
+            Dict mapping zone ID strings to status objects
+        """
+        zones_status = {}
+        
+        # Get confidence level from descriptor, default to 75
+        confidence = descriptor.get("confidenceLevel", 75)
+        
+        # Get zones from descriptor (list of zone IDs)
+        zones = descriptor.get("zones", [0])
+        
+        # Build status for each zone
+        for zone_id in zones:
+            zones_status[str(zone_id)] = {
+                "level": confidence,
+                "status": edge_type
+            }
+        
+        return zones_status
 
     def get_uptime(self) -> float:
         return time.time() - self._init_time
