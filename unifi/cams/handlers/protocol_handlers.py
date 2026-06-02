@@ -143,10 +143,72 @@ class ProtocolHandlers:
     ) -> None:
         """Process ChangeSmartDetectSettings from UniFi Protect.
 
-        The base implementation is a no-op. Subclasses (e.g. FrigateCam) can
-        override this to store zones and push them downstream.
+        Extracts and stores exclusion zones from the payload, then calls
+        ``change_exclude_zones()`` so subclasses can react.
+
+        Subclasses (e.g. FrigateCam) should call ``await super().process_smart_detect_settings(msg)``
+        to ensure exclusion zone storage is always kept up to date alongside
+        their own smart-detect zone handling.
         """
-        pass
+        payload = msg.get("payload") or {}
+        exclude_zones: dict = payload.get("excludeZones") or {}
+
+        if exclude_zones != self._exclude_zones:
+            self._exclude_zones = exclude_zones
+            self.logger.info(
+                f"Exclusion zones updated: {len(self._exclude_zones)} zone(s) received"
+            )
+            self.logger.debug(f"Exclusion zone details: {exclude_zones}")
+            await self.change_exclude_zones(exclude_zones)
+
+    async def process_privacy_zones(
+        self: "UnifiCamBase", msg: "AVClientRequest"
+    ) -> "AVClientResponse":
+        """Process ChangePrivacyZones from UniFi Protect.
+
+        Stores the incoming zone list and calls ``change_privacy_zones()`` so
+        subclasses can react (e.g. push masks to FFmpeg or the underlying
+        camera).  Always acknowledges the message so Protect knows the zones
+        were accepted.
+        """
+        zones: list = (msg.get("payload") or {}).get("zones", [])
+
+        # Rebuild in-memory store keyed by zone id
+        self._privacy_zones = {z["id"]: z for z in zones if "id" in z}
+
+        self.logger.info(
+            f"Privacy zones updated: {len(self._privacy_zones)} zone(s) received"
+        )
+        self.logger.debug(f"Privacy zone details: {zones}")
+
+        await self.change_privacy_zones(zones)
+
+        return self.gen_response("ChangePrivacyZones", msg["messageId"], {})
+
+    async def process_clarity_zones(
+        self: "UnifiCamBase", msg: "AVClientRequest"
+    ) -> "AVClientResponse":
+        """Process ChangeClarityZones from UniFi Protect.
+
+        Stores the incoming Enhanced Bitrate zone dict and calls
+        ``change_clarity_zones()`` so subclasses can react (e.g. push the
+        zone configuration to the underlying camera or encoder).  Always
+        acknowledges the message so Protect considers the zones committed.
+
+        Protect sends: ``{"autoMode": false, "zones": {"<id>": {points, ...}, ...}}``
+        """
+        payload = msg.get("payload") or {}
+        zones: dict = payload.get("zones") or {}
+
+        if zones != self._clarity_zones:
+            self._clarity_zones = zones
+            self.logger.info(
+                f"Clarity (Enhanced Bitrate) zones updated: {len(self._clarity_zones)} zone(s) received"
+            )
+            self.logger.debug(f"Clarity zone details: {zones}")
+            await self.change_clarity_zones(zones)
+
+        return self.gen_response("ChangeClarityZones", msg["messageId"], {})
 
     async def process_time(
         self: "UnifiCamBase", msg: "AVClientRequest"
@@ -285,7 +347,7 @@ class ProtocolHandlers:
             "irOnValSharpness": 50,
             "irOnValWdr": 1,
             "lensDistortionCorrection": 1,
-            "masks": None,
+            "masks": list(self._privacy_zones.values()) or None,
             "mirror": 0,
             "queryIrLedStatus": 0,
             "saturation": 50,

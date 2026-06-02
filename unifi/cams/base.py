@@ -128,6 +128,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "video3": (640, 360),    # Low quality default
         }
 
+        # Privacy zones - stored as dict keyed by zone id for efficient lookup/diff
+        # Each value is the full zone dict received from UniFi Protect
+        self._privacy_zones: dict[int, dict[str, Any]] = {}
+
+        # Exclusion zones - sent inside ChangeSmartDetectSettings payload under "excludeZones"
+        # Keyed by zone id (string as received from Protect)
+        self._exclude_zones: dict[str, dict[str, Any]] = {}
+
+        # Clarity (Enhanced Bitrate) zones - sent via ChangeClarityZones message
+        # Keyed by zone id (string as received from Protect)
+        self._clarity_zones: dict[str, dict[str, Any]] = {}
+
         # Analytics event linger settings
         # Delay sending EventAnalytics start until the event has been active for this duration (milliseconds)
         self.lingerEventStart: int = 1000  # 1000ms = 1 second
@@ -271,7 +283,105 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
+            "privacyMask": True,
+            "privacyMasks": {
+                "maxZones": 16,
+                "rectangleOnly": False,
+            },
+            # Advertise smart detection support for all object types.
+            # This enables the Smart Detection Zones and Exclusion Zones UI.
+            "smartDetect": ["person", "vehicle", "animal", "package"],
+            # Enable the Exclusion Zones menu. Must be an array (even empty) —
+            # Protect gates the menu on `featureFlags.excludeZones !== null`.
+            # Real cameras send an array of pre-configured zone objects; an
+            # empty array simply means "supported but no zones yet configured".
+            "excludeZone": [],
+            # Enable the Enhanced Bitrate Zones (Clarity Zones) menu.
+            # Same pattern as excludeZone — must be an array, not an object.
+            "clarityZones": [],
         }
+
+    async def get_privacy_zones(self) -> list[dict[str, Any]]:
+        """
+        Return the current list of privacy zones.
+
+        Each zone is a dict with at minimum:
+            - ``id``     (int)  – unique zone identifier
+            - ``points`` (list) – list of {x, y} normalised coordinate dicts
+
+        The base implementation returns whatever was last sent by UniFi Protect
+        via ``ChangePrivacyZones``. Subclasses may override this to persist
+        zones externally or derive them from the underlying camera.
+        """
+        return list(self._privacy_zones.values())
+
+    async def change_privacy_zones(self, zones: list[dict[str, Any]]) -> None:
+        """
+        Apply a new set of privacy zones.
+
+        Called whenever UniFi Protect pushes a ``ChangePrivacyZones`` message.
+        The base implementation stores the zones in memory. Subclasses can
+        override this to forward the zones to the underlying camera or stream
+        processor (e.g. FFmpeg ``drawbox`` filters, Frigate masks, etc.).
+
+        Args:
+            zones: List of zone dicts as received from UniFi Protect.
+        """
+        pass
+
+    async def get_exclude_zones(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the current set of exclusion zones.
+
+        Exclusion zones are regions inside Smart Detection Zones that suppress
+        AI detections.  They arrive inside the ``ChangeSmartDetectSettings``
+        payload under the ``excludeZones`` key (a dict keyed by zone id string).
+
+        The base implementation returns whatever was last received from Protect.
+        Subclasses may override to load from persistent storage.
+        """
+        return dict(self._exclude_zones)
+
+    async def change_exclude_zones(self, zones: dict[str, dict[str, Any]]) -> None:
+        """
+        Apply a new set of exclusion zones.
+
+        Called whenever ``ChangeSmartDetectSettings`` carries updated
+        ``excludeZones``.  The base implementation is a no-op (zones are
+        stored by the handler).  Subclasses can override to push zones to the
+        underlying camera or stream processor.
+
+        Args:
+            zones: Dict of zone dicts keyed by zone id string, as received
+                   from UniFi Protect.
+        """
+        pass
+
+    async def get_clarity_zones(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the current set of Enhanced Bitrate (Clarity) zones.
+
+        These zones tell the camera to allocate increased encoding bitrate to
+        preserve higher image detail in important areas of the scene.
+
+        The base implementation returns whatever was last received from Protect.
+        Subclasses may override to load from persistent storage.
+        """
+        return dict(self._clarity_zones)
+
+    async def change_clarity_zones(self, zones: dict[str, dict[str, Any]]) -> None:
+        """
+        Apply a new set of Enhanced Bitrate (Clarity) zones.
+
+        Called whenever UniFi Protect sends a ``ChangeClarityZones`` message.
+        The base implementation is a no-op (zones are stored by the handler).
+        Subclasses can override to push the zones to the underlying camera.
+
+        Args:
+            zones: Dict of zone dicts keyed by zone id string, as received
+                   from UniFi Protect.
+        """
+        pass
 
 
     ###
@@ -1505,9 +1615,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "SmartMotionTest", response_to=m["messageId"]
             )
         elif fn == "ChangeClarityZones":
-            res = self.gen_response(
-                "ChangeClarityZones", response_to=m["messageId"]
-            )
+            res = await self.process_clarity_zones(m)
+        elif fn == "ChangePrivacyZones":
+            res = await self.process_privacy_zones(m)
         elif fn == "UpdateFirmwareRequest":
             await self.process_upgrade(m)
             return True

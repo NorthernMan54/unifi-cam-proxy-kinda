@@ -154,5 +154,5 @@ class VideoStreamHandlers:
             del self._ffmpeg_handles[stream_index]
 
     def close_streams(self):
-        for stream in self._ffmpeg_handles:
+        for stream in list(self._ffmpeg_handles):
             self.stop_video_stream(stream)
