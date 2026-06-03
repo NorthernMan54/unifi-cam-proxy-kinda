@@ -519,6 +519,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                         self.logger.warning(f"Failed to delete cached snapshot {snapshot_path}: {e}")
             
             del self._active_smart_events[event_id]
+            end_time = event_data.get('end_time')  # <-- Add this line
             self.logger.debug(
                 f"Cleaned up smart detect event {event_id} "
                 f"(age: {(current_time - end_time) / 60:.1f} minutes)"
@@ -848,6 +849,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self.gen_response("EventSmartDetect", payload=payload)
         )
 
+
     async def trigger_smart_detect_stop(
         self,
         object_type: SmartDetectObjectType,
@@ -866,7 +868,113 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             event_id: Optional specific event ID to stop. If not provided, stops the first active event of the given object type.
             frame_time_ms: Optional frame timestamp for the final update (if custom_descriptor provided)
         """
-        # Find the active smart detect event
+
+        target_event_id = await self._find_or_validate_smart_event(event_id, object_type)
+        if not target_event_id:
+            return
+        
+        active_event = self._active_smart_events[target_event_id]
+        
+        # 2. Send final update if needed
+        if custom_descriptor:
+            await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms or event_timestamp)
+        
+        # 3. Process descriptors and build snapshots
+        descriptors_to_process = self._get_descriptors_for_stop_event(active_event, custom_descriptor, event_timestamp)
+        best_descriptors = self._get_best_descriptors_by_tracker(descriptors_to_process)
+        smart_detect_snapshots, tracker_id_attr_map = self._build_smart_detect_snapshots(best_descriptors, active_event, object_type)
+        
+        # 4. Build and send payload
+        payload = self._build_smart_detect_stop_payload(
+            target_event_id, object_type, active_event, smart_detect_snapshots, 
+            tracker_id_attr_map, event_timestamp
+        )
+        await self.send(self.gen_response("EventSmartDetect", payload=payload))
+        
+        # 5. Finalize event
+        self._finalize_smart_detect_event(target_event_id, active_event)
+        
+        duration = time.time() - active_event["start_time"]
+        self.logger.info(f"Stopping smart detect event {target_event_id} for {object_type.value} (duration: {duration:.1f}s)")
+
+    def _get_descriptors_for_stop_event(self, active_event, custom_descriptor, event_timestamp):
+        """Get descriptors to process, handling fallback chain."""
+        descriptors = active_event.get("descriptor_history", [])
+        
+        if not descriptors and custom_descriptor:
+            width, height = self._calculate_snapshot_dimensions(custom_descriptor)
+            descriptors = [{
+                "descriptor": custom_descriptor,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": width,
+                "snapshot_height": height,
+            }]
+        elif not descriptors and active_event.get("last_descriptor"):
+            last_desc = active_event["last_descriptor"]
+            width, height = self._calculate_snapshot_dimensions(last_desc)
+            descriptors = [{
+                "descriptor": last_desc,
+                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
+                "monotonic": int(self.get_uptime()),
+                "snapshot_width": width,
+                "snapshot_height": height,
+            }]
+        
+        return descriptors
+
+    def _get_best_descriptors_by_tracker(self, descriptors_to_process):
+        """Group descriptors by tracker ID, keeping highest confidence per tracker."""
+        best: dict[int, dict[str, Any]] = {}
+        
+        for entry in descriptors_to_process:
+            descriptor = entry["descriptor"]
+            tracker_id = descriptor.get("trackerID", 1)
+            confidence = descriptor.get("confidenceLevel", 0)
+            
+            if tracker_id not in best or confidence > best[tracker_id]["descriptor"].get("confidenceLevel", 0):
+                best[tracker_id] = entry
+        
+        return best
+
+    def _build_smart_detect_snapshots(self, best_descriptors, active_event, object_type):
+        """Build smartDetectSnapshots array and trackerIDAttrMap."""
+        snapshots = []
+        tracker_map = {}
+        
+        for tracker_id, desc_entry in best_descriptors.items():
+            descriptor = desc_entry["descriptor"]
+            zones = descriptor.get("zones", [1])
+            width = desc_entry.get("snapshot_width") or active_event.get("snapshot_width") or 640
+            height = desc_entry.get("snapshot_height") or active_event.get("snapshot_height") or 360
+            
+            snapshot_path = active_event.get("snapshot_crop_path")
+            filename = str(snapshot_path) if snapshot_path else f"smartdetectsnap_zone_{tracker_id}_{desc_entry['timestamp_ms']}.jpg"
+            
+            snapshots.append({
+                "clockBestMonotonic": desc_entry["monotonic"],
+                "clockBestWall": desc_entry["timestamp_ms"],
+                "smartDetectSnapshot": filename,
+                "smartDetectSnapshotHeight": height,
+                "smartDetectSnapshotName": descriptor.get("name", ""),
+                "smartDetectSnapshotType": object_type.value,
+                "smartDetectSnapshotWidth": width,
+                "trackerID": tracker_id
+            })
+            
+            tracker_map[str(tracker_id)] = {
+                "objectType": object_type.value,
+                "zone": zones or [1]
+            }
+        
+        # Handle empty case
+        if not snapshots:
+            self._add_default_smart_detect_snapshot(snapshots, tracker_map, active_event, object_type)
+        
+        return snapshots, tracker_map
+
+    async def _find_or_validate_smart_event(self, event_id: Optional[int], object_type: SmartDetectObjectType) -> Optional[int]:
+        """Find and validate a smart detect event."""
         target_event_id = event_id
         
         if target_event_id is None:
@@ -881,138 +989,69 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"trigger_smart_detect_stop called for {object_type.value} "
                 f"but no active event found. Event may have already ended or never started. Ignoring."
             )
-            return
+            return None
             
         if target_event_id not in self._active_smart_events:
             self.logger.warning(
                 f"trigger_smart_detect_stop called for event {target_event_id} "
                 f"but it is not in active events list. Ignoring."
             )
-            return
+            return None
         
-        active_event = self._active_smart_events[target_event_id]
+        return target_event_id
+
+    def _add_default_smart_detect_snapshot(
+        self,
+        snapshots: list,
+        tracker_map: dict,
+        active_event: dict,
+        object_type: SmartDetectObjectType
+    ) -> None:
+        """Add default snapshot entry when no descriptors available."""
+        default_tracker_id = 1
+        default_timestamp_ms = int(round(time.time() * 1000))
+        default_monotonic = int(self.get_uptime())
         
-        # If a custom_descriptor is provided, send it as a final update first
-        # so UniFi Protect receives the final bounding box and snapshot
-        if custom_descriptor:
-            self.logger.debug(
-                f"Sending final update with custom descriptor before stopping event {target_event_id}"
-            )
-            await self.trigger_smart_detect_update(
-                object_type,
-                custom_descriptor,
-                frame_time_ms or event_timestamp
-            )
+        snapshot_crop_path = active_event.get("snapshot_crop_path")
+        snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{default_tracker_id}_{default_timestamp_ms}.jpg"
         
-        # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
-        smart_detect_snapshots = []
-        tracker_id_attr_map = {}
+        snapshot_width = active_event.get("snapshot_width") or 640
+        snapshot_height = active_event.get("snapshot_height") or 360
         
-        # Use descriptor history if available, otherwise use last descriptor
-        descriptors_to_process = active_event.get("descriptor_history", [])
-        if not descriptors_to_process and custom_descriptor:
-            # Fallback: create a single entry from the final descriptor
-            snapshot_width, snapshot_height = self._calculate_snapshot_dimensions(custom_descriptor)
-            descriptors_to_process = [{
-                "descriptor": custom_descriptor,
-                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
-                "monotonic": int(self.get_uptime()),
-                "snapshot_width": snapshot_width,
-                "snapshot_height": snapshot_height,
-            }]
-        elif not descriptors_to_process and active_event.get("last_descriptor"):
-            # Further fallback: use last stored descriptor
-            last_desc = active_event["last_descriptor"]
-            snapshot_width, snapshot_height = self._calculate_snapshot_dimensions(last_desc)
-            descriptors_to_process = [{
-                "descriptor": last_desc,
-                "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
-                "monotonic": int(self.get_uptime()),
-                "snapshot_width": snapshot_width,
-                "snapshot_height": snapshot_height,
-            }]
-        
+        snapshots.append({
+            "clockBestMonotonic": default_monotonic,
+            "clockBestWall": default_timestamp_ms,
+            "smartDetectSnapshot": snapshot_filename,
+            "smartDetectSnapshotHeight": snapshot_height,
+            "smartDetectSnapshotName": "",
+            "smartDetectSnapshotType": object_type.value,
+            "smartDetectSnapshotWidth": snapshot_width,
+            "trackerID": default_tracker_id
+        })
+        tracker_map[str(default_tracker_id)] = {
+            "objectType": object_type.value,
+            "zone": [1]
+        }
+
+    def _build_smart_detect_stop_payload(
+        self,
+        target_event_id: int,
+        object_type: SmartDetectObjectType,
+        active_event: dict,
+        smart_detect_snapshots: list,
+        tracker_id_attr_map: dict,
+        event_timestamp: Optional[float] = None
+    ) -> dict[str, Any]:
+        """Build the stop event payload."""
         # Build zonesStatus from the last descriptor's zones
-        zonesStatus = {"0": {"level": 75, "status": "leave"}}  # Default fallback
+        zonesStatus = {"0": {"level": 75, "status": "leave"}}
         license_plate = None
-        if descriptors_to_process:
-            last_descriptor = descriptors_to_process[-1]["descriptor"]
+        
+        # Get zone status and license plate from last descriptor if available
+        if active_event.get("last_descriptor"):
+            last_descriptor = active_event["last_descriptor"]
             zonesStatus = self.build_zones_status_from_descriptor(last_descriptor, edge_type="leave")
             license_plate = last_descriptor.get("licensePlate")
-        
-        # Group descriptors by tracker ID and select the one with highest confidence for each
-        # Only one snapshot per tracker ID should be in the smartDetectSnapshots array
-        best_descriptors_by_tracker: dict[int, dict[str, Any]] = {}
-        
-        for desc_entry in descriptors_to_process:
-            descriptor = desc_entry["descriptor"]
-            tracker_id = descriptor.get("trackerID", 1)
-            confidence = descriptor.get("confidenceLevel", 0)
-            
-            # Keep only the descriptor with the highest confidence for each tracker ID
-            if tracker_id not in best_descriptors_by_tracker:
-                best_descriptors_by_tracker[tracker_id] = desc_entry
-            else:
-                existing_confidence = best_descriptors_by_tracker[tracker_id]["descriptor"].get("confidenceLevel", 0)
-                if confidence > existing_confidence:
-                    best_descriptors_by_tracker[tracker_id] = desc_entry
-        
-        # Build smartDetectSnapshots array from best descriptors (one per tracker ID)
-        for tracker_id, desc_entry in best_descriptors_by_tracker.items():
-            descriptor = desc_entry["descriptor"]
-            zones = descriptor.get("zones", [1])
-            
-            # Use per-descriptor snapshot dimensions if available, otherwise use event-level defaults
-            snapshot_width = desc_entry.get("snapshot_width") or active_event.get("snapshot_width") or 640
-            snapshot_height = desc_entry.get("snapshot_height") or active_event.get("snapshot_height") or 360
-            
-            # Use the actual cached snapshot path as the filename
-            # UniFi Protect will request this file via GetRequest
-            snapshot_crop_path = active_event.get("snapshot_crop_path")
-            snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{tracker_id}_{desc_entry['timestamp_ms']}.jpg"
-            
-            # Build smartDetectSnapshots entry
-            smart_detect_snapshots.append({
-                "clockBestMonotonic": desc_entry["monotonic"],
-                "clockBestWall": desc_entry["timestamp_ms"],
-                "smartDetectSnapshot": snapshot_filename,
-                "smartDetectSnapshotHeight": snapshot_height,
-                "smartDetectSnapshotName": descriptor.get("name", ""),
-                "smartDetectSnapshotType": object_type.value,
-                "smartDetectSnapshotWidth": snapshot_width,
-                "trackerID": tracker_id
-            })
-            
-            # Build trackerIDAttrMap entry (use zones from best descriptor for each tracker)
-            tracker_id_attr_map[str(tracker_id)] = {
-                "objectType": object_type.value,
-                "zone": zones if zones else [1]
-            }
-        
-        # If no descriptors were processed, create a minimal default entry
-        if not smart_detect_snapshots:
-            default_tracker_id = 1
-            default_timestamp_ms = event_timestamp or int(round(time.time() * 1000))
-            default_monotonic = int(self.get_uptime())
-            
-            # Use the actual cached snapshot path as the filename
-            snapshot_crop_path = active_event.get("snapshot_crop_path")
-            snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{default_tracker_id}_{default_timestamp_ms}.jpg"
-            
-            smart_detect_snapshots.append({
-                "clockBestMonotonic": default_monotonic,
-                "clockBestWall": default_timestamp_ms,
-                "smartDetectSnapshot": snapshot_filename,
-                "smartDetectSnapshotHeight": snapshot_height,
-                "smartDetectSnapshotName": "",
-                "smartDetectSnapshotType": object_type.value,
-                "smartDetectSnapshotWidth": snapshot_width,
-                "trackerID": default_tracker_id
-            })
-            tracker_id_attr_map[str(default_tracker_id)] = {
-                "objectType": object_type.value,
-                "zone": [1]
-            }
         
         # Get the full FoV snapshot path and dimensions from the event
         snapshot_fov_path = active_event.get("snapshot_fov_path")
@@ -1048,28 +1087,17 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         if license_plate:
             payload["licensePlate"] = license_plate
         
-        duration = time.time() - active_event["start_time"]
-        self.logger.info(
-            f"Stopping smart detect event {target_event_id} for {object_type.value} "
-            f"(duration: {duration:.1f}s, active smart events: "
-            f"{len([e for e in self._active_smart_events.values() if e.get('end_time') is None])})"
-        )
-        
-        await self.send(
-            self.gen_response("EventSmartDetect", payload=payload)
-        )
-        
-        # Mark this smart detect event as ended (keep in memory for 60 minutes)
+        return payload
+
+
+    def _finalize_smart_detect_event(self, event_id, active_event):
+        """Mark event as ended and update legacy fields."""
         active_event["end_time"] = time.time()
         
-        # Update legacy compatibility fields
-        # Check if there are any other active (not ended) smart detect events
-        active_smart_events = [e for e in self._active_smart_events.values() if e.get("end_time") is None]
-        if not active_smart_events:
-            # No more active smart detect events
+        # Clear legacy fields if no other active smart detect events
+        if not any(e.get("end_time") is None for e in self._active_smart_events.values()):
             self._motion_object_type = None
             self._motion_last_descriptor = None
-            # Only clear motion_event_ts if no analytics event is active
             if self._active_analytics_event_id is None:
                 self._motion_event_ts = None
 

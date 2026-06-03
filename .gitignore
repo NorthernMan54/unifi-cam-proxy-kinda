@@ -18,3 +18,4 @@ tools/config.json
 tools/recent-events-response.json
 tools/driveway.json
 test-docker-compose.yaml
+*.json
