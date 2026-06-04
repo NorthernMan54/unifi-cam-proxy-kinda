@@ -874,9 +874,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[target_event_id]
-        
-        self.logger.debug(
-            f"Logging smart detect stop for event {target_event_id} ({active_event}). ")
 
         # 2. Send final update if needed
         if custom_descriptor:
@@ -884,23 +881,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         # 3. Process descriptors and build snapshots
         descriptors_to_process = self._get_descriptors_for_stop_event(active_event, custom_descriptor, event_timestamp)
-        self.logger.debug(
-            f"Processing {len(descriptors_to_process)} descriptors for smart detect stop event {target_event_id} ({object_type.value})"
-            f"{descriptors_to_process and f': {descriptors_to_process}' or ''}"  # Log descriptors if available
-        )
         best_descriptors = self._get_best_descriptors_by_tracker(descriptors_to_process)
         smart_detect_snapshots, tracker_id_attr_map = self._build_smart_detect_snapshots(best_descriptors, active_event, object_type)
-        
-        # Log detailed debug information about the best descriptors. 
-        self.logger.debug(
-            f"Best descriptors for smart detect stop event {target_event_id} ({object_type.value}): "
-            f"{best_descriptors}"
-        )
-
-        self.logger.debug(
-            f"Prepared smart detect stop payload for event {target_event_id} with {len(smart_detect_snapshots)} snapshots "
-            f"(descriptors processed: {len(descriptors_to_process)}, best trackers: {len(best_descriptors)})"
-        )
 
         # 4. Build and send payload
         payload = self._build_smart_detect_stop_payload(
@@ -1072,6 +1054,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             zonesStatus = self.build_zones_status_from_descriptor(last_descriptor, edge_type="leave")
             license_plate = last_descriptor.get("licensePlate")
         
+        # zonesStatus = best_descriptors["descriptor"]["zonesStatus"]
+
+        # {'1': {'level': 80, 'status': 'moving'}}
+        # zonesStatus['1']['status'] = "leave"
+
         # Get the full FoV snapshot path and dimensions from the event
         snapshot_fov_path = active_event.get("snapshot_fov_path")
         fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"smartdetectsnap_{target_event_id}_fullfov.jpg"
@@ -1083,13 +1070,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             # Fall back to event-level dimensions or defaults
             fov_width = active_event.get("snapshot_width") or 640
             fov_height = active_event.get("snapshot_height") or 360
-        
-        self.logger.debug(
-            f"Building smart detect stop payload for event {target_event_id} ({object_type.value}): "
-            f"best_descriptors={best_descriptors}, license_plate={license_plate}, "
-            f"fov_filename={fov_filename}, fov_width={fov_width}, fov_height={fov_height}, "
-            f"tracker_id_attr_map={tracker_id_attr_map}"
-        )
 
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -1106,7 +1086,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "smartDetectSnapshotFullFoVWidth": fov_width,
             "smartDetectSnapshots": smart_detect_snapshots,
             "trackerIDAttrMap": tracker_id_attr_map,
-            "zonesStatus": best_descriptors["descriptor"]["zonesStatus"],
+            "zonesStatus": zonesStatus,
         }
         
         # Add license plate to payload if available
