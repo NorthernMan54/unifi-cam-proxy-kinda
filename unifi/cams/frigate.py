@@ -432,6 +432,7 @@ class FrigateCam(RTSPCam):
             "zones": zones, # validated
         }
         
+        descriptor["zonesStatus"] = super().build_zones_status_from_descriptor(descriptor)  # validated
         # Only include licensePlate if it has a value
         if license_plate:
             descriptor["licensePlate"] = license_plate
