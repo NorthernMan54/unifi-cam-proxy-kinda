@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 import aiohttp
 import websockets
@@ -199,6 +200,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     async def _run(self, ws) -> None:
         self._session = ws
         await self.init_adoption()
+        # asyncio.create_task(self.replay_json_file())
         while True:
             try:
                 msg = await ws.recv()
@@ -211,6 +213,44 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 if force_reconnect:
                     self.logger.info("Reconnecting...")
                     raise RetryableError()
+
+    async def replay_json_file(self) -> None:
+        """Replay events from a JSON file, one object every 2s, starting after a 15s delay."""
+        REPLAY_FILE: str = "./protect_EventSmartDetect.json"
+
+        # Wait 15 seconds from program start before sending anything
+        elapsed = time.time() - self._init_time
+        delay = max(15.0 - elapsed, 0.0)
+        if delay > 0:
+            self.logger.info(f"replay_json_file: waiting {delay:.1f}s before starting")
+            await asyncio.sleep(delay)
+
+        # Load the JSON file
+        try:
+            events: list = json.loads(Path(REPLAY_FILE).read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            self.logger.error(f"replay_json_file: could not load {REPLAY_FILE}: {exc}")
+            return
+
+        self.logger.info(f"replay_json_file: replaying {len(events)} events from {REPLAY_FILE}")
+
+        for i, obj in enumerate(events):
+            # Stamp clock fields with current wall/monotonic time
+            now_wall = int(round(time.time() * 1000))
+            now_mono = int(round(self.get_uptime() * 1000))
+            payload = obj.setdefault("payload", {})
+            payload["clockWall"]       = now_wall
+            payload["clockMonotonic"]  = now_mono
+            payload["clockStream"]     = now_mono
+
+            self.logger.debug(f"replay_json_file: sending object {i + 1}/{len(events)}")
+            await self.send(
+                self.gen_response("EventSmartDetect", payload=payload)
+            )
+
+            await asyncio.sleep(2.0)
+
+        self.logger.info("replay_json_file: all events sent")
 
     async def run(self) -> None:
         return
@@ -677,14 +717,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             license_plate = descriptors[0].get("licensePlate")
         
         payload: dict[str, Any] = {
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
+            "clockMonotonic": int(round(self.get_uptime() * 1000)),
+            "clockStream": int(round(self.get_uptime() * 1000)),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "enter",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "objectTypes": [object_type.value],
                 "smartDetectSnapshotFullFoV": "",
                 "smartDetectSnapshotFullFoVHeight": 0,
@@ -788,6 +828,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[event_id]
+        self._motion_event_id += 1
         
         # Build descriptors array
         descriptors = []
@@ -821,14 +862,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             license_plate = descriptors[0].get("licensePlate")
         
         payload: dict[str, Any] = {
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
+            "clockMonotonic": int(round(self.get_uptime() * 1000)),
+            "clockStream": int(round(self.get_uptime() * 1000)),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "moving",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": "",
             "smartDetectSnapshotFullFoVHeight": 0,
@@ -1071,15 +1112,17 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             fov_width = active_event.get("snapshot_width") or 640
             fov_height = active_event.get("snapshot_height") or 360
 
+        self._motion_event_id += 1
+
         payload: dict[str, Any] = {
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
+            "clockMonotonic": int(round(self.get_uptime() * 1000)),
+            "clockStream": int(round(self.get_uptime() * 1000)),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "descriptors": [],         # This is empty on stop events
             "displayTimeoutMSec": 2000,
             "edgeType": "leave",
-            "eventId": target_event_id,
+            "eventId": self._motion_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": fov_filename,
             "smartDetectSnapshotFullFoVHeight": fov_height,
@@ -1137,15 +1180,17 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             )
             return
         
+        self._motion_event_id += 1
+            
         payload: dict[str, Any] = {
             "clockBestMonotonic": 0,
             "clockBestWall": 0,
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
+            "clockMonotonic": int(round(self.get_uptime() * 1000)),
+            "clockStream": int(round(self.get_uptime() * 1000)),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "edgeType": "start",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "eventType": "motion",
             "levels": {"0": 47},
             "motionHeatmap": "motionHeatmapline101.png",
@@ -1384,14 +1429,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         active_event["end_time"] = time.time()
         
         payload: dict[str, Any] = {
-            "clockBestMonotonic": int(self.get_uptime()),
+            "clockBestMonotonic": int(round(self.get_uptime() * 1000)),
             "clockBestWall": int(round(active_event["start_time"] * 1000)),
-            "clockMonotonic": int(self.get_uptime()),
-            "clockStream": int(self.get_uptime()),
+            "clockMonotonic": int(round(self.get_uptime() * 1000)),
+            "clockStream": int(round(self.get_uptime() * 1000)),
             "clockStreamRate": 1000,
             "clockWall": int(round(time.time() * 1000)),
             "edgeType": "stop",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "eventType": "motion",
             "levels": {"0": 49},
             "motionHeatmap": heatmap_filename,
@@ -1579,6 +1624,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     def gen_response(
         self, name: str, response_to: int = 0, payload: Optional[dict[str, Any]] = None
     ) -> AVClientResponse:
+        now_dt = datetime.now(timezone.utc)
         if not payload:
             payload = {}
         return {
@@ -1589,6 +1635,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "payload": payload,
             "responseExpected": False,
             "to": "UniFiVideo",
+            "timeStamp": now_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now_dt.microsecond // 1000:03d}+00:00"
         }
 
     def build_zones_status_from_descriptor(
