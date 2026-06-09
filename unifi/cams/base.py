@@ -428,6 +428,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         # Remove old events and delete their cached snapshot files
         for event_id in events_to_remove:
             event_data = self._active_smart_events[event_id]
+            end_time = event_data.get('end_time')
             
             # Delete cached snapshot files
             for snapshot_key in ['snapshot_crop_path', 'snapshot_fov_path', 'heatmap_path']:
@@ -440,10 +441,13 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                         self.logger.warning(f"Failed to delete cached snapshot {snapshot_path}: {e}")
             
             del self._active_smart_events[event_id]
-            self.logger.debug(
-                f"Cleaned up smart detect event {event_id} "
-                f"(age: {(current_time - end_time) / 60:.1f} minutes)"
-            )
+            if end_time:
+                self.logger.debug(
+                    f"Cleaned up smart detect event {event_id} "
+                    f"(age: {(current_time - end_time) / 60:.1f} minutes)"
+                )
+            else:
+                self.logger.debug(f"Cleaned up smart detect event {event_id}")
         
         if events_to_remove:
             self.logger.info(
