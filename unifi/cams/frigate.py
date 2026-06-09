@@ -12,11 +12,61 @@ import backoff
 from aiomqtt import Client, Message
 from aiomqtt.exceptions import MqttError
 
-from unifi.cams.base import SmartDetectObjectType
 from unifi.cams.rtsp import RTSPCam
 
+from ..protect_api.protect_api import (
+    EventSmartDetect,
+    SmartDetectPayload,
+    SmartDetectObjectType,
+    SmartDetectEdgeType,
+    ZoneStatus,
+    TrackerAttr,
+    SmartDetectSnapshot,
+    SmartDetectDescriptor,
+    ProtectResponseMessage,
+)
 
 class FrigateCam(RTSPCam):
+    # ---------------------------------------------------------------------------
+    # Class-level constants and label maps
+    # ---------------------------------------------------------------------------
+
+    UNIFI_COORD_SCALE: int = 1000  # UniFi uses a 0–1000 coordinate space
+
+    # Canonical Frigate labels for each UniFi object-type bucket.
+    _VEHICLE_LABELS: frozenset[str] = frozenset(
+        {"vehicle", "car", "motorcycle", "truck", "bus", "school_bus", "bicycle", "boat"}
+    )
+    _ANIMAL_LABELS: frozenset[str] = frozenset(
+        {
+            "cat", "dog", "deer", "horse", "bird", "raccoon", "fox",
+            "bear", "cow", "squirrel", "goat", "rabbit", "skunk", "kangaroo",
+        }
+    )
+
+    # Flat dispatch map built once at class definition time.
+    _LABEL_TO_TYPE: dict[str, SmartDetectObjectType] = {
+        **{"person": SmartDetectObjectType.PERSON},
+        **{"face": SmartDetectObjectType.FACE},
+        **{"license_plate": SmartDetectObjectType.LICENSEPLATE},
+        **{"package": SmartDetectObjectType.PACKAGE},
+        **{lbl: SmartDetectObjectType.VEHICLE for lbl in _VEHICLE_LABELS},
+        **{lbl: SmartDetectObjectType.ANIMAL for lbl in _ANIMAL_LABELS},
+    }
+
+    # Frigate labels to expand when a UniFi "vehicle" zone object-type is received.
+    _VEHICLE_ZONE_LABELS: tuple[str, ...] = (
+        "car", "motorcycle", "truck", "bus",
+    )
+    _ANIMAL_ZONE_LABELS: tuple[str, ...] = (
+        "dog", "cat", "deer", "horse", "bird", "raccoon", "fox",
+        "bear", "cow", "squirrel", "goat", "rabbit", "skunk", "kangaroo",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Initialisation
+    # ---------------------------------------------------------------------------
+
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
         self.args = args
@@ -28,6 +78,10 @@ class FrigateCam(RTSPCam):
         self.event_last_update: dict[int, float] = {}
         self.event_timeout_seconds = 600  # Timeout after 600 seconds (10 minutes) without updates
 
+
+        # Shared aiohttp session (lazy-initialised, reused across all HTTP calls)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
         super().add_parser(parser)
@@ -95,6 +149,198 @@ class FrigateCam(RTSPCam):
             },
         }
 
+    # ---------------------------------------------------------------------------
+    # Zone / settings handlers
+    # ---------------------------------------------------------------------------
+
+    async def process_smart_detect_settings(self, msg: dict[str, Any]) -> None:
+        """Handle ChangeSmartDetectSettings from UniFi Protect.
+        Persists zone definitions and pushes them to Frigate.  Always delegates
+        to super() so that exclusion zones and change callbacks remain functional.
+        """
+        zones: dict[str, Any] = msg.get("payload", {}).get("zones", {})
+
+        if zones:
+            self._unifi_zones = zones
+            self.logger.info(
+                "ChangeSmartDetectSettings: received %d zone(s) from UniFi Protect: %s",
+                len(zones), list(zones.keys()),
+            )
+            if self.args.frigate_http_url:
+                await self._push_zones_to_frigate(zones)
+            else:
+                self.logger.warning(
+                    "ChangeSmartDetectSettings: --frigate-http-url not set; "
+                    "cannot sync zones to Frigate. Objects will report in zone 0 only."
+                )
+        else:
+            self.logger.debug("ChangeSmartDetectSettings: no zones in payload — skipping zone sync")
+
+        await super().process_smart_detect_settings(msg)
+
+    async def process_smart_motion_settings(self, msg: dict[str, Any]) -> Any:
+        """Handle ChangeSmartMotionSettings.
+        Motion zones are managed directly in Frigate; we only call super() to
+        keep motionEvents / lingerEventStart in sync with UniFi Protect.
+        """
+        return await super().process_smart_motion_settings(msg)
+
+    # ---------------------------------------------------------------------------
+    # Zone sync helpers
+    # ---------------------------------------------------------------------------
+
+    async def _push_zones_to_frigate(self, unifi_zones: dict[str, Any]) -> None:
+        """Convert UniFi Protect zone definitions and push them to Frigate.
+        UniFi is the sole zone source-of-truth. Frigate's config/set deep-merge
+        ensures only the zones section is touched.
+        Coordinate conversion:
+          UniFi: flat int list [x0,y0,x1,y1,…] in 0–1000 space
+          Frigate: comma-separated floats in 0.0–1.0 space
+        """
+        camera_tracked = await self._fetch_camera_tracked_objects()
+
+        frigate_zones: dict[str, Any] = {}
+        new_mapping: dict[str, int] = {}
+
+        for zone_id_str, zone_data in unifi_zones.items():
+            try:
+                zone_id = int(zone_id_str)
+            except ValueError:
+                self.logger.warning(
+                    "Zone sync: non-integer zone id '%s' — skipping", zone_id_str
+                )
+                continue
+
+            coord = zone_data.get("coord", [])
+            if len(coord) < 4 or len(coord) % 2 != 0:
+                self.logger.warning(
+                    "Zone sync: zone %s has invalid coord %s — skipping", zone_id_str, coord
+                )
+                continue
+
+            # Convert 0-1000 → 0.0-1.0.
+            # Use :.4g (not :.4f) so boundary value 1.0 stays as "1" not "1.0000";
+            # Frigate uses lexicographic comparison `p > "1.0"` to detect pixel mode.
+            frigate_coords = ",".join(f"{v / 1000.0:.4g}" for v in coord)
+
+            zone_name = f"unifi_zone_{zone_id}"
+            frigate_objects = self._unifi_object_types_to_frigate_labels(
+                zone_data.get("objectTypes", []), camera_tracked
+            )
+
+            frigate_zones[zone_name] = {
+                "coordinates": frigate_coords,
+                "objects": frigate_objects,
+                "inertia": 3,
+                "loitering_time": 0,
+            }
+            new_mapping[zone_name] = zone_id
+            self.logger.debug(
+                "Zone sync: unifi zone %d → '%s' coords=%s objects=%s",
+                zone_id, zone_name, frigate_coords, frigate_objects,
+            )
+
+        await self._save_zones_via_config_set(frigate_zones, new_mapping)
+
+    async def _fetch_camera_tracked_objects(self) -> set[str]:
+        """Return the set of labels this camera tracks in Frigate's resolved config."""
+        if not self.args.frigate_http_url:
+            return set()
+        try:
+            session = await self._get_session()
+            async with session.get(f"{self.args.frigate_http_url}/api/config") as resp:
+                if resp.status == 200:
+                    cfg = await resp.json()
+                    tracked = (
+                        cfg.get("cameras", {})
+                        .get(self.args.frigate_camera, {})
+                        .get("objects", {})
+                        .get("track", [])
+                    )
+                    result = set(tracked)
+                    self.logger.debug(
+                        "Zone sync: camera '%s' tracks: %s",
+                        self.args.frigate_camera, sorted(result),
+                    )
+                    return result
+                self.logger.warning(
+                    "Zone sync: could not fetch Frigate config (HTTP %d)", resp.status
+                )
+        except Exception:
+            self.logger.warning("Zone sync: failed to fetch Frigate config", exc_info=True)
+        return set()
+
+    def _unifi_object_types_to_frigate_labels(
+        self,
+        object_types: list[str],
+        camera_tracked: set[str],
+    ) -> list[str]:
+        """Expand UniFi object-type names to Frigate label strings.
+        Filters out labels the camera doesn't track (Frigate rejects unknown labels).
+        """
+        labels: list[str] = []
+        for ot in object_types:
+            if ot == "person":
+                labels.append("person")
+            elif ot == "vehicle":
+                labels.extend(self._VEHICLE_ZONE_LABELS)
+            elif ot == "animal":
+                labels.extend(self._ANIMAL_ZONE_LABELS)
+            elif ot == "package":
+                labels.append("package")
+            elif ot == "face":
+                labels.append("face")
+            elif ot == "licensePlate":
+                labels.append("license_plate")
+
+        # Deduplicate, preserving insertion order; filter to tracked labels.
+        seen: dict[str, None] = {}
+        for lbl in labels:
+            if lbl not in seen and (not camera_tracked or lbl in camera_tracked):
+                seen[lbl] = None
+        return list(seen)
+    
+    async def _save_zones_via_config_set(
+        self,
+        frigate_zones: dict[str, Any],
+        new_mapping: dict[str, int],
+    ) -> None:
+        """Push zones to Frigate via PUT /api/config/set (deep-merge)."""
+        if not frigate_zones:
+            self.logger.warning("Zone sync: no valid zones to push to Frigate")
+            return
+
+        payload = {
+            "requires_restart": 1,
+            "config_data": {
+                "cameras": {
+                    self.args.frigate_camera: {"zones": frigate_zones}
+                }
+            },
+        }
+        try:
+            session = await self._get_session()
+            async with session.put(
+                f"{self.args.frigate_http_url}/api/config/set", json=payload
+            ) as resp:
+                if resp.status == 200:
+                    self._frigate_zone_to_unifi_id = new_mapping
+                    self.logger.info(
+                        "Zone sync: pushed %d zone(s) to Frigate camera '%s': %s",
+                        len(new_mapping), self.args.frigate_camera, list(new_mapping.keys()),
+                    )
+                else:
+                    body = await resp.text()
+                    self.logger.error(
+                        "Zone sync: Frigate config API returned %d: %s", resp.status, body
+                    )
+        except Exception:
+            self.logger.exception("Zone sync: failed to push zones to Frigate")
+
+    # ---------------------------------------------------------------------------
+    # Label / type helpers
+    # ---------------------------------------------------------------------------     
+     
     @classmethod
     def label_to_object_type(cls, label: str) -> Optional[SmartDetectObjectType]:
         if label == "person":
@@ -344,6 +590,21 @@ class FrigateCam(RTSPCam):
         )
         
         return (snapshot_crop, snapshot_fov, heatmap)
+
+    # ---------------------------------------------------------------------------
+    # HTTP session management
+    # ---------------------------------------------------------------------------
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the shared aiohttp session, creating it if necessary."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def _close_session(self) -> None:
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     async def run(self) -> None:
         has_connected = False

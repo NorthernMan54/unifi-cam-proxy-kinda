@@ -21,15 +21,19 @@ import websockets
 from unifi.core import RetryableError
 from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers
 
+from ..protect_api.protect_api import (
+    EventSmartDetect,
+    SmartDetectPayload,
+    SmartDetectObjectType,
+    SmartDetectEdgeType,
+    ZoneStatus,
+    TrackerAttr,
+    SmartDetectSnapshot,
+    SmartDetectDescriptor,
+    ProtectResponseMessage,
+)
+
 AVClientRequest = AVClientResponse = dict[str, Any]
-
-
-class SmartDetectObjectType(Enum):
-    PERSON = "person"
-    VEHICLE = "vehicle"
-    ANIMAL = "animal"
-    PACKAGE = "package"
-
 
 class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, metaclass=ABCMeta):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
@@ -127,6 +131,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "video2": (1280, 704),   # Medium quality default
             "video3": (640, 360),    # Low quality default
         }
+
+        # --- Zone state ---------------------------------------------------
+        self._privacy_zones: dict[int, dict[str, Any]] = {}
+        self._exclude_zones: dict[str, dict[str, Any]] = {}
+        self._clarity_zones: dict[str, dict[str, Any]] = {}
 
         # Analytics event linger settings
         # Delay sending EventAnalytics start until the event has been active for this duration (milliseconds)
@@ -265,14 +274,38 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"(updated {len(descriptor_history)} descriptor entries)"
             )
 
+
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
             "mic": True,
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
+            "privacyMask": True,                            # Indicates whether privacy masks are supported at all
+            "privacyMasks": {"maxZones": 16, "rectangleOnly": False},
+            "smartDetect": [e.value for e in SmartDetectObjectType],
+            # Must be arrays (not null) to enable the respective Protect UI menus.
+            "excludeZone": [],
+            "clarityZones": [],
         }
 
+    async def get_privacy_zones(self) -> list[dict[str, Any]]:
+        return list(self._privacy_zones.values())
+
+    async def change_privacy_zones(self, zones: list[dict[str, Any]]) -> None:
+        pass
+
+    async def get_exclude_zones(self) -> dict[str, dict[str, Any]]:
+        return dict(self._exclude_zones)
+
+    async def change_exclude_zones(self, zones: dict[str, dict[str, Any]]) -> None:
+        pass
+
+    async def get_clarity_zones(self) -> dict[str, dict[str, Any]]:
+        return dict(self._clarity_zones)
+
+    async def change_clarity_zones(self, zones: dict[str, dict[str, Any]]) -> None:
+        pass
 
     ###
 
@@ -1484,9 +1517,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "UpdateUsernamePassword", response_to=m["messageId"]
             )
         elif fn == "ChangeSmartDetectSettings":
-            res = self.gen_response(
-                "ChangeSmartDetectSettings", response_to=m["messageId"]
-            )
+            await self.process_smart_detect_settings(m)
+            res = self.gen_response("ChangeSmartDetectSettings", response_to=m["messageId"])
         elif fn == "ChangeAudioEventsSettings":
             res = self.gen_response(
                 "ChangeAudioEventsSettings", response_to=m["messageId"]
@@ -1504,9 +1536,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "SmartMotionTest", response_to=m["messageId"]
             )
         elif fn == "ChangeClarityZones":
-            res = self.gen_response(
-                "ChangeClarityZones", response_to=m["messageId"]
-            )
+            res = await self.process_clarity_zones(m)
+        elif fn == "ChangePrivacyZones":
+            res = await self.process_privacy_zones(m)
         elif fn == "UpdateFirmwareRequest":
             await self.process_upgrade(m)
             return True
