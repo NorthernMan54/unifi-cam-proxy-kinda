@@ -89,6 +89,8 @@ class FrigateCam(RTSPCam):
                 "smartDetect": [
                     "person",
                     "vehicle",
+                    "animal",
+                    "package",
                 ],
             },
         }
@@ -96,9 +98,17 @@ class FrigateCam(RTSPCam):
     @classmethod
     def label_to_object_type(cls, label: str) -> Optional[SmartDetectObjectType]:
         if label == "person":
+            # Available: person, face
             return SmartDetectObjectType.PERSON
-        elif label in {"vehicle", "car", "motorcycle", "bus"}:
+        elif label in {"vehicle", "car", "motorcycle", "school_bus", "license_plate"}:
+            # Available: car, motorcycle, bicycle, boat, school_bus, license_plate
             return SmartDetectObjectType.VEHICLE
+        elif label in {"cat", "dog", "horse", "rabbit", "squirrel", "goat"}:
+            # Available: dog, cat, deer, horse, bird, raccoon, fox, bear, cow, squirrel, goat, rabbit, skunk, kangaroo
+            return SmartDetectObjectType.ANIMAL
+        elif label in {"package"}:
+            # Available: package
+            return SmartDetectObjectType.PACKAGE
 
     def build_descriptor_from_frigate_msg(
         self, frigate_msg: dict[str, Any], object_type: SmartDetectObjectType
