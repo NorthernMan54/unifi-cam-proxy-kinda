@@ -177,7 +177,7 @@ class SnapshotHandlers:
         Returns:
             URL to Frigate's latest.jpg endpoint
         """
-        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
+        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg".lower()
         
         # Add quality params for thumbnails
         if snapshot_type == "motionSnapshot":
