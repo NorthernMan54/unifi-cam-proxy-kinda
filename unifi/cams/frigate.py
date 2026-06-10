@@ -26,6 +26,8 @@ from ..protect_api.protect_api import (
     ProtectResponseMessage,
 )
 
+frigate_zone_mapping: dict[str, int] = {}
+
 class FrigateCam(RTSPCam):
     # ---------------------------------------------------------------------------
     # Class-level constants and label maps
@@ -199,8 +201,9 @@ class FrigateCam(RTSPCam):
         """
         camera_tracked = await self._fetch_camera_tracked_objects()
 
+        global frigate_zone_mapping
         frigate_zones: dict[str, Any] = {}
-        new_mapping: dict[str, int] = {}
+        frigate_zone_mapping = {}
 
         for zone_id_str, zone_data in unifi_zones.items():
             try:
@@ -234,13 +237,13 @@ class FrigateCam(RTSPCam):
                 "inertia": 3,
                 "loitering_time": 0,
             }
-            new_mapping[zone_name] = zone_id
+            frigate_zone_mapping[zone_name] = zone_id
             self.logger.debug(
                 "Zone sync: unifi zone %d → '%s' coords=%s objects=%s",
                 zone_id, zone_name, frigate_coords, frigate_objects,
             )
 
-        await self._save_zones_via_config_set(frigate_zones, new_mapping)
+        await self._save_zones_via_config_set(frigate_zones, frigate_zone_mapping)
 
     async def _fetch_camera_tracked_objects(self) -> set[str]:
         """Return the set of labels this camera tracks in Frigate's resolved config."""
@@ -414,9 +417,13 @@ class FrigateCam(RTSPCam):
         # Check if object is stationary
         stationary = after.get("stationary", False)
         
-        # Get current position and velocity if available
+        # Map Frigate zone names to UniFi zone IDs via frigate_zone_mapping
         current_zones = after.get("current_zones", [])
-        zones = [0] if not current_zones else [0]  # Default to zone 0
+        zones = [
+            frigate_zone_mapping[z]
+            for z in current_zones
+            if z in frigate_zone_mapping
+        ]
         
         # Extract speed information if available (Frigate provides speeds in km/h or mph)
         average_speed = after.get("average_estimated_speed", 0)
@@ -441,11 +448,11 @@ class FrigateCam(RTSPCam):
                 name = f"{license_plate} ({license_plate_score:.1%})"
             else:
                 name = license_plate
-        elif object_type == SmartDetectObjectType.VEHICLE:
-            name = "" # "No license plate available"
+        elif after.get("sub_label"):
+            name = after["sub_label"]  # Use sub_label from Frigate if available
         else:
-            name = "" # "Named by Frigate"
-
+            name= ""
+            
         descriptor = {
             "attributes": None,  # Optional and validated
             "boxColor": "red", # validated

@@ -589,6 +589,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         descriptors = []
         if custom_descriptor:
             descriptors = [custom_descriptor]
+            self.logger.debug(f"Custom descriptor provided for smart detect event {unifi_event_id}: {custom_descriptor}")
             if custom_descriptor and "confidenceLevel" in custom_descriptor:
                 try:
                     score = int(custom_descriptor.get("confidenceLevel"))
@@ -715,6 +716,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "snapshot_height": snapshot_height,
             })
             if custom_descriptor and "confidenceLevel" in custom_descriptor:
+                self.logger.debug(f"Custom descriptor provided for smart detect event {unifi_event_id}: {custom_descriptor}")
                 try:
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
@@ -780,7 +782,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 event_timestamp=frame_time_ms or event_timestamp
             )
         
-        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
+        self.logger.debug(f"Custom descriptor provided for smart detect event {unifi_event_id}: {custom_descriptor}")
+        zonesStatus = {"3": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
         
         # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
         smart_detect_snapshots = []
@@ -788,6 +791,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         # Use descriptor history if available, otherwise use last descriptor
         descriptors_to_process = active_event.get("descriptor_history", [])
+        self.logger.debug(f"descriptors_to_process {descriptors_to_process}")
         if not descriptors_to_process and custom_descriptor:
             # Fallback: create a single entry from the final descriptor
             snapshot_width, snapshot_height = self._calculate_snapshot_dimensions(custom_descriptor)
@@ -829,6 +833,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         # Build smartDetectSnapshots array from best descriptors (one per tracker ID)
         for tracker_id, desc_entry in best_descriptors_by_tracker.items():
+
+            self.logger.debug(f"tracker_id {tracker_id} desc_entry {desc_entry}")
             descriptor = desc_entry["descriptor"]
             zones = descriptor.get("zones", [1])
             
