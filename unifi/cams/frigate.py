@@ -637,12 +637,27 @@ class FrigateCam(RTSPCam):
                             elif message.topic.matches(
                                 f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/motion"
                             ):
-                                tg.create_task(self.handle_motion_event(message))   
+                                tg.create_task(self.handle_motion_event(message)) 
+                            elif message.topic.matches(f"{self.args.mqtt_prefix}/reviews"):
+                                tg.create_task(self.handle_review_event(message))
+                            elif message.topic.matches(f"{self.args.mqtt_prefix}/tracked_object_update"):
+                                tg.create_task(self.handle_object_update(message))
+
             except MqttError:
                 if not has_connected:
                     raise
 
         await mqtt_connect()
+
+    # ---------------------------------------------------------------------------
+    # MQTT message handlers
+    # ---------------------------------------------------------------------------
+
+    async def handle_review_event(self, message: Message) -> None:
+        self.logger.debug("Frigate Message: review event: %s", message.payload) 
+
+    async def handle_object_update(self, message: Message) -> None:
+        self.logger.debug("Frigate Message: tracked object update: %s", message.payload)
 
     async def handle_motion_event(self, message: Message) -> None:
         """Handle raw motion events from Frigate (if needed)"""
