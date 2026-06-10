@@ -739,7 +739,7 @@ class FrigateCam(RTSPCam):
         try:
             frigate_msg = json.loads(message.payload.decode())
             event_type = frigate_msg.get("type")
-            event_id = frigate_msg.get("after", {}).get("id")
+            frigate_detection_id = frigate_msg.get("after", {}).get("id")
             camera = frigate_msg.get("after", {}).get("camera")
             label = frigate_msg.get("after", {}).get("label")
             
@@ -751,7 +751,7 @@ class FrigateCam(RTSPCam):
                 return
             
             self.logger.debug(
-                    f"Frigate: Received: {frigate_msg} "
+                    f"Frigate Message: event received: {frigate_msg} "
                 )
 
             before_snapshot_time = frigate_msg.get('before', {}).get('snapshot', {}).get('frame_time', 'N/A') if frigate_msg.get('before', {}).get('snapshot') else 'N/A'
@@ -772,30 +772,30 @@ class FrigateCam(RTSPCam):
             if not object_type:
                 self.logger.warning(
                     f"MISSED EVENT: Received unsupported detection label type: {label} "
-                    f"(event_id={event_id}, type={event_type})"
+                    f"(frigate_detection_id={frigate_detection_id}, type={event_type})"
                 )
                 return
 
             self.logger.debug(
-                f"Frigate event: type={event_type}, id={event_id}, label={label}, "
+                f"Frigate event: type={event_type}, id={frigate_detection_id}, label={label}, "
                 f"active_frigate_events={list(self.frigate_to_unifi_event_map.keys())}"
             )
 
             if event_type == "new":
-                if event_id in self.frigate_to_unifi_event_map:
+                if frigate_detection_id in self.frigate_to_unifi_event_map:
                     self.logger.warning(
-                        f"Received 'new' event for already active Frigate event_id={event_id}. "
+                        f"Received 'new' event for already active Frigate frigate_detection_id={frigate_detection_id}. "
                         f"This may indicate event was not properly ended. Stopping old event first."
                     )
                     # Stop the old event before starting new one
-                    old_unifi_id = self.frigate_to_unifi_event_map[event_id]
+                    old_unifi_id = self.frigate_to_unifi_event_map[frigate_detection_id]
                     if old_unifi_id in self._active_smart_events:
                         old_event = self._active_smart_events[old_unifi_id]
-                        await self.trigger_smart_detect_stop(old_event["object_type"], event_id=old_unifi_id)
-                    del self.frigate_to_unifi_event_map[event_id]
+                        await self.trigger_smart_detect_stop(old_event["object_type"], frigate_detection_id=old_unifi_id)
+                    del self.frigate_to_unifi_event_map[frigate_detection_id]
                 
                 # Create snapshot ready event for this Frigate event
-                self.event_snapshot_ready[event_id] = asyncio.Event()
+                self.event_snapshot_ready[frigate_detection_id] = asyncio.Event()
                 
                 # Send smart detect event as update to existing motion event
                 # Build custom descriptor from Frigate data
@@ -805,32 +805,32 @@ class FrigateCam(RTSPCam):
                 start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms
                 frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
                  
-                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, frame_time_ms)
+                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, frame_time_ms, frigate_detection_id=frigate_detection_id)
                 
                 # Store mapping from Frigate event ID to UniFi event ID
-                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
+                self.frigate_to_unifi_event_map[frigate_detection_id] = unifi_event_id
                 
                 # Track event creation time as last update
                 self.event_last_update[unifi_event_id] = time.time()
                 
                 self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Frigate: Starting {label} smart event within motion context (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
                 )
                 
                 self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                    f"Frigate: Starting {label} smart event within motion context (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
                 )
 
             elif event_type == "update":
-                if event_id in self.frigate_to_unifi_event_map:
-                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
+                if frigate_detection_id in self.frigate_to_unifi_event_map:
+                    unifi_event_id = self.frigate_to_unifi_event_map[frigate_detection_id]
                     
                     # Verify the UniFi event is still active
                     if unifi_event_id not in self._active_smart_events:
                         self.logger.warning(
-                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
+                            f"Frigate event {frigate_detection_id} maps to UniFi event {unifi_event_id} "
                             f"but that event is not active. Skipping update."
                             f"active _active_smart_events: {list(self._active_smart_events.keys())}"
                         )
@@ -843,7 +843,7 @@ class FrigateCam(RTSPCam):
 
                     frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     # Send moving update with updated bounding box
-                    await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
+                    await self.trigger_smart_detect_update(object_type, unifi_event_id=unifi_event_id, custom_descriptor=custom_descriptor, event_timestamp=frame_time_ms)
                     
                     # Update last update time for timeout tracking
                     self.event_last_update[unifi_event_id] = time.time()
@@ -851,7 +851,7 @@ class FrigateCam(RTSPCam):
                     # Fetch and cache snapshots if available
                     has_snapshot = after_data.get('has_snapshot', False)
                     if has_snapshot and self.args.frigate_http_url:
-                        self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
+                        self.logger.debug(f"Event {frigate_detection_id} has updated snapshot, fetching and caching all types...")
                         try:
                             # Fetch snapshots using the UniFi event ID
                             snapshot_crop, snapshot_fov, heatmap = await self.fetch_snapshots_for_event(
@@ -877,28 +877,28 @@ class FrigateCam(RTSPCam):
                     event_data = self._active_smart_events[unifi_event_id]
                     event_age = time.time() - event_data["start_time"]
                     self.logger.debug(
-                        f"Sent moving update for smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                        f"Sent moving update for smart event (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "
                         f"Age: {event_age:.1f}s"
                     )
                 else:
                     self.logger.warning(
-                        f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
+                        f"MISSED EVENT: Received 'update' for unknown Frigate event_id={frigate_detection_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
                     
             elif event_type == "end":
-                if event_id in self.frigate_to_unifi_event_map:
-                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
+                if frigate_detection_id in self.frigate_to_unifi_event_map:
+                    unifi_event_id = self.frigate_to_unifi_event_map[frigate_detection_id]
                     
                     # Verify the UniFi event is still active
                     if unifi_event_id not in self._active_smart_events:
                         self.logger.warning(
-                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
+                            f"Frigate event {frigate_detection_id} maps to UniFi event {unifi_event_id} "
                             f"but that event is not active. Cleaning up mapping."
                         )
-                        del self.frigate_to_unifi_event_map[event_id]
-                        if event_id in self.event_snapshot_ready:
-                            del self.event_snapshot_ready[event_id]
+                        del self.frigate_to_unifi_event_map[frigate_detection_id]
+                        if frigate_detection_id in self.event_snapshot_ready:
+                            del self.event_snapshot_ready[frigate_detection_id]
                         return
                     
                     event_data = self._active_smart_events.get(unifi_event_id)
@@ -906,9 +906,9 @@ class FrigateCam(RTSPCam):
                         self.logger.warning(
                             f"Event data missing for UniFi event {unifi_event_id}. Cleaning up mapping."
                         )
-                        del self.frigate_to_unifi_event_map[event_id]
-                        if event_id in self.event_snapshot_ready:
-                            del self.event_snapshot_ready[event_id]
+                        del self.frigate_to_unifi_event_map[frigate_detection_id]
+                        if frigate_detection_id in self.event_snapshot_ready:
+                            del self.event_snapshot_ready[frigate_detection_id]
                         return
                     
                     # Build final descriptor from end event data
@@ -920,7 +920,7 @@ class FrigateCam(RTSPCam):
                     
                     event_duration = time.time() - event_data["start_time"]
                     self.logger.info(
-                        f"Frigate: Ending {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
+                        f"Frigate: Ending {label} smart event within motion context (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "
                         f"Duration: {event_duration:.1f}s"
                     )
                     self.logger.debug(
@@ -931,31 +931,31 @@ class FrigateCam(RTSPCam):
                     # Pass both end_time (for stop event) and frame_time (for final update)
                     await self.trigger_smart_detect_stop(
                         object_type, 
-                        final_descriptor, 
-                        end_time_ms, 
-                        event_id=unifi_event_id,
+                        unifi_event_id=unifi_event_id,
+                        custom_descriptor=final_descriptor, 
+                        event_timestamp=end_time_ms, 
                         frame_time_ms=frame_time_ms
                     )
                     
                     # Clean up mappings
-                    del self.frigate_to_unifi_event_map[event_id]
-                    if event_id in self.event_snapshot_ready:
-                        del self.event_snapshot_ready[event_id]
+                    del self.frigate_to_unifi_event_map[frigate_detection_id]
+                    if frigate_detection_id in self.event_snapshot_ready:
+                        del self.event_snapshot_ready[frigate_detection_id]
                     if unifi_event_id in self.event_last_update:
                         del self.event_last_update[unifi_event_id]
                     
                     self.logger.info(
-                        f"Frigate: Event {event_id} ended. "
+                        f"Frigate: Event {frigate_detection_id} ended. "
                         f"Remaining active events: {len(self.frigate_to_unifi_event_map)}"
                     )
                 else:
                     self.logger.warning(
-                        f"MISSED EVENT: Received 'end' for unknown Frigate event_id={event_id} "
+                        f"MISSED EVENT: Received 'end' for unknown Frigate event_id={frigate_detection_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
             else:
                 self.logger.debug(
-                    f"Received unhandled event type: {event_type} for event_id={event_id}"
+                    f"Received unhandled event type: {event_type} for event_id={frigate_detection_id}"
                 )
                 
         except json.JSONDecodeError:

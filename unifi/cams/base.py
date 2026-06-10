@@ -552,6 +552,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
+        frigate_detection_id: Optional[str] = None,
     ) -> int:
         """
         Start a smart detect event for a specific object type.
@@ -570,19 +571,19 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         # Embedding time reduces collisions across restarts/instances while keeping a small
         # incrementing counter for uniqueness within the same millisecond.
         epoch_ms = int(time.time() * 1000)
-        event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
+        unifi_event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
         self._motion_event_id += 1
         
         # Check if we already have an active smart detect event with this event_id
-        if event_id in self._active_smart_events:
-            existing_event = self._active_smart_events[event_id]
+        if unifi_event_id in self._active_smart_events:
+            existing_event = self._active_smart_events[unifi_event_id]
             self.logger.warning(
-                f"Smart detect event {event_id} already active "
+                f"Smart detect event {unifi_event_id} already active "
                 f"(type: {existing_event['object_type'].value}, "
                 f"started: {current_time - existing_event['start_time']:.1f}s ago). "
                 f"Ignoring duplicate start for {object_type.value}."
             )
-            return event_id
+            return unifi_event_id
         zonesStatus = {"1": {"level": 60, "status": "enter"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
@@ -603,7 +604,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "enter",
-            "eventId": event_id,
+            "eventId": unifi_event_id,
             "objectTypes": [object_type.value],
                 "smartDetectSnapshotFullFoV": "",
                 "smartDetectSnapshotFullFoVHeight": 0,
@@ -625,7 +626,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         self._cleanup_old_smart_events()
         
         # Track this smart detect event
-        self._active_smart_events[event_id] = {
+        self._active_smart_events[unifi_event_id] = {
+            "frigate_detection_id": frigate_detection_id,  # Optional ID from Frigate for correlation
             "object_type": object_type,
             "start_time": current_time,
             "end_time": None,  # Will be set when event ends
@@ -647,7 +649,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             # to get actual dimensions from the image file
             snapshot_width, snapshot_height = (640, 360)  # Default dimensions
             
-            self._active_smart_events[event_id]["descriptor_history"].append({
+            self._active_smart_events[unifi_event_id]["descriptor_history"].append({
                 "descriptor": custom_descriptor,
                 "timestamp_ms": event_timestamp or int(round(time.time() * 1000)),
                 "monotonic": int(self.get_uptime()),
@@ -659,9 +661,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         if self._active_analytics_event_id is not None:
             active_analytics = self._analytics_event_history.get(self._active_analytics_event_id)
             if active_analytics:
-                active_analytics["smart_detect_event_ids"].append(event_id)
+                active_analytics["smart_detect_event_ids"].append(unifi_event_id)
                 self.logger.debug(
-                    f"Associated smart detect event {event_id} ({object_type.value}) "
+                    f"Associated smart detect event {unifi_event_id} ({object_type.value}) "
                     f"with analytics event {self._active_analytics_event_id}. "
                     f"Total smart detects for this analytics event: "
                     f"{len(active_analytics['smart_detect_event_ids'])}"
@@ -672,11 +674,12 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         self._motion_object_type = object_type
         self._motion_last_descriptor = custom_descriptor
         
-        return event_id
+        return unifi_event_id
 
     async def trigger_smart_detect_update(
         self,
         object_type: SmartDetectObjectType,
+        unifi_event_id: int,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
     ) -> None:
@@ -685,24 +688,12 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         Args:
             object_type: The type of object to update
+            unifi_event_id: The UniFi event ID for this smart detect event
             custom_descriptor: Updated descriptor data (bounding box, etc.)
             event_timestamp: Optional timestamp for the event
         """
-        # Find the active smart detect event with matching object type
-        event_id = None
-        for eid, event in self._active_smart_events.items():
-            if event["object_type"] == object_type:
-                event_id = eid
-                break
-        
-        if event_id is None:
-            self.logger.warning(
-                f"trigger_smart_detect_update called for {object_type.value} "
-                f"but no active event found. Event may have already ended or never started. Ignoring."
-            )
-            return
-        
-        active_event = self._active_smart_events[event_id]
+
+        active_event = self._active_smart_events[unifi_event_id]
         zonesStatus = {"1": {"level": 75, "status": "moving"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
@@ -738,7 +729,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "moving",
-            "eventId": event_id,
+            "eventId": unifi_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": "",
             "smartDetectSnapshotFullFoVHeight": 0,
@@ -748,7 +739,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         }
         
         self.logger.debug(
-            f"Updating smart detect event {event_id} for {object_type.value}"
+            f"Updating smart detect event {unifi_event_id} for {object_type.value}"
         )
         
         await self.send(
@@ -758,9 +749,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     async def trigger_smart_detect_stop(
         self,
         object_type: SmartDetectObjectType,
+        unifi_event_id: int,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
-        event_id: Optional[int] = None,
         frame_time_ms: Optional[int] = None,
     ) -> None:
         """
@@ -768,42 +759,19 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         Args:
             object_type: The type of object to stop detecting
-            custom_descriptor: Optional final descriptor data. If provided, sends a final update before stopping.
-            event_timestamp: Optional timestamp for the stop event
-            event_id: Optional specific event ID to stop. If not provided, stops the first active event of the given object type.
-            frame_time_ms: Optional frame timestamp for the final update (if custom_descriptor provided)
+            unifi_event_id: int: The UniFi event ID for this smart detect event,
+            custom_descriptor: Optional[dict[str, Any]] = None,
+            event_timestamp: Optional[float] = None,
+            frame_time_ms: Optional[int] = None,
         """
-        # Find the active smart detect event
-        target_event_id = event_id
         
-        if target_event_id is None:
-            # Fallback to finding by object type (legacy behavior)
-            for eid, event in self._active_smart_events.items():
-                if event["object_type"] == object_type:
-                    target_event_id = eid
-                    break
-        
-        if target_event_id is None:
-            self.logger.warning(
-                f"trigger_smart_detect_stop called for {object_type.value} "
-                f"but no active event found. Event may have already ended or never started. Ignoring."
-            )
-            return
-            
-        if target_event_id not in self._active_smart_events:
-            self.logger.warning(
-                f"trigger_smart_detect_stop called for event {target_event_id} "
-                f"but it is not in active events list. Ignoring."
-            )
-            return
-        
-        active_event = self._active_smart_events[target_event_id]
+        active_event = self._active_smart_events[unifi_event_id]
         
         # If a custom_descriptor is provided, send it as a final update first
         # so UniFi Protect receives the final bounding box and snapshot
         if custom_descriptor:
             self.logger.debug(
-                f"Sending final update with custom descriptor before stopping event {target_event_id}"
+                f"Sending final update with custom descriptor before stopping event {unifi_event_id}"
             )
             await self.trigger_smart_detect_update(
                 object_type,
@@ -917,7 +885,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         # Get the full FoV snapshot path and dimensions from the event
         snapshot_fov_path = active_event.get("snapshot_fov_path")
-        fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"smartdetectsnap_{target_event_id}_fullfov.jpg"
+        fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"smartdetectsnap_{unifi_event_id}_fullfov.jpg"
         
         # Get FoV dimensions - try to read from the actual FoV file if available
         if snapshot_fov_path:
@@ -935,7 +903,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": [],         # This is empty on stop events
             "displayTimeoutMSec": 2000,
             "edgeType": "leave",
-            "eventId": target_event_id,
+            "eventId": unifi_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": fov_filename,
             "smartDetectSnapshotFullFoVHeight": fov_height,
@@ -947,7 +915,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         
         duration = time.time() - active_event["start_time"]
         self.logger.info(
-            f"Stopping smart detect event {target_event_id} for {object_type.value} "
+            f"Stopping smart detect event {unifi_event_id} for {object_type.value} "
             f"(duration: {duration:.1f}s, active smart events: "
             f"{len([e for e in self._active_smart_events.values() if e.get('end_time') is None])})"
         )
