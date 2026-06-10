@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-import aiohttp
+import aiohttp # type: ignore
 
 
 class SnapshotHandlers:
@@ -41,6 +41,73 @@ class SnapshotHandlers:
             self._motion_snapshot_fov = fov
         if heatmap is not None:
             self._motion_heatmap = heatmap
+
+    async def process_smart_motion_test_request(
+        self, msg: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """
+        Process a snapshot request from UniFi Protect.
+        
+        Handles cached snapshot files (from motion events) and fallback to Frigate API.
+
+        {'from': 'UniFiVideo', 'to': 'ubnt_avclient', 'responseExpected': True, 'functionName': 'SmartMotionTest', 'messageId': 34907, 'inResponseTo': 0, 'payload': {'heatmapUploadKind': 'httppost', 'httpPostUri': 'https://192.168.1.1:7444/live-heatmap/6a20294703dedd03e40302f9', 'lingerTestStopSec': 3600, 'pulsePeriodMs': 200}}
+        """
+
+        return self.gen_response(
+            "SmartMotionTest", response_to=msg["messageId"]
+            )
+    
+        heatmapUploadKind = msg["payload"]["heatmapUploadKind"]
+        httpPostUri = msg["payload"]["httpPostUri"]
+        
+        self.logger.debug(f"Motion Snapshot request: heatmapUploadKind={heatmapUploadKind}, httpPostUri={httpPostUri}")
+        
+        # Try to find cached snapshot file from event history
+        cached_path = self._find_cached_snapshot(filename, snapshot_type)
+        snapshot_path = None
+        
+        if cached_path and cached_path.exists():
+            # Serve cached snapshot
+            snapshot_path = cached_path
+            self.logger.info(f"Serving cached {snapshot_type} from {cached_path}")
+            await self._upload_file_to_protect(
+                cached_path,
+                msg["payload"]["uri"],
+                msg["payload"].get("formFields", {}),
+                snapshot_type
+            )
+        else:
+            # Fallback to Frigate API or regular snapshot
+            use_frigate = (
+                hasattr(self.args, 'frigate_http_url') and 
+                self.args.frigate_http_url
+            )
+            
+            if use_frigate:
+                # Fetch from Frigate latest.jpg endpoint
+                snapshot_url = self._build_frigate_fallback_url(snapshot_type)
+                self.logger.info(f"Fetching {snapshot_type} from Frigate (no cached): {snapshot_url}")
+                await self._fetch_and_upload_snapshot(
+                    snapshot_url,
+                    msg["payload"]["uri"],
+                    msg["payload"].get("formFields", {}),
+                    snapshot_type
+                )
+            else:
+                # Use regular snapshot method
+                snapshot_path = await self._process_motion_event_snapshot(msg, snapshot_type)
+        
+        if msg["responseExpected"]:
+            # Get image dimensions for the response
+            width, height = (640, 360)  # Default dimensions
+            if snapshot_path and hasattr(self, '_get_image_dimensions'):
+                width, height = self._get_image_dimensions(snapshot_path)
+            
+            return self.gen_response(
+                "GetRequest", 
+                response_to=msg["messageId"],
+                payload={"height": height, "width": width}
+            )
 
     async def process_snapshot_request(
         self, msg: dict[str, Any]

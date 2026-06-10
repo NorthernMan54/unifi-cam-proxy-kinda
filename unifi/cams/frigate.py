@@ -7,10 +7,10 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-import aiohttp
-import backoff
-from aiomqtt import Client, Message
-from aiomqtt.exceptions import MqttError
+import aiohttp # type: ignore
+import backoff # type: ignore
+from aiomqtt import Client, Message # type: ignore
+from aiomqtt.exceptions import MqttError # type: ignore
 
 from unifi.cams.rtsp import RTSPCam
 
@@ -812,11 +812,6 @@ class FrigateCam(RTSPCam):
                 
                 # Track event creation time as last update
                 self.event_last_update[unifi_event_id] = time.time()
-                
-                self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "
-                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
-                )
                 
                 self.logger.info(
                     f"Frigate: Starting {label} smart event within motion context (Frigate: {frigate_detection_id}, UniFi: {unifi_event_id}). "

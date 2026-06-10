@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-import aiohttp
-import websockets
+import aiohttp # type: ignore
+import websockets # type: ignore
 
 from unifi.core import RetryableError
 from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers
@@ -472,7 +472,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             # Try to read image dimensions without loading the entire image
             # This works with PIL/Pillow if available
             try:
-                from PIL import Image
+                from PIL import Image # type: ignore
                 with Image.open(image_path) as img:
                     return img.size  # Returns (width, height)
             except ImportError:
@@ -614,7 +614,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         }
         
         self.logger.info(
-            f"Starting smart detect event {event_id} for {object_type.value} "
+            f"Starting smart detect event {unifi_event_id} for {object_type.value} "
             f"(active smart events: {len(self._active_smart_events)})"
         )
         
@@ -775,8 +775,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             )
             await self.trigger_smart_detect_update(
                 object_type,
-                custom_descriptor,
-                frame_time_ms or event_timestamp
+                unifi_event_id=unifi_event_id,
+                custom_descriptor=custom_descriptor,
+                event_timestamp=frame_time_ms or event_timestamp
             )
         
         zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
@@ -1504,9 +1505,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         elif fn == "ChangeSmartMotionSettings":
             res = await self.process_smart_motion_settings(m)
         elif fn == "SmartMotionTest":
-            res = self.gen_response(
-                "SmartMotionTest", response_to=m["messageId"]
-            )
+            res = await self.process_smart_motion_test_request(m)
         elif fn == "ChangeClarityZones":
             res = await self.process_clarity_zones(m)
         elif fn == "ChangePrivacyZones":
