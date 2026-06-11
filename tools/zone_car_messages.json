@@ -6,7 +6,7 @@
 			"frame_time": 1780512429.710308,
 			"snapshot": null,
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.0,
 			"false_positive": true,
 			"start_time": 1780512429.710308,
@@ -52,7 +52,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -102,7 +102,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -149,7 +149,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -199,7 +199,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -246,7 +246,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -296,7 +296,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,
@@ -343,7 +343,7 @@
 				"recognized_license_plate_score": null
 			},
 			"label": "car",
-			"sub_label": null,
+			"sub_label": ["NAME", 0.9603765632873701],
 			"top_score": 0.90478515625,
 			"false_positive": false,
 			"start_time": 1780512429.710308,

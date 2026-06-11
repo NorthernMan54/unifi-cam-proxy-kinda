@@ -47,6 +47,14 @@ async function main() {
 
     //    "frame_time": 1780844299.181006,
 
+    const now = Date.now();
+    const hrtime = process.hrtime();
+    const microseconds = (now % 1000) * 1000 + Math.floor(hrtime[1] / 1000) % 1000;
+    const firstShownTimeMs = Math.floor(now / 1000) + microseconds / 1000000;
+
+    // 			"id": "1780512429.710308-9uivz2",
+    const id = `${Math.floor(firstShownTimeMs)}.${Math.floor(microseconds * 1000)}-testmessage`;
+
     for (const [index, message] of messages.entries()) {
 
 
@@ -56,7 +64,16 @@ async function main() {
         const timestamp = Math.floor(now / 1000) + microseconds / 1000000;
 
         console.log(`Setting message ${index + 1} timestamp ${message.after.frame_time} to ${timestamp} (current time)`);
+        message.after.id = id;
         message.after.frame_time = timestamp;
+        message.after.start_time = firstShownTimeMs;
+
+        // message.after.end_time = timestamp only on the last message, so that the event is still "active" when the next message is published. This simulates a real event lifecycle where the event starts with the first message and ends after the last message.
+
+        if (index === messages.length - 1) {
+            message.after.end_time = timestamp;
+            console.log(`Setting end_time for last message to ${timestamp}`);
+        }
 
         console.log(`Publishing message ${index + 1}/${messages.length} to topic "${topic}"...`);
         var payload = JSON.stringify(message);
@@ -69,10 +86,11 @@ async function main() {
         await sleep(2); // Only sleep between messages, not after the last one
     }
 
+    await sleep(30); // Only sleep between messages, not after the last one
     await publishAsync(client, motionTopic, "OFF");
     console.log(`✓ Published "OFF" to ${motionTopic}`);
-    await sleep(2); // Only sleep between messages, not after the last one
     console.log('\n✓ All event lifecycles complete. Disconnecting...');
+    await sleep(2); // Only sleep between messages, not after the last one
     client.end();
     process.exit(0);
 }

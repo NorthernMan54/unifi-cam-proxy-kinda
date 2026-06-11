@@ -449,7 +449,11 @@ class FrigateCam(RTSPCam):
             else:
                 name = license_plate
         elif after.get("sub_label"):
-            name = after["sub_label"]  # Use sub_label from Frigate if available
+            sub_label = after["sub_label"]
+            if isinstance(sub_label, list) and len(sub_label) >= 1:
+                name = f"{sub_label[0]} ({sub_label[1]:.1%})"  # Extract the name from the sub_label list
+            else:
+                name = str(sub_label)  # Fallback to string representation
         else:
             name= ""
             
@@ -469,7 +473,7 @@ class FrigateCam(RTSPCam):
             "secondLensZones": [],  # validated Optional but included for completeness
             "speed": speed,  # Average estimated speed from Frigate
             "stationary": stationary, # validated
-            "tag": "Tagged by Frigate",  # validated
+            "tag": name,  # validated
             "trackerID": tracker_id, # validated
             "zones": zones, # validated
         }
