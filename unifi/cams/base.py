@@ -584,7 +584,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"Ignoring duplicate start for {object_type.value}."
             )
             return unifi_event_id
-        zonesStatus = {"1": {"level": 60, "status": "enter"}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 60, "status": "enter"}}  # TODO: Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -595,7 +595,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"level": score, "status": "enter"}}
+                zonesStatus = {"1": {"level": score, "status": "enter"}} # TODO: Level should be based on amount of motion
         
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -695,7 +695,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         """
 
         active_event = self._active_smart_events[unifi_event_id]
-        zonesStatus = {"1": {"level": 75, "status": "moving"}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 75, "status": "moving"}}  # TODO:Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -721,7 +721,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"level": score, "status": "moving"}}
+                zonesStatus = {"1": {"level": score, "status": "moving"}}  # TODO: Level should be based on amount of motion
         
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -783,7 +783,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             )
         
         self.logger.debug(f"Custom descriptor provided for smart detect event {unifi_event_id}: {custom_descriptor}")
-        zonesStatus = {"3": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
+        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # TODO:Example zonesStatus, can be customized
         
         # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
         smart_detect_snapshots = []
