@@ -13,7 +13,7 @@ services:
       --verbose
       --host 192.168.1.1
       --mac 'AA:BB:CC:33:44:CC'
-      --ip 192.168.254.7
+      --ip 192.168.1.42
       --cert /client.pem
       --token "GLuVqfAMLU8qjaXujLOCHxKQ7bXrdkic"
       --name "Driveway"
@@ -35,6 +35,8 @@ services:
 
   unifi-cam-backyard:
     container_name: unifi-cam-backyard
+    profiles: 
+      - disabled
     restart: unless-stopped
     build: .
     environment:
@@ -97,10 +99,8 @@ services:
       --video1 rtsp://192.168.1.3:8554/canoe_src
       --video3 rtsp://192.168.1.3:8554/canoe_video3
 #
-  unifi-cam-north-sidewalk:
-    profiles:
-      - disabled
-    container_name: unifi-cam-north-sidewalk
+  unifi-cam-side-door:
+    container_name: unifi-cam-side-door
     restart: unless-stopped
     build: .
     volumes:
@@ -111,27 +111,25 @@ services:
       --verbose
       --host 192.168.1.1
       --mac 'AA:BB:CC:33:44:BB'
-      --ip 192.168.254.10
+      --ip 192.168.1.44
       --cert /client.pem
-      --token "GLuVqfAMLU8qjaXujLOCHxKQ7bXrdkic"
+      --token "mZLBOQRasWKfnSOmLLr146bqMZMGeF85"
       --name "North Sidewalk"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
       frigate
       --timestamp-modifier 90
-      --snapshot-url "http://192.168.1.3:5000/api/north_sidewalk/latest.jpg"
+      --snapshot-url "http://192.168.1.3:5000/api/side_door/latest.jpg"
       --ffmpeg-args='-c:v copy -c:a copy'
-      --frigate-camera north_sidewalk
+      --frigate-camera side_door
       --mqtt-host 192.168.1.3
       --mqtt-prefix frigate
       --frigate-http-url http://192.168.1.3:5000
       --frigate-time-sync-ms 1105
-      --video1 rtsp://192.168.1.3:8554/north_sidewalk_src
-      --video3 rtsp://192.168.1.3:8554/north_sidewalk_video3
+      --video1 rtsp://192.168.1.3:8554/side_door_src
+#      --video3 rtsp://192.168.1.3:8554/side_door_video3
 
   unifi-cam-porch:
-    profiles:
-      - disabled
     container_name: unifi-cam-porch
     restart: unless-stopped
     build: .
@@ -143,9 +141,9 @@ services:
       --verbose
       --host 192.168.1.1
       --mac 'AA:BB:CC:33:44:AA'
-      --ip 192.168.254.6
+      --ip 192.168.1.45
       --cert /client.pem
-      --token "GLuVqfAMLU8qjaXujLOCHxKQ7bXrdkic"
+      --token "duwm0lq2MXkyEqhMhMyDEellAHqIEh1O"
       --name "Porch"
       --model "UVC G4 Dome"
       --fw-version "4.69.55"
@@ -159,4 +157,4 @@ services:
       --frigate-http-url http://192.168.1.3:5000
       --frigate-time-sync-ms 1105
       --video1 rtsp://192.168.1.3:8554/porch_src
-      --video3 rtsp://192.168.1.3:8554/porch_video3
+#      --video3 rtsp://192.168.1.3:8554/porch_video3
