@@ -20,6 +20,7 @@ class FrigateCam(RTSPCam):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
         self.args = args
+        self.frigate_detect_fps: Optional[float] = None
         # Map Frigate event IDs to UniFi event IDs for tracking
         self.frigate_to_unifi_event_map: dict[str, int] = {}
         # Store snapshot readiness per Frigate event ID
@@ -208,7 +209,11 @@ class FrigateCam(RTSPCam):
             "coord3d": [-1,-1],  # validated Required field: no 3D coordinates available
             "depth": None,  # Optional depth information
             "firstShownTimeMs": int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms,  # validated
-            "idleSinceTimeMs": int(frigate_msg.get('after', {}).get('motionless_count', 0) * 1000), # validated
+            "idleSinceTimeMs": (
+                int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)
+                - int(frigate_msg.get('after', {}).get('motionless_count', 0) * (1000 / self.frigate_detect_fps))
+                - self.args.frigate_time_sync_ms
+            ) if frigate_msg.get('after', {}).get('motionless_count', 0) > 0 else 0,
             "lines": [],  # validated Required field: no line crossing detection
             "loiterZones": [],  # validated Optional but included for completeness
             "name": name, # validated - License plate for vehicles, or default name
@@ -348,6 +353,8 @@ class FrigateCam(RTSPCam):
     async def run(self) -> None:
         has_connected = False
 
+        await self.load_frigate_detect_fps()
+
         @backoff.on_predicate(backoff.expo, max_value=60, logger=self.logger)
         async def mqtt_connect():
             nonlocal has_connected
@@ -382,6 +389,43 @@ class FrigateCam(RTSPCam):
                     raise
 
         await mqtt_connect()
+
+    async def load_frigate_detect_fps(self) -> None:
+        """Load detect FPS from Frigate config for the configured camera."""
+        frigate_url = (self.args.frigate_http_url or "http://frigate:5000").rstrip("/")
+        config_url = f"{frigate_url}/api/config"
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(config_url) as response:
+                    if response.status != 200:
+                        self.logger.warning(
+                            f"Unable to load Frigate config from {config_url}: HTTP {response.status}"
+                        )
+                        return
+
+                    config = await response.json()
+
+            detect_fps = (
+                config.get("cameras", {})
+                .get(self.args.frigate_camera, {})
+                .get("detect", {})
+                .get("fps")
+            )
+
+            if detect_fps is None:
+                self.logger.warning(
+                    f"Frigate config missing detect.fps for camera '{self.args.frigate_camera}'"
+                )
+                return
+
+            self.frigate_detect_fps = float(detect_fps)
+            self.logger.info(
+                f"Frigate detect FPS for camera '{self.args.frigate_camera}': {self.frigate_detect_fps}"
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
+            self.logger.warning(f"Failed to fetch Frigate detect FPS from {config_url}: {e}")
 
     async def handle_motion_event(self, message: Message) -> None:
         """Handle raw motion events from Frigate (if needed)"""
