@@ -25,8 +25,9 @@ class Core(object):
 
     async def run(self) -> None:
         uri = "wss://{}:7442/camera/1.0/ws?token={}".format(self.host, self.token)
-        headers = {"camera-mac": self.mac}
-        # "camera-model": "0xa591" - G5 Bullet
+        headers = {
+            "camera-mac": self.mac,
+            "camera-model": "0xa573" }         # "UVC_G4_DOME": "0xa573",
         has_connected = False
 
         @backoff.on_predicate(
