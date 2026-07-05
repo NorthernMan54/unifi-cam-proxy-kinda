@@ -26,7 +26,9 @@ class Core(object):
     async def run(self) -> None:
         uri = "wss://{}:7442/camera/1.0/ws?token={}".format(self.host, self.token)
         headers = {
-            "camera-mac": self.mac,
+            "camera-mac": self.mac.replace(":", "")
+                            .replace("-", "")
+                            .upper(),
             "camera-model": "0xa573" }         # "UVC_G4_DOME": "0xa573",
         has_connected = False
 

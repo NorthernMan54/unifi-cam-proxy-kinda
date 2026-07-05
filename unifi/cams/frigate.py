@@ -4,6 +4,7 @@ import json
 import logging
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,12 +16,97 @@ from aiomqtt.exceptions import MqttError
 from unifi.cams.base import SmartDetectObjectType
 from unifi.cams.rtsp import RTSPCam
 
+# --- Zone status decay tuning (see protocol spec Section 8.5) -----------------
+# Zone occupancy in real UniFi Protect devices is a smoothed/decaying aggregate
+# signal, not a hard per-object boolean: once an occupying object leaves a zone,
+# the zone's reported "level" decays gradually over several ticks before the
+# status flips from "moving" to "leave". These constants approximate that
+# behavior; tune DECAY_PER_TICK against your own captured traffic if needed.
+ZONE_LEVEL_CONFIDENCE_OFFSET = 10  # observed: zonesStatus.level runs ~10 below confidenceLevel
+ZONE_DECAY_PER_TICK = 8
+DEFAULT_DETECT_FPS = 5.0  # Frigate's own hardcoded default for detect.fps
+DETECT_FPS_MIN, DETECT_FPS_MAX = 1.0, 30.0  # sanity bounds; guards against a bad/renamed config field
+DETECT_FPS_REFRESH_SECONDS = 300  # re-fetch periodically in case Frigate config changes live
+
+
+@dataclass
+class ZoneState:
+    """Per-zone decaying occupancy state. One instance per configured Protect zone ID."""
+
+    level: float = 0.0
+    status: str = "none"  # "none" | "enter" | "moving" | "leave"
+    was_active: bool = False
+
+    def update(self, occupied_this_tick: bool, best_confidence: float) -> None:
+        if occupied_this_tick:
+            self.level = min(100.0, max(self.level, best_confidence - ZONE_LEVEL_CONFIDENCE_OFFSET))
+            self.status = "moving" if self.was_active else "enter"
+            self.was_active = True
+        elif self.was_active:
+            self.level = max(0.0, self.level - ZONE_DECAY_PER_TICK)
+            if self.level <= 0.0:
+                self.status = "leave"
+                self.was_active = False
+            else:
+                self.status = "moving"  # still decaying, not fully cleared yet
+        else:
+            self.status = "none"
+            self.level = 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"level": int(self.level), "status": self.status}
+
+
+class ZoneStatusTracker:
+    """
+    Maintains per-zone decaying occupancy across ALL concurrently-active tracks
+    on one camera. This is intentionally decoupled from any single Frigate
+    event's lifecycle: `zonesStatus` in the real protocol reflects the union of
+    every currently-active track's zone membership, not one track's state, and
+    a track's own `leave`/closing-summary can reference a completely different
+    zone state than what's reported here on the same tick (protocol spec
+    Section 7.4/8.5).
+    """
+
+    def __init__(self, zone_ids: list[int]) -> None:
+        self._zones: dict[int, ZoneState] = {zid: ZoneState() for zid in zone_ids}
+        # occupancy contributed by each active track, keyed by tracker_id
+        self._track_zone_confidence: dict[int, dict[int, float]] = {}
+
+    def update_track(self, tracker_id: int, zone_ids: list[int], confidence: float) -> None:
+        self._track_zone_confidence[tracker_id] = {zid: confidence for zid in zone_ids}
+        self._recompute()
+
+    def remove_track(self, tracker_id: int) -> None:
+        self._track_zone_confidence.pop(tracker_id, None)
+        self._recompute()
+
+    def _recompute(self) -> None:
+        # Union of all currently-active tracks' zone membership, using max
+        # confidence per zone across occupants so one dipping tracker doesn't
+        # flicker a zone that another occupant is still solidly holding.
+        occupancy: dict[int, float] = {}
+        for zone_conf in self._track_zone_confidence.values():
+            for zid, conf in zone_conf.items():
+                occupancy[zid] = max(occupancy.get(zid, 0.0), conf)
+
+        for zid, zone_state in self._zones.items():
+            if zid in occupancy:
+                zone_state.update(True, occupancy[zid])
+            else:
+                zone_state.update(False, 0.0)
+
+    def as_dict(self) -> dict[str, dict[str, Any]]:
+        # Every configured zone must be present on every message, not just
+        # the ones that changed (protocol spec Section 3).
+        return {str(zid): state.as_dict() for zid, state in self._zones.items()}
+
 
 class FrigateCam(RTSPCam):
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
         self.args = args
-        self.frigate_detect_fps: Optional[float] = None
+        self.frigate_detect_fps: float = DEFAULT_DETECT_FPS
         # Map Frigate event IDs to UniFi event IDs for tracking
         self.frigate_to_unifi_event_map: dict[str, int] = {}
         # Store snapshot readiness per Frigate event ID
@@ -28,6 +114,72 @@ class FrigateCam(RTSPCam):
         # Track last update time for each event (for timeout detection)
         self.event_last_update: dict[int, float] = {}
         self.event_timeout_seconds = 600  # Timeout after 600 seconds (10 minutes) without updates
+
+        # Frigate zone name -> Protect numeric zone ID, static per camera.
+        # Protect has no concept of Frigate's zone names; you choose the
+        # numeric IDs yourself and must keep them consistent with whatever
+        # ChangeSmartDetectSettings zone config your emulator advertises on
+        # connect (see protocol spec Section 8.2/8.3).
+        self.zone_name_to_id: dict[str, int] = self._parse_zone_map(
+            getattr(self.args, "zone_map", None)
+        )
+        self.zone_status_tracker = ZoneStatusTracker(list(set(self.zone_name_to_id.values())))
+        # tracker_id -> Frigate event_id, needed to reverse-look-up which
+        # camera-numeric trackerID owns a closing Frigate event
+        self.unifi_tracker_id_by_frigate_event: dict[str, int] = {}
+
+        # Frigate's own event/tracker ID is a string (e.g. a UUID-like value)
+        # and is NOT reused as the numeric trackerID directly. Real UniFi
+        # Protect devices use session-scoped, monotonically-increasing
+        # integer trackerIDs (observed: 716235 -> 716236 -> 716259 across one
+        # session). Deriving trackerID via hash(frigate_id) % N is unsafe:
+        # Python's str hash is randomized per-process (unstable across
+        # restarts) and offers no uniqueness guarantee against collisions
+        # between concurrently active tracks. Instead, assign a fresh integer
+        # once per Frigate "new" event and hold it for that track's lifetime.
+        self._next_tracker_id: int = 700000  # arbitrary session-scoped base, mirrors observed value range
+        self.frigate_id_to_tracker_id: dict[str, int] = {}
+
+    def _allocate_tracker_id(self, frigate_event_id: str) -> int:
+        """Assign a fresh trackerID for a newly-started Frigate track. Call
+        exactly once per Frigate event_type == "new"."""
+        tracker_id = self._next_tracker_id
+        self._next_tracker_id += 1
+        self.frigate_id_to_tracker_id[frigate_event_id] = tracker_id
+        return tracker_id
+
+    def _get_tracker_id(self, frigate_event_id: str) -> int:
+        """Look up the trackerID already allocated for an in-progress Frigate
+        track (update/end events). Falls back to allocating one if missing
+        (e.g. a missed "new" event) so the bridge degrades gracefully rather
+        than crashing, while logging the anomaly."""
+        tracker_id = self.frigate_id_to_tracker_id.get(frigate_event_id)
+        if tracker_id is None:
+            self.logger.warning(
+                f"No trackerID allocated for Frigate event_id={frigate_event_id} "
+                f"(likely missed 'new' event); allocating one now"
+            )
+            tracker_id = self._allocate_tracker_id(frigate_event_id)
+        return tracker_id
+
+    def _release_tracker_id(self, frigate_event_id: str) -> None:
+        """Free the trackerID mapping once a Frigate track ends."""
+        self.frigate_id_to_tracker_id.pop(frigate_event_id, None)
+
+    @staticmethod
+    def _parse_zone_map(raw: Optional[str]) -> dict[str, int]:
+        """
+        Parse --zone-map JSON, e.g. '{"parking": 1, "road": 2, "sidewalk": 3}'.
+        Falls back to an empty map (all detections reported as zone-less) if
+        not provided or malformed, rather than crashing at startup.
+        """
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return {str(k): int(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
 
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
@@ -81,6 +233,18 @@ class FrigateCam(RTSPCam):
             type=int,
             help="Time synchronization offset in milliseconds to apply to Frigate event timestamps (default: 0). Positive values shift timestamps backward to compensate for Frigate event delay relative to video.",
         )
+        parser.add_argument(
+            "--zone-map",
+            required=False,
+            type=str,
+            default=None,
+            help=(
+                'JSON mapping of Frigate zone name -> Protect numeric zone ID '
+                'for this camera, e.g. \'{"parking": 1, "road": 2}\'. Must match '
+                'whatever zone IDs/polygons this emulated camera advertises via '
+                'ChangeSmartDetectSettings on connect.'
+            ),
+        )
 
     async def get_feature_flags(self) -> dict[str, Any]:
         return {
@@ -111,25 +275,50 @@ class FrigateCam(RTSPCam):
             # Available: package
             return SmartDetectObjectType.PACKAGE
 
+    def _translate_zones(self, current_zones: list[str]) -> list[int]:
+        """
+        Frigate's `current_zones` -> Protect numeric zone IDs via the static
+        per-camera map. Order preserved as given (most-recently-entered first,
+        matching Frigate's own convention); unmapped zone names are dropped
+        rather than raising, so a config gap degrades to "zone-less" instead
+        of crashing the bridge.
+        """
+        translated = []
+        for zname in current_zones:
+            zid = self.zone_name_to_id.get(zname)
+            if zid is not None:
+                translated.append(zid)
+            else:
+                self.logger.debug(
+                    f"Frigate zone '{zname}' has no entry in --zone-map for "
+                    f"camera '{self.args.frigate_camera}'; omitting from zones[]"
+                )
+        return translated
+
     def build_descriptor_from_frigate_msg(
-        self, frigate_msg: dict[str, Any], object_type: SmartDetectObjectType
+        self, frigate_msg: dict[str, Any], object_type: SmartDetectObjectType, tracker_id: int
     ) -> dict[str, Any]:
         """
         Build a UniFi Protect-compatible descriptor from Frigate event data.
-        
-        Frigate provides bounding boxes as pixel coordinates.
-        Testing with raw pixel values to see UniFi Protect's expected format.
+
+        `tracker_id` must be pre-allocated via `_allocate_tracker_id`/
+        `_get_tracker_id` -- see the trackerID allocator notes in __init__.
+        Frigate's own event id (a string) is never used as the numeric
+        trackerID directly.
+
+        Coordinate system note (confirmed against real device captures): both
+        zone polygons and descriptor bounding boxes use a normalized 0-1000
+        grid, independent of any stream's actual pixel resolution -- NOT the
+        low-res sub-stream's raw pixel space. The scaling below is correct.
         """
         after = frigate_msg.get("after", {})
         type = after.get("type", "unknown")
-        
+
         # Extract bounding box if available
         box = after.get("box")
         if box and len(box) == 4:
             # Frigate box format: [x_min, y_min, x_max, y_max] in configured pixel dimensions
-            # UniFi format: [x, y, width, height] in 1000x1000 coordinate system
-
-            # Scale factors
+            # UniFi format: [x, y, width, height] in a 0-1000 normalized coordinate system
             frigate_width = self.args.frigate_detect_width
             frigate_height = self.args.frigate_detect_height
             UNIFI_WIDTH = 1000
@@ -139,167 +328,189 @@ class FrigateCam(RTSPCam):
             x_scale = UNIFI_WIDTH / frigate_width
             y_scale = UNIFI_HEIGHT / frigate_height
 
-            # Transform coordinates
             x_min_unifi = int(box[0] * x_scale)
             y_min_unifi = int(box[1] * y_scale) + UNIFI_Y_OFFSET
             x_max_unifi = int(box[2] * x_scale)
             y_max_unifi = int(box[3] * y_scale) + UNIFI_Y_OFFSET
 
-            # Convert to UniFi format
             x = x_min_unifi
             y = y_min_unifi
             width = x_max_unifi - x_min_unifi
             height = y_max_unifi - y_min_unifi
             coord = [x, y, width, height]
         else:
-            # Fallback to default if no bounding box
             coord = [0, 0, 1920, 1080]
-        
+
         # Extract confidence score (Frigate uses 0.0-1.0, UniFi uses 0-100)
-        # If type is "end" use after.top_score if available, else after.score
         score = after.get("top_score" if type == "end" else "score", 0.95)
         confidence_level = int(score * 100)
-        
-        # Extract tracker ID if available
-        tracker_id = after.get("id", 1)
-        if isinstance(tracker_id, str):
-            # Convert string ID to numeric hash for tracker ID
-            tracker_id = hash(tracker_id) % 1000000
-        
-        # Check if object is stationary
+
         stationary = after.get("stationary", False)
-        
-        # Get current position and velocity if available
+
+        # Real zone translation (previously hardcoded to [0] regardless of
+        # Frigate's actual zone membership -- see protocol spec Section 8.4).
         current_zones = after.get("current_zones", [])
-        zones = [0] if not current_zones else [0]  # Default to zone 0
-        
-        # Extract speed information if available (Frigate provides speeds in km/h or mph)
+        zones = self._translate_zones(current_zones)
+
+        # boxColor: real devices show "red" for objects actively occupying a
+        # zone of interest and "white" for background/idle detections outside
+        # any zone (protocol spec Section 3, descriptors[].boxColor).
+        box_color = "red" if zones else "white"
+
         average_speed = after.get("average_estimated_speed", 0)
-        # Convert to appropriate units if needed
-        # UniFi Protect expects positive number or null, stored as float
         speed = float(average_speed) if average_speed > 0 else None
-        
-        # Extract license plate information if available
-        # Frigate format: ["PLATE-TEXT", confidence_score]
+
+        # License plate (vehicles) via Frigate's recognized_license_plate.
         license_plate_data = after.get("recognized_license_plate")
         license_plate = None
         license_plate_score = None
         if license_plate_data and isinstance(license_plate_data, list) and len(license_plate_data) >= 1:
-            license_plate = license_plate_data[0]  # Extract the plate text
+            license_plate = license_plate_data[0]
             if len(license_plate_data) >= 2:
-                license_plate_score = license_plate_data[1]  # Extract the confidence score
-        
-        # Set name based on object type and available data
-        # For vehicles with license plates, use the plate as the name with confidence score
+                license_plate_score = license_plate_data[1]
+
+        # Face recognition (persons) via Frigate's generic sub_label facility.
+        # Real Protect devices only populate name/tag when there's an actual
+        # recognition match (see protocol spec Section 3, name/tag) -- they
+        # are not a static branding string, so don't hardcode one here.
+        sub_label_data = after.get("sub_label")
+        recognized_name = None
+        if (
+            object_type == SmartDetectObjectType.PERSON
+            and sub_label_data
+            and isinstance(sub_label_data, list)
+            and len(sub_label_data) >= 1
+        ):
+            recognized_name = sub_label_data[0]
+
         if object_type == SmartDetectObjectType.VEHICLE and license_plate:
             if license_plate_score is not None:
                 name = f"{license_plate} ({license_plate_score:.1%})"
             else:
                 name = license_plate
-        elif object_type == SmartDetectObjectType.VEHICLE:
-            name = "" # "No license plate available"
+        elif object_type == SmartDetectObjectType.PERSON and recognized_name:
+            name = recognized_name
         else:
-            name = "" # "Named by Frigate"
+            name = ""
+
+        # Real devices mirror name into tag for the same matched entity
+        # rather than using a static "Tagged by Frigate" label.
+        tag = name
 
         descriptor = {
-            "attributes": None,  # Optional and validated
-            "boxColor": "red", # validated
-            "confidenceLevel": confidence_level, # validated
-            "coord": coord, # validated
-            "coord3d": [-1,-1],  # validated Required field: no 3D coordinates available
-            "depth": None,  # Optional depth information
-            "firstShownTimeMs": int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms,  # validated
+            "attributes": None,
+            "boxColor": box_color,
+            "confidenceLevel": confidence_level,
+            "coord": coord,
+            "coord3d": [-1, -1],
+            "depth": None,
+            "firstShownTimeMs": int(after.get("start_time", 0) * 1000) - self.args.frigate_time_sync_ms,
+            # idleSinceTimeMs derivation: converts Frigate's motionless_count
+            # (a frame counter) into an epoch-ms instant anchored to frame_time,
+            # using the camera's actual detect.fps rather than assuming
+            # 1 frame == 1 second. Recomputing this every message is safe --
+            # as long as frame_time and motionless_count advance together at a
+            # consistent fps, the derived instant stays pinned automatically
+            # (validated against real device idleSinceTimeMs behavior, which
+            # stays constant across a stationary track's lifetime).
             "idleSinceTimeMs": (
-                int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000)
-                - int(frigate_msg.get('after', {}).get('motionless_count', 0) * (1000 / self.frigate_detect_fps))
+                int(after.get("frame_time", 0) * 1000)
+                - int(after.get("motionless_count", 0) * (1000 / self.frigate_detect_fps))
                 - self.args.frigate_time_sync_ms
-            ) if frigate_msg.get('after', {}).get('motionless_count', 0) > 0 else 0,
-            "lines": [],  # validated Required field: no line crossing detection
-            "loiterZones": [],  # validated Optional but included for completeness
-            "name": name, # validated - License plate for vehicles, or default name
-            "objectType": object_type.value, # validated
-            "secondLensZones": [],  # validated Optional but included for completeness
-            "speed": speed,  # Average estimated speed from Frigate
-            "stationary": stationary, # validated
-            "tag": "Tagged by Frigate",  # validated
-            "trackerID": tracker_id, # validated
-            "zones": zones, # validated
+            ) if after.get("motionless_count", 0) > 0 else 0,
+            "lines": [],
+            "loiterZones": [],
+            "name": name,
+            "objectType": object_type.value,
+            "secondLensZones": [],
+            "speed": speed,
+            "stationary": stationary,
+            "tag": tag,
+            "trackerID": tracker_id,
+            "zones": zones,
         }
-        
-        # Only include licensePlate if it has a value
+
         if license_plate:
             descriptor["licensePlate"] = license_plate
-        
+
         self.logger.debug(
             f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
-            f"coord={coord}, stationary={stationary}, speed={speed}, licensePlate={license_plate}"
+            f"coord={coord}, stationary={stationary}, speed={speed}, "
+            f"licensePlate={license_plate}, zones={zones}, boxColor={box_color}, name={name!r}"
         )
-        
+
         return descriptor
+
+    def _update_zone_status_for_track(
+        self, tracker_id: int, zones: list[int], confidence: float, active: bool
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Feed this track's current zone membership into the shared, decaying
+        per-camera zone status tracker and return the full zonesStatus dict
+        to attach to the outgoing message. This is deliberately independent
+        of any single track's own start/update/end lifecycle -- zonesStatus
+        reflects the union of all currently-active tracks on the camera
+        (protocol spec Section 7.4/8.5), not just this one.
+        """
+        if active:
+            self.zone_status_tracker.update_track(tracker_id, zones, confidence)
+        else:
+            self.zone_status_tracker.remove_track(tracker_id)
+        return self.zone_status_tracker.as_dict()
 
     async def fetch_snapshots_for_event(
         self, event_id: int, event_type: str = "analytics"
     ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
         """
         Fetch and cache all three snapshot types for an event from Frigate.
-        
+
         Args:
             event_id: The event ID (analytics or smart detect)
             event_type: "analytics" or "smart_detect"
-            
+
         Returns:
             Tuple of (crop_path, fov_path, heatmap_path) - paths to cached snapshot files
         """
         if not self.args.frigate_http_url:
             self.logger.warning("Cannot fetch snapshots: frigate_http_url not configured")
             return (None, None, None)
-        
-        # For smart detect events, try to find the corresponding Frigate event ID
+
         frigate_event_id = None
         if event_type == "smart_detect":
-            # Look up Frigate event ID by searching the mapping
             for frig_id, unifi_id in self.frigate_to_unifi_event_map.items():
                 if unifi_id == event_id:
                     frigate_event_id = frig_id
                     break
-        
-        # Build URLs based on whether we have a Frigate event ID
+
         if frigate_event_id:
-            # Use event-specific snapshot endpoint for smart detect events
-            # https://demo.frigate.video/api/events/:event_id/snapshot.jpg
             base_url = f"{self.args.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
             full_url = base_url
-            thumbnail_url = f"{base_url}?crop=1&quality=80"  # Crop gives bounding box snapshot
-            
+            thumbnail_url = f"{base_url}?crop=1&quality=80"
+
             self.logger.debug(
                 f"Using Frigate event-specific snapshot URLs for event {event_id} "
                 f"(Frigate: {frigate_event_id}): {base_url}"
             )
         else:
-            # Fallback to latest.jpg endpoint with timestamp for analytics events
             timestamp = None
             if event_type == "analytics" and event_id in self._analytics_event_history:
                 event_data = self._analytics_event_history[event_id]
                 start_time = event_data.get('start_time')
                 if start_time is not None:
                     timestamp = int(start_time)
-            
-            # Build URLs for snapshots from latest frame endpoint
+
             base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg"
-            
-            # Full resolution snapshot
+
             full_url = base_url
             if timestamp is not None:
                 full_url = f"{full_url}?timestamp={timestamp}"
-            
-            # Thumbnail snapshot (360p for fast UniFi Protect processing)
+
             thumbnail_url = f"{base_url}?height=360&quality=80"
             if timestamp is not None:
                 thumbnail_url = f"{thumbnail_url}&timestamp={timestamp}"
-        
+
         self.logger.debug(f"Fetching snapshots for event {event_id}: full={full_url}, thumbnail={thumbnail_url}")
-        
-        # Fetch both snapshots in parallel
+
         async def fetch_url(url: str, snapshot_type: str) -> Optional[Path]:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -327,27 +538,25 @@ class FrigateCam(RTSPCam):
             except Exception as e:
                 self.logger.error(f"Error fetching {snapshot_type} snapshot: {e}")
                 return None
-        
-        # Fetch both in parallel
+
         results = await asyncio.gather(
             fetch_url(full_url, "full"),
             fetch_url(thumbnail_url, "thumbnail"),
             return_exceptions=True
         )
-        
+
         snapshot_fov = results[0] if not isinstance(results[0], Exception) else None
         snapshot_crop = results[1] if not isinstance(results[1], Exception) else None
-        
-        # Use full snapshot as heatmap
+
         heatmap = snapshot_fov
-        
+
         self.logger.info(
             f"Fetched snapshots for event {event_id}: "
             f"crop={'✓' if snapshot_crop else '✗'}, "
             f"fov={'✓' if snapshot_fov else '✗'}, "
             f"heatmap={'✓' if heatmap else '✗'}"
         )
-        
+
         return (snapshot_crop, snapshot_fov, heatmap)
 
     async def run(self) -> None:
@@ -371,8 +580,8 @@ class FrigateCam(RTSPCam):
                     )
                     await client.subscribe(f"{self.args.mqtt_prefix}/#")
                     async with asyncio.TaskGroup() as tg:
-                        # Start event timeout monitor
                         tg.create_task(self.monitor_event_timeouts())
+                        tg.create_task(self.refresh_frigate_detect_fps_periodically())
                         async for message in client.messages:
                             if message.topic.matches(f"{self.args.mqtt_prefix}/events"):
                                 tg.create_task(self.handle_detection_event(message))
@@ -383,7 +592,7 @@ class FrigateCam(RTSPCam):
                             elif message.topic.matches(
                                 f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/motion"
                             ):
-                                tg.create_task(self.handle_motion_event(message))   
+                                tg.create_task(self.handle_motion_event(message))
             except MqttError:
                 if not has_connected:
                     raise
@@ -391,7 +600,14 @@ class FrigateCam(RTSPCam):
         await mqtt_connect()
 
     async def load_frigate_detect_fps(self) -> None:
-        """Load detect FPS from Frigate config for the configured camera."""
+        """
+        Load detect FPS from Frigate's resolved config (/api/config, not
+        /api/config/raw -- the resolved endpoint merges in Frigate's defaults
+        so detect.fps is present even if never set explicitly in config.yml).
+        Falls back through camera-level -> global -> hardcoded default, with a
+        final sanity bound, so a bad/renamed field can't silently corrupt
+        every idleSinceTimeMs calculation downstream.
+        """
         frigate_url = (self.args.frigate_http_url or "http://frigate:5000").rstrip("/")
         config_url = f"{frigate_url}/api/config"
 
@@ -401,31 +617,48 @@ class FrigateCam(RTSPCam):
                 async with session.get(config_url) as response:
                     if response.status != 200:
                         self.logger.warning(
-                            f"Unable to load Frigate config from {config_url}: HTTP {response.status}"
+                            f"Unable to load Frigate config from {config_url}: HTTP {response.status}. "
+                            f"Keeping current detect_fps={self.frigate_detect_fps}"
                         )
                         return
 
                     config = await response.json()
 
-            detect_fps = (
-                config.get("cameras", {})
-                .get(self.args.frigate_camera, {})
-                .get("detect", {})
-                .get("fps")
-            )
-
-            if detect_fps is None:
+            cam_cfg = config.get("cameras", {}).get(self.args.frigate_camera, {})
+            fps = cam_cfg.get("detect", {}).get("fps")
+            if not fps:
+                fps = config.get("detect", {}).get("fps")
+            if not fps:
+                fps = DEFAULT_DETECT_FPS
                 self.logger.warning(
-                    f"Frigate config missing detect.fps for camera '{self.args.frigate_camera}'"
+                    f"Frigate config missing detect.fps for camera "
+                    f"'{self.args.frigate_camera}' at every level; using default {fps}"
+                )
+
+            fps = float(fps)
+            if not (DETECT_FPS_MIN <= fps <= DETECT_FPS_MAX):
+                self.logger.warning(
+                    f"Frigate detect.fps={fps} out of sane bounds "
+                    f"[{DETECT_FPS_MIN}, {DETECT_FPS_MAX}]; keeping previous value "
+                    f"{self.frigate_detect_fps} instead"
                 )
                 return
 
-            self.frigate_detect_fps = float(detect_fps)
+            self.frigate_detect_fps = fps
             self.logger.info(
                 f"Frigate detect FPS for camera '{self.args.frigate_camera}': {self.frigate_detect_fps}"
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
-            self.logger.warning(f"Failed to fetch Frigate detect FPS from {config_url}: {e}")
+            self.logger.warning(
+                f"Failed to fetch Frigate detect FPS from {config_url}: {e}. "
+                f"Keeping current detect_fps={self.frigate_detect_fps}"
+            )
+
+    async def refresh_frigate_detect_fps_periodically(self) -> None:
+        """Re-fetch detect.fps periodically in case Frigate's config is changed live."""
+        while True:
+            await asyncio.sleep(DETECT_FPS_REFRESH_SECONDS)
+            await self.load_frigate_detect_fps()
 
     async def handle_motion_event(self, message: Message) -> None:
         """Handle raw motion events from Frigate (if needed)"""
@@ -435,7 +668,6 @@ class FrigateCam(RTSPCam):
             )
             return
         msg = message.payload.decode()
-        # self.logger.debug(f"Received raw motion event: {msg}")
         if msg == "ON":
             self.logger.debug("Frigate motion event: ON")
             await self.trigger_analytics_start()
@@ -446,55 +678,55 @@ class FrigateCam(RTSPCam):
     async def monitor_event_timeouts(self) -> None:
         """Monitor active events and end those that haven't received updates in 600 seconds"""
         while True:
-            await asyncio.sleep(30)  # Check every 30 seconds
+            await asyncio.sleep(30)
             current_time = time.time()
             expired_frigate_events = []
-            
-            # Check all active smart detect events (from base class)
+
             for unifi_event_id, event_data in list(self._active_smart_events.items()):
-                # Skip events that have already ended
                 if event_data.get("end_time") is not None:
                     continue
-                    
-                # Get last update time, defaulting to start time if no updates yet
+
                 last_update = self.event_last_update.get(unifi_event_id, event_data["start_time"])
                 time_since_update = current_time - last_update
-                
-                # Only timeout if no update for over 600 seconds
+
                 if time_since_update > self.event_timeout_seconds:
-                    # Find the Frigate event ID that maps to this UniFi event ID
                     frigate_event_id = None
                     for fid, uid in self.frigate_to_unifi_event_map.items():
                         if uid == unifi_event_id:
                             frigate_event_id = fid
                             break
-                    
+
                     expired_frigate_events.append((frigate_event_id, unifi_event_id))
                     self.logger.warning(
                         f"EVENT TIMEOUT: Event {unifi_event_id} (Frigate: {frigate_event_id}, "
                         f"{event_data['object_type'].value}) has not been updated for "
                         f"{time_since_update:.1f}s (timeout: {self.event_timeout_seconds}s). Force ending event."
                     )
-            
-            # End expired events
+
             for frigate_event_id, unifi_event_id in expired_frigate_events:
                 event_data = self._active_smart_events.get(unifi_event_id)
                 if not event_data:
                     continue
-                    
+
                 try:
-                    # End smart detect event (motion event will end separately)
                     await self.trigger_smart_detect_stop(event_data["object_type"], event_id=unifi_event_id)
                 except Exception as e:
                     self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
                 finally:
-                    # Clean up mappings
                     if frigate_event_id and frigate_event_id in self.frigate_to_unifi_event_map:
                         del self.frigate_to_unifi_event_map[frigate_event_id]
                     if frigate_event_id and frigate_event_id in self.event_snapshot_ready:
                         del self.event_snapshot_ready[frigate_event_id]
                     if unifi_event_id in self.event_last_update:
                         del self.event_last_update[unifi_event_id]
+                    # Also drop this track from the shared zone status tracker
+                    # so it stops contributing occupancy to any zone (Section 8.5),
+                    # and free its trackerID allocation.
+                    tracker_id = self.unifi_tracker_id_by_frigate_event.pop(frigate_event_id, None)
+                    if tracker_id is not None:
+                        self.zone_status_tracker.remove_track(tracker_id)
+                    if frigate_event_id:
+                        self._release_tracker_id(frigate_event_id)
 
     async def handle_detection_event(self, message: Message) -> None:
         if not isinstance(message.payload, bytes):
@@ -510,31 +742,11 @@ class FrigateCam(RTSPCam):
             event_id = frigate_msg.get("after", {}).get("id")
             camera = frigate_msg.get("after", {}).get("camera")
             label = frigate_msg.get("after", {}).get("label")
-            
+
             if camera != self.args.frigate_camera:
-                #self.logger.debug(
-                #    f"Frigate: Ignoring Frigate event for different camera: {camera} "
-                #    f"(expecting {self.args.frigate_camera})"
-                #)
                 return
-            
-            self.logger.debug(
-                    f"Frigate: Received: {frigate_msg} "
-                )
 
-            before_snapshot_time = frigate_msg.get('before', {}).get('snapshot', {}).get('frame_time', 'N/A') if frigate_msg.get('before', {}).get('snapshot') else 'N/A'
-            after_snapshot_time = frigate_msg.get('after', {}).get('snapshot', {}).get('frame_time', 'N/A') if frigate_msg.get('after', {}).get('snapshot') else 'N/A'
-            
-            before_data = frigate_msg.get('before', {})
-            after_data = frigate_msg.get('after', {})
-            
-            #self.logger.debug(
-            #    f"Times - before: frame={before_data.get('frame_time', 'N/A')}, snapshot_frame={before_snapshot_time}, start={before_data.get('start_time', 'N/A')}, end={before_data.get('end_time', 'N/A')} | after: frame={after_data.get('frame_time', 'N/A')}, snapshot_frame={after_snapshot_time}, start={after_data.get('start_time', 'N/A')}, end={after_data.get('end_time', 'N/A')}"
-            #)
-
-            #self.logger.debug(
-            #    f"{before_data.get('frame_time', 'N/A')},{before_snapshot_time},{before_data.get('start_time', 'N/A')},{before_data.get('end_time', 'N/A')},{after_data.get('frame_time', 'N/A')},{after_snapshot_time},{after_data.get('start_time', 'N/A')},{after_data.get('end_time', 'N/A')}"
-            #)
+            self.logger.debug(f"Frigate: Received: {frigate_msg} ")
 
             object_type = self.label_to_object_type(label)
             if not object_type:
@@ -555,37 +767,40 @@ class FrigateCam(RTSPCam):
                         f"Received 'new' event for already active Frigate event_id={event_id}. "
                         f"This may indicate event was not properly ended. Stopping old event first."
                     )
-                    # Stop the old event before starting new one
                     old_unifi_id = self.frigate_to_unifi_event_map[event_id]
                     if old_unifi_id in self._active_smart_events:
                         old_event = self._active_smart_events[old_unifi_id]
                         await self.trigger_smart_detect_stop(old_event["object_type"], event_id=old_unifi_id)
                     del self.frigate_to_unifi_event_map[event_id]
-                
-                # Create snapshot ready event for this Frigate event
+
                 self.event_snapshot_ready[event_id] = asyncio.Event()
-                
-                # Send smart detect event as update to existing motion event
-                # Build custom descriptor from Frigate data
+
+                tracker_id = self._allocate_tracker_id(event_id)
                 custom_descriptor = self.build_descriptor_from_frigate_msg(
-                    frigate_msg, object_type
+                    frigate_msg, object_type, tracker_id
                 )
-                start_time_ms = int(frigate_msg.get('after', {}).get('start_time', 0) * 1000) - self.args.frigate_time_sync_ms
                 frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                 
-                unifi_event_id = await self.trigger_smart_detect_start(object_type, custom_descriptor, frame_time_ms)
-                
-                # Store mapping from Frigate event ID to UniFi event ID
-                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
-                
-                # Track event creation time as last update
-                self.event_last_update[unifi_event_id] = time.time()
-                
-                self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
-                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
+
+                # Register this track with the shared per-camera zone tracker,
+                # keyed by trackerID (matching how the real protocol scopes
+                # zone occupancy per tracked object rather than per event),
+                # and capture the resulting full zonesStatus dict to send
+                # alongside this message.
+                self.unifi_tracker_id_by_frigate_event[event_id] = tracker_id
+                zones_status = self._update_zone_status_for_track(
+                    tracker_id,
+                    custom_descriptor["zones"],
+                    custom_descriptor["confidenceLevel"],
+                    active=True,
                 )
-                
+
+                unifi_event_id = await self.trigger_smart_detect_start(
+                    object_type, custom_descriptor, frame_time_ms, zonesStatus=zones_status
+                )
+
+                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
+                self.event_last_update[unifi_event_id] = time.time()
+
                 self.logger.info(
                     f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
                     f"Total active events: {len(self.frigate_to_unifi_event_map)}"
@@ -594,8 +809,7 @@ class FrigateCam(RTSPCam):
             elif event_type == "update":
                 if event_id in self.frigate_to_unifi_event_map:
                     unifi_event_id = self.frigate_to_unifi_event_map[event_id]
-                    
-                    # Verify the UniFi event is still active
+
                     if unifi_event_id not in self._active_smart_events:
                         self.logger.warning(
                             f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
@@ -603,30 +817,40 @@ class FrigateCam(RTSPCam):
                             f"active _active_smart_events: {list(self._active_smart_events.keys())}"
                         )
                         return
-                    
-                    # Build updated descriptor from Frigate data
+
+                    tracker_id = self._get_tracker_id(event_id)
                     custom_descriptor = self.build_descriptor_from_frigate_msg(
-                        frigate_msg, object_type
+                        frigate_msg, object_type, tracker_id
                     )
 
                     frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                    # Send moving update with updated bounding box
-                    await self.trigger_smart_detect_update(object_type, custom_descriptor, frame_time_ms)
-                    
-                    # Update last update time for timeout tracking
+
+                    # Keep this track's contribution to the shared zone
+                    # tracker current on every update, independent of
+                    # whether this specific event is the one closing out.
+                    zones_status = self._update_zone_status_for_track(
+                        tracker_id,
+                        custom_descriptor["zones"],
+                        custom_descriptor["confidenceLevel"],
+                        active=True,
+                    )
+
+                    # Confirmed: trigger_smart_detect_update accepts zonesStatus.
+                    await self.trigger_smart_detect_update(
+                        object_type, custom_descriptor, frame_time_ms, zonesStatus=zones_status
+                    )
+
                     self.event_last_update[unifi_event_id] = time.time()
-                    
-                    # Fetch and cache snapshots if available
+
+                    after_data = frigate_msg.get('after', {})
                     has_snapshot = after_data.get('has_snapshot', False)
                     if has_snapshot and self.args.frigate_http_url:
                         self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
                         try:
-                            # Fetch snapshots using the UniFi event ID
                             snapshot_crop, snapshot_fov, heatmap = await self.fetch_snapshots_for_event(
                                 unifi_event_id, "smart_detect"
                             )
-                            
-                            # Cache snapshots in the smart detect event data
+
                             event_data = self._active_smart_events[unifi_event_id]
                             if snapshot_crop:
                                 event_data["snapshot_crop_path"] = snapshot_crop
@@ -634,14 +858,14 @@ class FrigateCam(RTSPCam):
                                 event_data["snapshot_fov_path"] = snapshot_fov
                             if heatmap:
                                 event_data["heatmap_path"] = heatmap
-                            
+
                             self.logger.debug(
                                 f"Cached snapshots for smart event {unifi_event_id}: "
                                 f"crop={snapshot_crop}, fov={snapshot_fov}, heatmap={heatmap}"
                             )
                         except Exception as e:
                             self.logger.error(f"Error fetching/caching snapshots for event {unifi_event_id}: {e}")
-                    
+
                     event_data = self._active_smart_events[unifi_event_id]
                     event_age = time.time() - event_data["start_time"]
                     self.logger.debug(
@@ -653,12 +877,11 @@ class FrigateCam(RTSPCam):
                         f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
-                    
+
             elif event_type == "end":
                 if event_id in self.frigate_to_unifi_event_map:
                     unifi_event_id = self.frigate_to_unifi_event_map[event_id]
-                    
-                    # Verify the UniFi event is still active
+
                     if unifi_event_id not in self._active_smart_events:
                         self.logger.warning(
                             f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
@@ -668,7 +891,7 @@ class FrigateCam(RTSPCam):
                         if event_id in self.event_snapshot_ready:
                             del self.event_snapshot_ready[event_id]
                         return
-                    
+
                     event_data = self._active_smart_events.get(unifi_event_id)
                     if not event_data:
                         self.logger.warning(
@@ -678,14 +901,14 @@ class FrigateCam(RTSPCam):
                         if event_id in self.event_snapshot_ready:
                             del self.event_snapshot_ready[event_id]
                         return
-                    
-                    # Build final descriptor from end event data
+
+                    tracker_id = self._get_tracker_id(event_id)
                     final_descriptor = self.build_descriptor_from_frigate_msg(
-                        frigate_msg, object_type
+                        frigate_msg, object_type, tracker_id
                     )
                     end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
                     frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                    
+
                     event_duration = time.time() - event_data["start_time"]
                     self.logger.info(
                         f"Frigate: Ending {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
@@ -694,24 +917,32 @@ class FrigateCam(RTSPCam):
                     self.logger.debug(
                         f"Event timestamps: end_time={end_time_ms}, frame_time={frame_time_ms}"
                     )
-                    
-                    # End the smart detect event (motion event will end when Frigate sends motion OFF)
-                    # Pass both end_time (for stop event) and frame_time (for final update)
+
+                    # This track is closing -- remove its contribution from
+                    # the shared zone tracker (other tracks' occupancy is
+                    # unaffected, per protocol spec Section 7.4) and capture
+                    # the resulting zonesStatus to send with the stop message.
+                    zones_status = self._update_zone_status_for_track(tracker_id, [], 0, active=False)
+
+                    # Confirmed: trigger_smart_detect_stop accepts zonesStatus.
                     await self.trigger_smart_detect_stop(
-                        object_type, 
-                        final_descriptor, 
-                        end_time_ms, 
+                        object_type,
+                        final_descriptor,
+                        end_time_ms,
                         event_id=unifi_event_id,
-                        frame_time_ms=frame_time_ms
+                        frame_time_ms=frame_time_ms,
+                        zonesStatus=zones_status,
                     )
-                    
-                    # Clean up mappings
+
+                    self.unifi_tracker_id_by_frigate_event.pop(event_id, None)
+                    self._release_tracker_id(event_id)
+
                     del self.frigate_to_unifi_event_map[event_id]
                     if event_id in self.event_snapshot_ready:
                         del self.event_snapshot_ready[event_id]
                     if unifi_event_id in self.event_last_update:
                         del self.event_last_update[unifi_event_id]
-                    
+
                     self.logger.info(
                         f"Frigate: Event {event_id} ended. "
                         f"Remaining active events: {len(self.frigate_to_unifi_event_map)}"
@@ -725,7 +956,7 @@ class FrigateCam(RTSPCam):
                 self.logger.debug(
                     f"Received unhandled event type: {event_type} for event_id={event_id}"
                 )
-                
+
         except json.JSONDecodeError:
             self.logger.exception(f"Could not decode payload: {msg}")
         except Exception as e:
@@ -740,32 +971,27 @@ class FrigateCam(RTSPCam):
             )
             return
 
-        # Extract label from topic: frigate/<camera>/<label>/snapshot
         topic_parts = message.topic.value.split("/")
         if len(topic_parts) < 4:
             self.logger.debug(f"Unexpected snapshot topic format: {message.topic.value}")
             return
-            
+
         snapshot_label = topic_parts[-2]
-        
+
         self.logger.debug(
             f"Received snapshot: topic={message.topic.value}, "
             f"message={message}"
         )
-        
-        # Find matching active Frigate event by label
-        # We need to match based on label since snapshots don't include event ID
+
         matching_frigate_event_id = None
         for frigate_event_id, unifi_event_id in self.frigate_to_unifi_event_map.items():
-            # Check if this UniFi event is still active and matches the label
             if unifi_event_id in self._active_smart_events:
                 event_data = self._active_smart_events[unifi_event_id]
-                # Match by object type (person -> person, vehicle labels -> vehicle)
                 event_label = event_data["object_type"].value
                 if event_label == snapshot_label and not message.retain:
                     matching_frigate_event_id = frigate_event_id
                     break
-        
+
         if matching_frigate_event_id:
             f = tempfile.NamedTemporaryFile(delete=False)
             f.write(message.payload)

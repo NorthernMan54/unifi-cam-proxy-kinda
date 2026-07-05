@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import atexit
+import datetime
 import json
 import logging
 import shutil
@@ -407,10 +408,16 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                         self.logger.warning(f"Failed to delete cached snapshot {snapshot_path}: {e}")
             
             del self._active_smart_events[event_id]
-            self.logger.debug(
-                f"Cleaned up smart detect event {event_id} "
-                f"(age: {(current_time - end_time) / 60:.1f} minutes)"
-            )
+            if end_time is not None:
+                self.logger.debug(
+                    f"Cleaned up smart detect event {event_id} "
+                    f"(age: {(current_time - end_time) / 60:.1f} minutes)"
+                )
+            else:
+                self.logger.debug(
+                    f"Cleaned up smart detect event {event_id} "
+                    "(age: unknown, end_time is null)"
+                )
         
         if events_to_remove:
             self.logger.info(
@@ -515,6 +522,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
+        zonesStatus: Optional[dict[str, Any]] = None
     ) -> int:
         """
         Start a smart detect event for a specific object type.
@@ -546,7 +554,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 f"Ignoring duplicate start for {object_type.value}."
             )
             return event_id
-        zonesStatus = {"1": {"level": 60, "status": "enter"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -556,7 +563,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"level": score, "status": "enter"}}
+                # zonesStatus = {"1": {"level": score, "status": "enter"}}
         
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
@@ -566,7 +573,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "enter",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "objectTypes": [object_type.value],
                 "smartDetectSnapshotFullFoV": "",
                 "smartDetectSnapshotFullFoVHeight": 0,
@@ -642,6 +649,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         object_type: SmartDetectObjectType,
         custom_descriptor: Optional[dict[str, Any]] = None,
         event_timestamp: Optional[float] = None,
+        zonesStatus: Optional[dict[str, Any]] = None
     ) -> None:
         """
         Send a smart detect update (moving) event with updated descriptor information.
@@ -666,7 +674,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             return
         
         active_event = self._active_smart_events[event_id]
-        zonesStatus = {"1": {"level": 75, "status": "moving"}}  # Example zonesStatus, can be customized
         # Build descriptors array
         descriptors = []
         if custom_descriptor:
@@ -691,8 +698,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     score = int(custom_descriptor.get("confidenceLevel"))
                 except Exception:
                     score = 75
-                zonesStatus = {"1": {"level": score, "status": "moving"}}
+                # zonesStatus = {"1": {"level": score, "status": "moving"}}
         
+        self._motion_event_id += 1  # Increment global event ID for uniqueness
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
@@ -701,7 +709,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "moving",
-            "eventId": event_id,
+            "eventId": self._motion_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": "",
             "smartDetectSnapshotFullFoVHeight": 0,
@@ -725,6 +733,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         event_timestamp: Optional[float] = None,
         event_id: Optional[int] = None,
         frame_time_ms: Optional[int] = None,
+        zonesStatus: Optional[dict[str, Any]] = None
     ) -> None:
         """
         Stop a smart detect event for a specific object type.
@@ -773,8 +782,6 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 custom_descriptor,
                 frame_time_ms or event_timestamp
             )
-        
-        zonesStatus = {"1": {"level": 75, "status": "leave"}}  # Example zonesStatus, can be customized
         
         # Build smartDetectSnapshots array and trackerIDAttrMap from descriptor history
         smart_detect_snapshots = []
@@ -890,6 +897,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             fov_width = active_event.get("snapshot_width") or 640
             fov_height = active_event.get("snapshot_height") or 360
         
+        self._motion_event_id += 1  # Increment motion event ID for the stop event
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
@@ -898,7 +906,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": [],         # This is empty on stop events
             "displayTimeoutMSec": 2000,
             "edgeType": "leave",
-            "eventId": target_event_id,
+            "eventId": self._motion_event_id ,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": fov_filename,
             "smartDetectSnapshotFullFoVHeight": fov_height,
@@ -963,6 +971,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             )
             return
         
+        self._motion_event_id += 1  # Increment global event ID for uniqueness
         payload: dict[str, Any] = {
             "clockBestMonotonic": 0,
             "clockBestWall": 0,
@@ -971,7 +980,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
             "edgeType": "start",
-            "eventId": event_id,
+            "eventId": self._motion_event_id ,
             "eventType": "motion",
             "levels": {"0": 47},
             "motionHeatmap": "motionHeatmapline101.png",
@@ -1209,6 +1218,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         active_event["heatmap_filename"] = heatmap_filename
         active_event["end_time"] = time.time()
         
+        self._motion_event_id += 1  # Increment motion event ID for the stop event
         payload: dict[str, Any] = {
             "clockBestMonotonic": int(self.get_uptime()),
             "clockBestWall": int(round(active_event["start_time"] * 1000)),
@@ -1217,7 +1227,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "clockStreamRate": 1000,
             "clockWall": int(round(time.time() * 1000)),
             "edgeType": "stop",
-            "eventId": event_id,
+            "eventId": self._motion_event_id ,
             "eventType": "motion",
             "levels": {"0": 49},
             "motionHeatmap": heatmap_filename,
@@ -1372,7 +1382,11 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                     "hwrev": 19,
                     "idleTime": 191.96,
                     "ip": self.args.ip,
-                    "mac": self.args.mac,
+                    "mac": (
+                        self.args.mac.replace(":", "")
+                                    .replace("-", "")
+                                    .upper()
+                    ),
                     "model": self.args.model,
                     "name": self.args.name,
                     "protocolVersion": 67,
@@ -1413,6 +1427,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "messageId": self.gen_msg_id(),
             "payload": payload,
             "responseExpected": False,
+            "timeStamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
             "to": "UniFiVideo",
         }
 
