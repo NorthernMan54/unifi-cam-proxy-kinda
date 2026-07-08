@@ -39,7 +39,14 @@ class ZoneState:
 
     def update(self, occupied_this_tick: bool, best_confidence: float) -> None:
         if occupied_this_tick:
-            self.level = min(100.0, max(self.level, best_confidence - ZONE_LEVEL_CONFIDENCE_OFFSET))
+            # Reflect THIS tick's occupancy directly. Do not max against
+            # self.level here -- that previously created a ratchet where a
+            # zone's level could never drop while occupied, even when the
+            # current occupant's confidence was much lower than an earlier
+            # tick's value. Cross-occupant maxing (so two simultaneous
+            # objects in one zone don't cause flicker) already happens one
+            # level up, in ZoneStatusTracker._recompute()'s `occupancy` dict.
+            self.level = min(100.0, max(0.0, best_confidence - ZONE_LEVEL_CONFIDENCE_OFFSET))
             self.status = "moving" if self.was_active else "enter"
             self.was_active = True
         elif self.was_active:
@@ -836,8 +843,11 @@ class FrigateCam(RTSPCam):
                     )
 
                     # Confirmed: trigger_smart_detect_update accepts zonesStatus.
+                    # event_id=unifi_event_id disambiguates against other
+                    # concurrently active tracks of the same object_type.
                     await self.trigger_smart_detect_update(
-                        object_type, custom_descriptor, frame_time_ms, zonesStatus=zones_status
+                        object_type, custom_descriptor, frame_time_ms,
+                        zonesStatus=zones_status, event_id=unifi_event_id,
                     )
 
                     self.event_last_update[unifi_event_id] = time.time()
@@ -918,10 +928,29 @@ class FrigateCam(RTSPCam):
                         f"Event timestamps: end_time={end_time_ms}, frame_time={frame_time_ms}"
                     )
 
+                    # Send a final "moving" update carrying the real last-known
+                    # position/confidence BEFORE closing the track. This
+                    # mirrors real device behavior (the last real detection
+                    # frame arrives as a live "moving" message immediately
+                    # before the "leave" summary, which itself carries empty
+                    # descriptors) and avoids handing the closing zonesStatus
+                    # snapshot straight from a possibly-stale prior tick.
+                    zones_status_final_update = self._update_zone_status_for_track(
+                        tracker_id,
+                        final_descriptor["zones"],
+                        final_descriptor["confidenceLevel"],
+                        active=True,
+                    )
+                    await self.trigger_smart_detect_update(
+                        object_type, final_descriptor, frame_time_ms,
+                        zonesStatus=zones_status_final_update, event_id=unifi_event_id,
+                    )
+
                     # This track is closing -- remove its contribution from
                     # the shared zone tracker (other tracks' occupancy is
                     # unaffected, per protocol spec Section 7.4) and capture
-                    # the resulting zonesStatus to send with the stop message.
+                    # the resulting post-departure zonesStatus for the stop
+                    # message.
                     zones_status = self._update_zone_status_for_track(tracker_id, [], 0, active=False)
 
                     # Confirmed: trigger_smart_detect_stop accepts zonesStatus.

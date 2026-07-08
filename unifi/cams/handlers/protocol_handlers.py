@@ -143,12 +143,17 @@ class ProtocolHandlers:
     ) -> "AVClientResponse":
         """Process time synchronization request."""
         import time
-        
+
         return self.gen_response(
             "ubnt_avclient_paramAgreement",
             msg["messageId"],
             {
-                "monotonicMs": self.get_uptime(),
+                # FIX: get_uptime() returns fractional SECONDS. "monotonicMs"
+                # (and its sibling "wallMs", already correctly in ms via
+                # time.time()*1000) both indicate this field is expected in
+                # milliseconds -- same units bug as clockMonotonic/clockStream
+                # in base.py's trigger_smart_detect_* methods, fixed there too.
+                "monotonicMs": int(self.get_uptime() * 1000),
                 "wallMs": int(round(time.time() * 1000)),
                 "features": {},
             },
@@ -296,10 +301,22 @@ class ProtocolHandlers:
         self: "UnifiCamBase", msg: "AVClientRequest"
     ) -> "AVClientResponse":
         """Process video settings change request."""
+        # FIX: previously `vid_dst` was rebuilt fresh every call, defaulting
+        # every stream to /dev/null unless *this specific* incoming message
+        # happened to configure it. Since self._streams (stream names)
+        # already persists across calls but destinations did not, a stream
+        # started in an earlier message would get reported back with a
+        # contradictory response on a later, unrelated ChangeVideoSettings
+        # call: a real streamName paired with destinations: ["file:///dev/null"],
+        # even though nothing was actually stopped. Persist destinations the
+        # same way stream names are persisted.
+        if not hasattr(self, "_stream_destinations"):
+            self._stream_destinations: dict[str, list[str]] = {}
+
         vid_dst = {
-            "video1": ["file:///dev/null"],
-            "video2": ["file:///dev/null"],
-            "video3": ["file:///dev/null"],
+            "video1": self._stream_destinations.get("video1", ["file:///dev/null"]),
+            "video2": self._stream_destinations.get("video2", ["file:///dev/null"]),
+            "video3": self._stream_destinations.get("video3", ["file:///dev/null"]),
         }
 
         if msg["payload"] is not None and "video" in msg["payload"]:
@@ -313,10 +330,43 @@ class ProtocolHandlers:
                             # Remove stream from tracking when stopping
                             if k in self._streams:
                                 del self._streams[k]
+                            # Also clear persisted destination so a future
+                            # unrelated ChangeVideoSettings call doesn't keep
+                            # echoing a stopped stream's old real destination.
+                            self._stream_destinations[k] = vid_dst[k]
                         elif "parameters" in v["avSerializer"]:
+                            # FIX: previously this branch started a new
+                            # ffmpeg process for key k on every
+                            # ChangeVideoSettings that (re)configures it,
+                            # with no guard against k already having a live
+                            # stream. If Protect's controller re-sends
+                            # ChangeVideoSettings to try to recover/restart a
+                            # stalled stream (rather than only sending it
+                            # once at initial setup), this would spawn a
+                            # SECOND ffmpeg process reading the same RTSP
+                            # source concurrently with the first, silently
+                            # orphaning the old process -- a likely cause of
+                            # "Timed out waiting for stream to open"
+                            # symptoms if the upstream RTSP source doesn't
+                            # support multiple simultaneous clients on one
+                            # path. Stop any existing stream on this key
+                            # first so a reconfigure/recovery attempt tears
+                            # down and replaces cleanly instead of piling up.
+                            if k in self._streams or k in self._ffmpeg_handles:
+                                self.logger.info(
+                                    f"Restarting stream {k}: stopping existing process "
+                                    f"before starting new one (possible controller-initiated recovery)"
+                                )
+                                self.stop_video_stream(k)
+
                             self._streams[k] = stream = v["avSerializer"]["parameters"][
                                 "streamName"
                             ]
+                            # Persist the real destination alongside the
+                            # stream name so later, unrelated
+                            # ChangeVideoSettings calls report it consistently
+                            # instead of falling back to /dev/null.
+                            self._stream_destinations[k] = vid_dst[k]
                             try:
                                 host, port = urlparse(
                                     v["avSerializer"]["destinations"][0]
