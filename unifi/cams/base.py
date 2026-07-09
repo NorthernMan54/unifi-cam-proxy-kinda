@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import atexit
-import datetime
 import json
 import logging
 import shutil
@@ -1119,7 +1118,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "messageId": self.gen_msg_id(),
             "payload": payload,
             "responseExpected": False,
-            "timeStamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+            "timeStamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "to": "UniFiVideo",
         }
     
