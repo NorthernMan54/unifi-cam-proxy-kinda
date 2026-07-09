@@ -114,12 +114,14 @@ class FrigateCam(RTSPCam):
         super().__init__(args, logger)
         self.args = args
         self.frigate_detect_fps: float = DEFAULT_DETECT_FPS
-        # Map Frigate event IDs to UniFi event IDs for tracking
-        self.frigate_to_unifi_event_map: dict[str, int] = {}
+        # Active smart-detect event ID used for EventSmartDetect updates.
+        # This is distinct from analytics motion-window IDs.
+        self._motion_smart_event_id: Optional[int] = None
+        self._motion_start_time: float = 0.0
         # Store snapshot readiness per Frigate event ID
         self.event_snapshot_ready: dict[str, asyncio.Event] = {}
-        # Track last update time for each event (for timeout detection)
-        self.event_last_update: dict[int, float] = {}
+        # Track last update time for each Frigate track (for timeout detection)
+        self.event_last_update: dict[str, float] = {}
         self.event_timeout_seconds = 600  # Timeout after 600 seconds (10 minutes) without updates
 
         # Frigate zone name -> Protect numeric zone ID, static per camera.
@@ -131,9 +133,11 @@ class FrigateCam(RTSPCam):
             getattr(self.args, "zone_map", None)
         )
         self.zone_status_tracker = ZoneStatusTracker(list(set(self.zone_name_to_id.values())))
-        # tracker_id -> Frigate event_id, needed to reverse-look-up which
-        # camera-numeric trackerID owns a closing Frigate event
-        self.unifi_tracker_id_by_frigate_event: dict[str, int] = {}
+        # Track which Frigate events are currently active (for lifecycle management).
+        # Maps Frigate event.id (string) → True when tracking, removed on event end.
+        self._active_frigate_events: set[str] = set()
+        # Frigate event.id -> object type, used for label-aware snapshot matching.
+        self._frigate_event_object_types: dict[str, SmartDetectObjectType] = {}
 
         # Frigate's own event/tracker ID is a string (e.g. a UUID-like value)
         # and is NOT reused as the numeric trackerID directly. Real UniFi
@@ -275,8 +279,25 @@ class FrigateCam(RTSPCam):
         elif label in {"vehicle", "car", "motorcycle", "school_bus", "license_plate"}:
             # Available: car, motorcycle, bicycle, boat, school_bus, license_plate
             return SmartDetectObjectType.VEHICLE
-        elif label in {"cat", "dog", "horse", "rabbit", "squirrel", "goat"}:
-            # Available: dog, cat, deer, horse, bird, raccoon, fox, bear, cow, squirrel, goat, rabbit, skunk, kangaroo
+        elif label in {
+            "animal",
+            "cat",
+            "dog",
+            "horse",
+            "rabbit",
+            "squirrel",
+            "goat",
+            "deer",
+            "bird",
+            "raccoon",
+            "fox",
+            "bear",
+            "cow",
+            "skunk",
+            "kangaroo",
+        }:
+            # Available: animal, dog, cat, deer, horse, bird, raccoon, fox,
+            # bear, cow, squirrel, goat, rabbit, skunk, kangaroo
             return SmartDetectObjectType.ANIMAL
         elif label in {"package"}:
             # Available: package
@@ -469,6 +490,18 @@ class FrigateCam(RTSPCam):
             self.zone_status_tracker.remove_track(tracker_id)
         return self.zone_status_tracker.as_dict()
 
+    def _current_motion_window_event_id(self) -> Optional[int]:
+        """Return the currently active motion-window event ID, if any.
+
+        This returns the active smart-detect event ID (if one has been
+        started in the current motion window), not the analytics event ID.
+        """
+        return self._motion_smart_event_id
+
+    def _is_motion_window_active(self) -> bool:
+        """Return whether an analytics motion window is currently active."""
+        return self._active_analytics_event_id is not None
+
     async def fetch_snapshots_for_event(
         self, event_id: int, event_type: str = "analytics"
     ) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
@@ -488,10 +521,13 @@ class FrigateCam(RTSPCam):
 
         frigate_event_id = None
         if event_type == "smart_detect":
-            for frig_id, unifi_id in self.frigate_to_unifi_event_map.items():
-                if unifi_id == event_id:
-                    frigate_event_id = frig_id
-                    break
+            # In the new architecture, we don't have a direct mapping from motion window
+            # smart event ID to individual Frigate event IDs. All objects in a motion
+            # window use the same smart event context. For now, use generic snapshot URLs.
+            self.logger.debug(
+                f"Smart detect event {event_id} does not map to a specific Frigate event "
+                f"(all objects share motion window). Using generic camera snapshots."
+            )
 
         if frigate_event_id:
             base_url = f"{self.args.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
@@ -672,7 +708,12 @@ class FrigateCam(RTSPCam):
             await self.load_frigate_detect_fps()
 
     async def handle_motion_event(self, message: Message) -> None:
-        """Handle raw motion events from Frigate (if needed)"""
+        """Handle Frigate motion events: create/destroy the motion window smart event.
+        
+        Per protocol spec Section 3: one smart event spans from motion ON to motion OFF.
+        All Frigate object detections within this window emit EventSmartDetect updates
+        within that single smart event context.
+        """
         if not isinstance(message.payload, bytes):
             self.logger.warning(
                 f"Unexpectedly received non-bytes payload for motion event: {message.payload}"
@@ -680,64 +721,118 @@ class FrigateCam(RTSPCam):
             return
         msg = message.payload.decode()
         if msg == "ON":
-            self.logger.debug("Frigate motion event: ON")
-            await self.trigger_analytics_start()
+            if self._is_motion_window_active():
+                self.logger.warning(
+                    "Motion ON received but analytics motion window is already active. Ignoring."
+                )
+                return
+            
+            self._motion_start_time = time.time()
+            self.logger.debug("Frigate motion event: ON, creating motion window smart event")
+            
+            # Create the motion window smart event. Real device behavior: motion-triggered
+            # event context that encompasses all tracked objects within the window.
+            try:
+                # Call parent's trigger_analytics_start or create smart event.
+                # The actual EventSmartDetect wire protocol will be emitted per-object.
+                await self.trigger_analytics_start()
+                # trigger_analytics_start() allocates _active_analytics_event_id
+                # immediately and only delays *sending* EventAnalytics(start)
+                # via linger. Keep smart-detect event ID unset until the first
+                # object arrives, then bootstrap trigger_smart_detect_start.
+                self._motion_smart_event_id = None
+                self.logger.info(
+                    f"Motion window started immediately (analytics_event_id={self._active_analytics_event_id}); "
+                    "ready for object detections"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to start motion window: {e}")
+                self._motion_smart_event_id = None
+                
         elif msg == "OFF":
-            self.logger.debug("Frigate motion event: OFF")
-            await self.trigger_analytics_stop()
+            if not self._is_motion_window_active():
+                self.logger.debug("Motion OFF received but no active motion window, ignoring")
+                return
+            
+            self.logger.debug("Frigate motion event: OFF, closing motion window smart event")
+            
+            try:
+                # Close the motion window. Any remaining active Frigate objects should
+                # have been ended by Frigate's own motion-triggered cleanup, but if not,
+                # we close them here.
+                active_copy = list(self._active_frigate_events)
+                for frigate_event_id in active_copy:
+                    self.logger.warning(
+                        f"Motion OFF but Frigate event {frigate_event_id} still active. "
+                        f"Force-closing it."
+                    )
+                    tracker_id = self.frigate_id_to_tracker_id.get(frigate_event_id)
+                    if tracker_id is not None:
+                        self.zone_status_tracker.remove_track(tracker_id)
+                    self._release_tracker_id(frigate_event_id)
+                    self._active_frigate_events.discard(frigate_event_id)
+                    self._frigate_event_object_types.pop(frigate_event_id, None)
+                    if frigate_event_id in self.event_last_update:
+                        del self.event_last_update[frigate_event_id]
+                    if frigate_event_id in self.event_snapshot_ready:
+                        del self.event_snapshot_ready[frigate_event_id]
+                
+                if self._motion_smart_event_id is not None:
+                    active_smart_event = self._active_smart_events.get(self._motion_smart_event_id)
+                    if active_smart_event is not None:
+                        smart_object_type = active_smart_event["object_type"]
+                        await self.trigger_smart_detect_stop(
+                            smart_object_type,
+                            event_id=self._motion_smart_event_id,
+                            event_timestamp=int(round(time.time() * 1000)),
+                            zonesStatus=self.zone_status_tracker.as_dict(),
+                        )
+
+                await self.trigger_analytics_stop()
+                motion_duration = time.time() - self._motion_start_time
+                self.logger.info(
+                    f"Motion window closed after {motion_duration:.1f}s, "
+                    f"active objects: {len(self._active_frigate_events)}"
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to stop motion window: {e}")
+            finally:
+                self._motion_smart_event_id = None
 
     async def monitor_event_timeouts(self) -> None:
-        """Monitor active events and end those that haven't received updates in 600 seconds"""
+        """Monitor active Frigate object tracks and end those that haven't been updated."""
         while True:
             await asyncio.sleep(30)
             current_time = time.time()
             expired_frigate_events = []
 
-            for unifi_event_id, event_data in list(self._active_smart_events.items()):
-                if event_data.get("end_time") is not None:
-                    continue
-
-                last_update = self.event_last_update.get(unifi_event_id, event_data["start_time"])
+            for frigate_event_id in list(self._active_frigate_events):
+                last_update = self.event_last_update.get(frigate_event_id, self._motion_start_time)
                 time_since_update = current_time - last_update
 
                 if time_since_update > self.event_timeout_seconds:
-                    frigate_event_id = None
-                    for fid, uid in self.frigate_to_unifi_event_map.items():
-                        if uid == unifi_event_id:
-                            frigate_event_id = fid
-                            break
-
-                    expired_frigate_events.append((frigate_event_id, unifi_event_id))
+                    expired_frigate_events.append(frigate_event_id)
                     self.logger.warning(
-                        f"EVENT TIMEOUT: Event {unifi_event_id} (Frigate: {frigate_event_id}, "
-                        f"{event_data['object_type'].value}) has not been updated for "
-                        f"{time_since_update:.1f}s (timeout: {self.event_timeout_seconds}s). Force ending event."
+                        f"TRACK TIMEOUT: Frigate event {frigate_event_id} "
+                        f"has not been updated for {time_since_update:.1f}s "
+                        f"(timeout: {self.event_timeout_seconds}s). Force ending track."
                     )
 
-            for frigate_event_id, unifi_event_id in expired_frigate_events:
-                event_data = self._active_smart_events.get(unifi_event_id)
-                if not event_data:
-                    continue
-
-                try:
-                    await self.trigger_smart_detect_stop(event_data["object_type"], event_id=unifi_event_id)
-                except Exception as e:
-                    self.logger.exception(f"Error ending timed out event {unifi_event_id}: {e}")
-                finally:
-                    if frigate_event_id and frigate_event_id in self.frigate_to_unifi_event_map:
-                        del self.frigate_to_unifi_event_map[frigate_event_id]
-                    if frigate_event_id and frigate_event_id in self.event_snapshot_ready:
-                        del self.event_snapshot_ready[frigate_event_id]
-                    if unifi_event_id in self.event_last_update:
-                        del self.event_last_update[unifi_event_id]
-                    # Also drop this track from the shared zone status tracker
-                    # so it stops contributing occupancy to any zone (Section 8.5),
-                    # and free its trackerID allocation.
-                    tracker_id = self.unifi_tracker_id_by_frigate_event.pop(frigate_event_id, None)
-                    if tracker_id is not None:
-                        self.zone_status_tracker.remove_track(tracker_id)
-                    if frigate_event_id:
-                        self._release_tracker_id(frigate_event_id)
+            for frigate_event_id in expired_frigate_events:
+                tracker_id = self.frigate_id_to_tracker_id.get(frigate_event_id)
+                if tracker_id is not None:
+                    # Remove track from zone status tracker
+                    self.zone_status_tracker.remove_track(tracker_id)
+                    self.logger.debug(
+                        f"Removed timed-out track {frigate_event_id} (trackerID={tracker_id}) "
+                        f"from zone status tracker"
+                    )
+                
+                self._release_tracker_id(frigate_event_id)
+                self._active_frigate_events.discard(frigate_event_id)
+                self._frigate_event_object_types.pop(frigate_event_id, None)
+                self.event_last_update.pop(frigate_event_id, None)
+                self.event_snapshot_ready.pop(frigate_event_id, None)
 
     async def handle_detection_event(self, message: Message) -> None:
         if not isinstance(message.payload, bytes):
@@ -769,20 +864,25 @@ class FrigateCam(RTSPCam):
 
             self.logger.debug(
                 f"Frigate event: type={event_type}, id={event_id}, label={label}, "
-                f"active_frigate_events={list(self.frigate_to_unifi_event_map.keys())}"
+                f"active_frigate_events={list(self._active_frigate_events)}"
             )
 
             if event_type == "new":
-                if event_id in self.frigate_to_unifi_event_map:
+                if event_id in self._active_frigate_events:
                     self.logger.warning(
                         f"Received 'new' event for already active Frigate event_id={event_id}. "
-                        f"This may indicate event was not properly ended. Stopping old event first."
+                        f"Ignoring duplicate and cleaning up."
                     )
-                    old_unifi_id = self.frigate_to_unifi_event_map[event_id]
-                    if old_unifi_id in self._active_smart_events:
-                        old_event = self._active_smart_events[old_unifi_id]
-                        await self.trigger_smart_detect_stop(old_event["object_type"], event_id=old_unifi_id)
-                    del self.frigate_to_unifi_event_map[event_id]
+                    return
+                
+                if not self._is_motion_window_active():
+                    self.logger.warning(
+                        f"Received Frigate 'new' event {event_id} but no active motion window. "
+                        f"Buffering object detection until motion starts."
+                    )
+                    # In production, Frigate should not send objects outside a motion window,
+                    # but handle gracefully by waiting for motion to trigger.
+                    return
 
                 self.event_snapshot_ready[event_id] = asyncio.Event()
 
@@ -793,11 +893,7 @@ class FrigateCam(RTSPCam):
                 frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
 
                 # Register this track with the shared per-camera zone tracker,
-                # keyed by trackerID (matching how the real protocol scopes
-                # zone occupancy per tracked object rather than per event),
-                # and capture the resulting full zonesStatus dict to send
-                # alongside this message.
-                self.unifi_tracker_id_by_frigate_event[event_id] = tracker_id
+                # keyed by trackerID. This contributes to the aggregated zonesStatus.
                 zones_status = self._update_zone_status_for_track(
                     tracker_id,
                     custom_descriptor["zones"],
@@ -805,196 +901,171 @@ class FrigateCam(RTSPCam):
                     active=True,
                 )
 
-                unifi_event_id = await self.trigger_smart_detect_start(
-                    object_type, custom_descriptor, frame_time_ms, zonesStatus=zones_status
-                )
-
-                self.frigate_to_unifi_event_map[event_id] = unifi_event_id
-                self.event_last_update[unifi_event_id] = time.time()
+                if self._motion_smart_event_id is None:
+                    self._motion_smart_event_id = await self.trigger_smart_detect_start(
+                        object_type,
+                        custom_descriptor,
+                        frame_time_ms,
+                        zonesStatus=zones_status,
+                    )
+                else:
+                    await self.trigger_smart_detect_update(
+                        object_type,
+                        custom_descriptor,
+                        frame_time_ms,
+                        zonesStatus=zones_status,
+                        event_id=self._motion_smart_event_id,
+                    )
+                
+                self._active_frigate_events.add(event_id)
+                self._frigate_event_object_types[event_id] = object_type
+                self.event_last_update[event_id] = time.time()
 
                 self.logger.info(
-                    f"Frigate: Starting {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
-                    f"Total active events: {len(self.frigate_to_unifi_event_map)}"
+                    f"Frigate: Object entering zone (Frigate: {event_id}, trackerID: {tracker_id}, "
+                        f"{label}). Motion smart-detect event: {self._motion_smart_event_id}. "
+                    f"Total active objects: {len(self._active_frigate_events)}"
                 )
 
             elif event_type == "update":
-                if event_id in self.frigate_to_unifi_event_map:
-                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
-
-                    if unifi_event_id not in self._active_smart_events:
+                if event_id not in self._active_frigate_events:
+                    if not self._is_motion_window_active():
                         self.logger.warning(
-                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
-                            f"but that event is not active. Skipping update."
-                            f"active _active_smart_events: {list(self._active_smart_events.keys())}"
+                            f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
+                            f"(label={label}) with no active motion window; dropping update."
                         )
                         return
 
-                    tracker_id = self._get_tracker_id(event_id)
-                    custom_descriptor = self.build_descriptor_from_frigate_msg(
-                        frigate_msg, object_type, tracker_id
-                    )
-
-                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
-
-                    # Keep this track's contribution to the shared zone
-                    # tracker current on every update, independent of
-                    # whether this specific event is the one closing out.
-                    zones_status = self._update_zone_status_for_track(
-                        tracker_id,
-                        custom_descriptor["zones"],
-                        custom_descriptor["confidenceLevel"],
-                        active=True,
-                    )
-
-                    # Confirmed: trigger_smart_detect_update accepts zonesStatus.
-                    # event_id=unifi_event_id disambiguates against other
-                    # concurrently active tracks of the same object_type.
-                    await self.trigger_smart_detect_update(
-                        object_type, custom_descriptor, frame_time_ms,
-                        zonesStatus=zones_status, event_id=unifi_event_id,
-                    )
-
-                    self.event_last_update[unifi_event_id] = time.time()
-
-                    after_data = frigate_msg.get('after', {})
-                    has_snapshot = after_data.get('has_snapshot', False)
-                    if has_snapshot and self.args.frigate_http_url:
-                        self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
-                        try:
-                            snapshot_crop, snapshot_fov, heatmap = await self.fetch_snapshots_for_event(
-                                unifi_event_id, "smart_detect"
-                            )
-
-                            event_data = self._active_smart_events[unifi_event_id]
-                            if snapshot_crop:
-                                event_data["snapshot_crop_path"] = snapshot_crop
-                            if snapshot_fov:
-                                event_data["snapshot_fov_path"] = snapshot_fov
-                            if heatmap:
-                                event_data["heatmap_path"] = heatmap
-
-                            self.logger.debug(
-                                f"Cached snapshots for smart event {unifi_event_id}: "
-                                f"crop={snapshot_crop}, fov={snapshot_fov}, heatmap={heatmap}"
-                            )
-                        except Exception as e:
-                            self.logger.error(f"Error fetching/caching snapshots for event {unifi_event_id}: {e}")
-
-                    event_data = self._active_smart_events[unifi_event_id]
-                    event_age = time.time() - event_data["start_time"]
-                    self.logger.debug(
-                        f"Sent moving update for smart event (Frigate: {event_id}, UniFi: {unifi_event_id}). "
-                        f"Age: {event_age:.1f}s"
-                    )
-                else:
-                    self.logger.warning(
-                        f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
-                        f"(label={label}). Likely missed 'new' event."
-                    )
-
-            elif event_type == "end":
-                if event_id in self.frigate_to_unifi_event_map:
-                    unifi_event_id = self.frigate_to_unifi_event_map[event_id]
-
-                    if unifi_event_id not in self._active_smart_events:
-                        self.logger.warning(
-                            f"Frigate event {event_id} maps to UniFi event {unifi_event_id} "
-                            f"but that event is not active. Cleaning up mapping."
-                        )
-                        del self.frigate_to_unifi_event_map[event_id]
-                        if event_id in self.event_snapshot_ready:
-                            del self.event_snapshot_ready[event_id]
-                        return
-
-                    event_data = self._active_smart_events.get(unifi_event_id)
-                    if not event_data:
-                        self.logger.warning(
-                            f"Event data missing for UniFi event {unifi_event_id}. Cleaning up mapping."
-                        )
-                        del self.frigate_to_unifi_event_map[event_id]
-                        if event_id in self.event_snapshot_ready:
-                            del self.event_snapshot_ready[event_id]
-                        return
-
-                    tracker_id = self._get_tracker_id(event_id)
-                    final_descriptor = self.build_descriptor_from_frigate_msg(
-                        frigate_msg, object_type, tracker_id
-                    )
-                    end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
-                    frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
-
-                    event_duration = time.time() - event_data["start_time"]
+                    # Recovery path for out-of-order/missed MQTT delivery:
+                    # if a Frigate update arrives before we saw its "new"
+                    # event, adopt it as a late-joining object in the current
+                    # motion window instead of dropping it.
+                    self.event_snapshot_ready[event_id] = asyncio.Event()
+                    self._active_frigate_events.add(event_id)
+                    self._frigate_event_object_types[event_id] = object_type
                     self.logger.info(
-                        f"Frigate: Ending {label} smart event within motion context (Frigate: {event_id}, UniFi: {unifi_event_id}). "
-                        f"Duration: {event_duration:.1f}s"
+                        f"Recovered unknown Frigate update as active object "
+                        f"(event_id={event_id}, label={label}) in motion window "
+                        f"{self._motion_smart_event_id}."
                     )
-                    self.logger.debug(
-                        f"Event timestamps: end_time={end_time_ms}, frame_time={frame_time_ms}"
-                    )
+                
+                tracker_id = self._get_tracker_id(event_id)
+                custom_descriptor = self.build_descriptor_from_frigate_msg(
+                    frigate_msg, object_type, tracker_id
+                )
 
-                    # Send a final "moving" update carrying the real last-known
-                    # position/confidence BEFORE closing the track. This
-                    # mirrors real device behavior (the last real detection
-                    # frame arrives as a live "moving" message immediately
-                    # before the "leave" summary, which itself carries empty
-                    # descriptors) and avoids handing the closing zonesStatus
-                    # snapshot straight from a possibly-stale prior tick.
-                    zones_status_final_update = self._update_zone_status_for_track(
-                        tracker_id,
-                        final_descriptor["zones"],
-                        final_descriptor["confidenceLevel"],
-                        active=True,
-                    )
-                    await self.trigger_smart_detect_update(
-                        object_type, final_descriptor, frame_time_ms,
-                        zonesStatus=zones_status_final_update, event_id=unifi_event_id,
-                    )
+                frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
 
-                    # This track is closing -- remove its contribution from
-                    # the shared zone tracker (other tracks' occupancy is
-                    # unaffected, per protocol spec Section 7.4) and capture
-                    # the resulting post-departure zonesStatus for the stop
-                    # message.
-                    zones_status = self._update_zone_status_for_track(
-                        tracker_id,
-                        [],
-                        0,
-                        active=False,
-                    )
-                    # Keep stop-event zone handling simple: any zone that is
-                    # not "none" is reported as "leave".
-                    for zone in zones_status.values():
-                        if zone.get("status") != "none":
-                            zone["status"] = "leave"
+                # Keep this track's contribution to the shared zone tracker current.
+                # This maintains the aggregated zonesStatus across all active objects.
+                zones_status = self._update_zone_status_for_track(
+                    tracker_id,
+                    custom_descriptor["zones"],
+                    custom_descriptor["confidenceLevel"],
+                    active=True,
+                )
 
-                    # Confirmed: trigger_smart_detect_stop accepts zonesStatus.
-                    await self.trigger_smart_detect_stop(
+                if self._motion_smart_event_id is None:
+                    self._motion_smart_event_id = await self.trigger_smart_detect_start(
                         object_type,
-                        final_descriptor,
-                        end_time_ms,
-                        event_id=unifi_event_id,
-                        frame_time_ms=frame_time_ms,
+                        custom_descriptor,
+                        frame_time_ms,
                         zonesStatus=zones_status,
                     )
-
-                    self.unifi_tracker_id_by_frigate_event.pop(event_id, None)
-                    self._release_tracker_id(event_id)
-
-                    del self.frigate_to_unifi_event_map[event_id]
-                    if event_id in self.event_snapshot_ready:
-                        del self.event_snapshot_ready[event_id]
-                    if unifi_event_id in self.event_last_update:
-                        del self.event_last_update[unifi_event_id]
-
-                    self.logger.info(
-                        f"Frigate: Event {event_id} ended. "
-                        f"Remaining active events: {len(self.frigate_to_unifi_event_map)}"
-                    )
                 else:
+                    await self.trigger_smart_detect_update(
+                        object_type,
+                        custom_descriptor,
+                        frame_time_ms,
+                        zonesStatus=zones_status,
+                        event_id=self._motion_smart_event_id,
+                    )
+
+                self.event_last_update[event_id] = time.time()
+                self._frigate_event_object_types[event_id] = object_type
+
+            elif event_type == "end":
+                if event_id not in self._active_frigate_events:
                     self.logger.warning(
                         f"MISSED EVENT: Received 'end' for unknown Frigate event_id={event_id} "
                         f"(label={label}). Likely missed 'new' event."
                     )
+                    return
+                
+                if self._motion_smart_event_id is None:
+                    self.logger.warning(
+                        f"Frigate object end {event_id} but no active motion window. "
+                        f"Cleaning up track locally."
+                    )
+                    tracker_id = self.frigate_id_to_tracker_id.get(event_id)
+                    if tracker_id is not None:
+                        self.zone_status_tracker.remove_track(tracker_id)
+                        self._release_tracker_id(event_id)
+                    self._active_frigate_events.discard(event_id)
+                    self._frigate_event_object_types.pop(event_id, None)
+                    self.event_last_update.pop(event_id, None)
+                    self.event_snapshot_ready.pop(event_id, None)
+                    return
+
+                tracker_id = self._get_tracker_id(event_id)
+                final_descriptor = self.build_descriptor_from_frigate_msg(
+                    frigate_msg, object_type, tracker_id
+                )
+                end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
+                frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
+                
+                track_duration = time.time() - self.event_last_update.get(event_id, self._motion_start_time)
+                self.logger.info(
+                    f"Frigate: Object leaving (Frigate: {event_id}, trackerID: {tracker_id}, "
+                    f"{label}). Duration: {track_duration:.1f}s"
+                )
+
+                # Send a final update carrying the last-known position/confidence
+                # before removing the track. This mirrors real device behavior:
+                # the last real detection frame arrives as a live update immediately
+                # before the object leaves the zone.
+                zones_status_final_update = self._update_zone_status_for_track(
+                    tracker_id,
+                    final_descriptor["zones"],
+                    final_descriptor["confidenceLevel"],
+                    active=True,
+                )
+                await self.trigger_smart_detect_update(
+                    object_type, final_descriptor, frame_time_ms,
+                    zonesStatus=zones_status_final_update, event_id=self._motion_smart_event_id,
+                )
+
+                # This track is closing -- remove its contribution from
+                # the shared zone tracker (other tracks' occupancy is
+                # unaffected, per protocol spec Section 3) and capture
+                # the resulting post-departure zonesStatus.
+                zones_status = self._update_zone_status_for_track(
+                    tracker_id,
+                    [],
+                    0,
+                    active=False,
+                )
+                # Zone status override: any zone not "none" is reported as "leave".
+                for zone in zones_status.values():
+                    if zone.get("status") != "none":
+                        zone["status"] = "leave"
+
+                # Emit final leave update for this object within the motion window.
+                await self.trigger_smart_detect_update(
+                    object_type, final_descriptor, end_time_ms,
+                    zonesStatus=zones_status, event_id=self._motion_smart_event_id,
+                )
+
+                self._release_tracker_id(event_id)
+                self._active_frigate_events.discard(event_id)
+                self._frigate_event_object_types.pop(event_id, None)
+                self.event_last_update.pop(event_id, None)
+                self.event_snapshot_ready.pop(event_id, None)
+
+                self.logger.info(
+                    f"Frigate: Object {event_id} ended. "
+                    f"Remaining active objects: {len(self._active_frigate_events)}"
+                )
             else:
                 self.logger.debug(
                     f"Received unhandled event type: {event_type} for event_id={event_id}"
@@ -1023,24 +1094,36 @@ class FrigateCam(RTSPCam):
 
         self.logger.debug(
             f"Received snapshot: topic={message.topic.value}, "
-            f"message={message}"
+            f"label={snapshot_label}, size={len(message.payload)} bytes"
         )
 
+        # In the new architecture, all active objects within a motion window
+        # share the same smart event. We just need to cache the snapshot for
+        # whichever Frigate event matches the label.
         matching_frigate_event_id = None
-        for frigate_event_id, unifi_event_id in self.frigate_to_unifi_event_map.items():
-            if unifi_event_id in self._active_smart_events:
-                event_data = self._active_smart_events[unifi_event_id]
-                event_label = event_data["object_type"].value
-                if event_label == snapshot_label and not message.retain:
-                    matching_frigate_event_id = frigate_event_id
-                    break
+        snapshot_object_type = self.label_to_object_type(snapshot_label)
+        for frigate_event_id in self._active_frigate_events:
+            # Snapshots come labeled by object type (person, car, etc), but do
+            # not include a Frigate event ID. Match by active event object type
+            # first to avoid assigning person snapshots to vehicle tracks.
+            self.logger.debug(
+                f"Checking Frigate event {frigate_event_id} for snapshot label {snapshot_label}"
+            )
+            if snapshot_object_type is None:
+                matching_frigate_event_id = frigate_event_id
+                break
 
-        if matching_frigate_event_id:
+            if self._frigate_event_object_types.get(frigate_event_id) == snapshot_object_type:
+                matching_frigate_event_id = frigate_event_id
+                break
+
+        if matching_frigate_event_id and self._motion_smart_event_id is not None:
             f = tempfile.NamedTemporaryFile(delete=False)
             f.write(message.payload)
             f.close()
             self.logger.debug(
-                f"Updating snapshot for Frigate event {matching_frigate_event_id} ({snapshot_label}) with {f.name}"
+                f"Cached snapshot for Frigate event {matching_frigate_event_id} "
+                f"({snapshot_label}): {f.name} ({len(message.payload)} bytes)"
             )
             self.update_motion_snapshot(Path(f.name))
             if matching_frigate_event_id in self.event_snapshot_ready:
@@ -1049,5 +1132,5 @@ class FrigateCam(RTSPCam):
             self.logger.debug(
                 f"Discarding snapshot for label={snapshot_label} "
                 f"(size={len(message.payload)}, retained={message.retain}). "
-                f"No matching active event."
+                f"No active motion window or matching event."
             )

@@ -30,7 +30,55 @@ Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-
 - `timeStamp` is set fractionally *after* `payload.clockWall` (tens of ms later) — i.e. it's stamped at send time, not detection time. Fine to set at emit time.
 - `responseExpected: false`, `inResponseTo: 0` for all observed smart-detect pushes — this is fire-and-forget telemetry, not a request/response pair.
 
-## 3. Payload fields
+## 3. Architectural layers: Motion events vs. object tracking vs. EventSmartDetect
+
+There are three distinct scopes to understand:
+
+**1. Motion event (Unifi smart event context window)**
+- Triggered by motion detector `motion: ON` MQTT message
+- Spans from motion start until motion stop (`motion: OFF`)
+- A single motion window may contain multiple simultaneous object detections
+- Unifi API: `trigger_smart_detect_start()` (enter motion) → `trigger_smart_detect_stop()` (exit motion)
+
+**2. Frigate object tracking (per-object lifecycle)**
+- Each Frigate MQTT event message corresponds to a single object being tracked by Frigate's detector
+- Frigate's `event.id` = unique identifier for this object instance; analogous to Unifi's `trackerID`
+- Frigate event lifecycle: `type: "new"` → `type: "update"` (0+ messages) → `type: "end"`
+- Multiple Frigate object detections may occur within a single motion window
+
+**3. EventSmartDetect messages (per-object protocol messages)**
+- Sent per tracked object as it enters, moves, and exits zones
+- Sent *within* an active motion window (between `trigger_smart_detect_start()` and `trigger_smart_detect_stop()`)
+- Each message carries: `edgeType` (`enter`/`moving`/`leave`), object descriptor (`trackerID`, `zones`, confidence), and aggregated `zonesStatus`
+- Mapping: Frigate `event.id` (string) → Unifi `trackerID` (int, allocated per object for the bridge session)
+
+**Correct flow example:**
+```
+MQTT motion: ON
+  └─ trigger_smart_detect_start()
+     └─ Motion window begins, eventId counter starts
+        
+        MQTT frigate event type=new (vehicle detected in zone 1)
+          └─ Allocate trackerID=700000 for this Frigate event.id
+             └─ Send EventSmartDetect: edgeType="enter", trackerID=700000, zones=[1]
+        
+        MQTT frigate event type=update (vehicle moves to zone 2)
+          └─ Send EventSmartDetect: edgeType="moving", trackerID=700000, zones=[2]
+        
+        MQTT frigate event type=end (vehicle leaves)
+          └─ Send EventSmartDetect: edgeType="leave", trackerID=700000, zones=[], zonesStatus forced to leave
+             └─ Include smartDetectSnapshots[], trackerIDAttrMap
+        
+        (Meanwhile, another object may have entered/updated/left within the same motion window)
+
+MQTT motion: OFF
+  └─ trigger_smart_detect_stop()
+     └─ Motion window ends, all remaining trackerIDs cleaned up
+```
+
+**Key constraint:** Frigate's `event.id` is the object-level grouping key; do NOT treat it as a motion event. One motion window can contain many Frigate events (objects).
+
+## 4. Payload fields
 
 | Field | Notes |
 |---|---|
@@ -65,7 +113,7 @@ Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-
 | `attributes`, `lines`, `loiterZones`, `secondLensZones`, `coord3d` | Not exercised in either capture — safe to emit as `null`/`[]`/`[-1,-1]` defaults. |
 | `name`, `tag` | **Update from a second capture**: not always empty. A session with a matched face returned a populated (redacted-in-log) value in both `name` and `tag` on every descriptor for that trackerID, for the life of the track. This is Protect's facial-recognition "known person" label, populated by the camera when it matches its local face DB — not something the wire protocol invents on its own. **Relevant to your bridge**: your Frigate stats show `face_recognition_speed` is active, meaning Frigate is already doing face recognition. If Frigate's face-recognition match returns a name for a `person` event, you can populate `name`/`tag` here with that matched name to get the same "recognized person" labeling behavior in Protect's UI; otherwise leave both as `""`. |
 
-## 4. Observed message lifecycle for one track
+## 5. Observed message lifecycle for one track
 
 1. **enter** — first zone crossing. `objectTypes` populated, `edgeType: "enter"`, that zone's `zonesStatus[..].status: "enter"`.
 2. **moving** — repeated every ~250-500ms while the object is tracked and changing zones/position. `objectTypes: []`, box color stays `"red"`.
@@ -74,7 +122,7 @@ Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-
 
 Separately, low-confidence stationary "animal" blobs cycle through their own independent `enter`→`none`→`leave` messages roughly every 5 minutes even with zero real motion — this is background noise-floor detection, not something you need to reproduce faithfully; Frigate's static "false positive"/stationary filtering already suppresses most of this on the source side.
 
-## 5. Implications for your `FrigateCam` bridge
+## 6. Implications for your `FrigateCam` bridge
 
 Given your existing dual-dict label mapping and dataclass hierarchy in `unifi/protect_api/smart_detect.py`, the additions needed:
 
@@ -87,3 +135,22 @@ Given your existing dual-dict label mapping and dataclass hierarchy in `unifi/pr
 7. **boxColor derivation**: `"red"` while `edgeType` for the track is active (in zone), `"white"` for out-of-zone/background detections you still want to surface (optional — could just omit non-zone detections entirely, which is simpler and matches Frigate's zone-scoped semantics better).
 
 This is enough to drive `trigger_smart_detect_enter`/`_moving`/`_leave` (or equivalent) calls in your existing `UnifiCamBase` API from a Frigate MQTT event stream with correct field population.
+
+## 7. TODO: Loitering object handling (future investigation)
+
+**Issue:** Current implementation treats all Frigate `type: "update"` events identically, sending them as `edgeType: "moving"` messages. However, stationary/idle objects (e.g., parked cars, loitering persons) should use a different `edgeType` value.
+
+**Protocol spec guidance (Section 5):** Stationary objects are mentioned as cycling through `enter` → `none` → `leave` messages independently from actively moving tracks. The `edgeType: "none"` appears to correspond to idle/stationary state.
+
+**Current code state:** 
+- The `stationary` boolean is extracted from Frigate events and populated in the descriptor
+- The `loiterZones[]` field in descriptors is always empty (connection to this feature unclear)
+- No distinction is made between moving and stationary objects when determining message type
+
+**Questions to resolve:**
+1. When Frigate marks an object `stationary: true`, should we emit `edgeType: "none"` instead of `moving`?
+2. Should `loiterZones[]` be populated when an object is stationary? If so, with which zones?
+3. Should stationary objects send continuous updates while idle, or only a state-transition message?
+4. Do we need to implement the "cycling" behavior mentioned in Section 5 (re-announcing long-term loiterers every ~5 minutes), or is this background noise filtering not applicable to the bridge?
+
+**Next step:** Obtain a real device capture containing parked vehicles or stationary persons, then confirm the expected `edgeType` and `zonesStatus` values for loitering objects before implementing.

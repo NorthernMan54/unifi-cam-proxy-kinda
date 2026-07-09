@@ -611,6 +611,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         for tracker_id, desc_entry in best_descriptors_by_tracker.items():
             descriptor = desc_entry["descriptor"]
             zones = descriptor.get("zones", [1])
+            descriptor_object_type = descriptor.get("objectType", object_type.value)
 
             snapshot_width = desc_entry.get("snapshot_width") or active_event.get("snapshot_width") or 640
             snapshot_height = desc_entry.get("snapshot_height") or active_event.get("snapshot_height") or 360
@@ -624,13 +625,13 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "smartDetectSnapshot": snapshot_filename,
                 "smartDetectSnapshotHeight": snapshot_height,
                 "smartDetectSnapshotName": descriptor.get("name", ""),
-                "smartDetectSnapshotType": object_type.value,
+                "smartDetectSnapshotType": descriptor_object_type,
                 "smartDetectSnapshotWidth": snapshot_width,
                 "trackerID": tracker_id
             })
 
             tracker_id_attr_map[str(tracker_id)] = {
-                "objectType": object_type.value,
+                "objectType": descriptor_object_type,
                 "zone": zones if zones else [1]
             }
 
