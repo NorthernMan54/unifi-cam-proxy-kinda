@@ -211,7 +211,7 @@ class SnapshotHandlers:
                     if response.status != 200:
                         error_body = await response.text()
                         self.logger.warning(
-                            f"Failed to fetch {snapshot_type}: HTTP {response.status}, {error_body}"
+                            f"Failed to fetch {snapshot_type}: HTTP {response.status}, {error_body} from {snapshot_url}"
                         )
                         return False
                     
@@ -227,10 +227,10 @@ class SnapshotHandlers:
                     return True
                     
         except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching {snapshot_type}")
+            self.logger.warning(f"Timeout fetching {snapshot_type} from {snapshot_url}")
             return False
         except aiohttp.ClientError:
-            self.logger.exception(f"Failed to fetch/upload {snapshot_type}")
+            self.logger.exception(f"Failed to fetch/upload {snapshot_type} from {snapshot_url}")
             return False
 
     async def _upload_file_to_protect(

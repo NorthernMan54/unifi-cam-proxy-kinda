@@ -449,7 +449,11 @@ class FrigateCam(RTSPCam):
         return descriptor
 
     def _update_zone_status_for_track(
-        self, tracker_id: int, zones: list[int], confidence: float, active: bool
+        self,
+        tracker_id: int,
+        zones: list[int],
+        confidence: float,
+        active: bool,
     ) -> dict[str, dict[str, Any]]:
         """
         Feed this track's current zone membership into the shared, decaying
@@ -951,7 +955,17 @@ class FrigateCam(RTSPCam):
                     # unaffected, per protocol spec Section 7.4) and capture
                     # the resulting post-departure zonesStatus for the stop
                     # message.
-                    zones_status = self._update_zone_status_for_track(tracker_id, [], 0, active=False)
+                    zones_status = self._update_zone_status_for_track(
+                        tracker_id,
+                        [],
+                        0,
+                        active=False,
+                    )
+                    # Keep stop-event zone handling simple: any zone that is
+                    # not "none" is reported as "leave".
+                    for zone in zones_status.values():
+                        if zone.get("status") != "none":
+                            zone["status"] = "leave"
 
                     # Confirmed: trigger_smart_detect_stop accepts zonesStatus.
                     await self.trigger_smart_detect_stop(

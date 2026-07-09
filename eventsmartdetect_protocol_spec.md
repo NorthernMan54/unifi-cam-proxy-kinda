@@ -70,7 +70,7 @@ Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-
 1. **enter** — first zone crossing. `objectTypes` populated, `edgeType: "enter"`, that zone's `zonesStatus[..].status: "enter"`.
 2. **moving** — repeated every ~250-500ms while the object is tracked and changing zones/position. `objectTypes: []`, box color stays `"red"`.
 3. (object may cross into/out of multiple zones — messages show 2 zones simultaneously non-empty during a transition frame, e.g. `zones:[2,1]`)
-4. **leave** — terminal message for the track. Zone(s) revert to `"leave"`/`"none"`, and this single message carries the enriched summary payload (`smartDetectSnapshotFullFoV`, `smartDetectSnapshots`, `trackerIDAttrMap`). This is the message Protect's UI/timeline actually keys its event thumbnail off of.
+4. **leave** — terminal message for the track. This stop message explicitly carries the post-departure zone state in `zonesStatus`, with the active zone reporting `status: "leave"` (e.g. `"zonesStatus": {"2": {"level": 68, "status": "leave"}}`). Other configured zones remain present and may be `"none"`. This same terminal message also carries the enriched summary payload (`smartDetectSnapshotFullFoV`, `smartDetectSnapshots`, `trackerIDAttrMap`). This is the message Protect's UI/timeline actually keys its event thumbnail off of.
 
 Separately, low-confidence stationary "animal" blobs cycle through their own independent `enter`→`none`→`leave` messages roughly every 5 minutes even with zero real motion — this is background noise-floor detection, not something you need to reproduce faithfully; Frigate's static "false positive"/stationary filtering already suppresses most of this on the source side.
 
