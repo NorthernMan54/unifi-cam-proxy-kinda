@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 import aiohttp
 import websockets
@@ -346,6 +347,9 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
         self._motion_event_id += 1
 
+        # event_id = self._motion_event_id
+        
+        # Check if we already have an active smart detect event with this event_id
         if event_id in self._active_smart_events:
             existing_event = self._active_smart_events[event_id]
             self.logger.warning(
@@ -1107,6 +1111,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     ) -> AVClientResponse:
         if not payload:
             payload = {}
+        now = datetime.now(timezone.utc)
         return {
             "from": "ubnt_avclient",
             "functionName": name,
@@ -1117,7 +1122,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "timeStamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
             "to": "UniFiVideo",
         }
-
+    
     def get_uptime(self) -> float:
         return time.time() - self._init_time
 
@@ -1226,7 +1231,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         return False
 
     async def close(self):
-        self.logger.info("Cleaning up instance")
+        self.logger.info("Protect sent close, cleaning up instance")
         await self.stop_all_motion_events()
         self.close_streams()
 
