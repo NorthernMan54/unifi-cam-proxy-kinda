@@ -18,7 +18,7 @@ services:
       --token "FrZnnUqOlO84CmQijsWjKiBBtDwoz7i4"
       --name "Driveway"
       --model "UVC G4 Dome"
-      --fw-version "4.69.55"
+      --fw-version "5.3.95"
       frigate
       --timestamp-modifier 90
       --snapshot-url "http://192.168.1.38:5050/api/driveway/latest.jpg"
@@ -54,7 +54,7 @@ services:
       --token "GLuVqfAMLU8qjaXujLOCHxKQ7bXrdkic"
       --name "Canoe"
       --model "UVC G4 Dome"
-      --fw-version "4.69.55"
+      --fw-version "5.3.95"
       frigate
       --timestamp-modifier 90
       --snapshot-url "http://192.168.1.38:5050/api/backyard/latest.jpg"
@@ -86,7 +86,7 @@ services:
       --token "GLuVqfAMLU8qjaXujLOCHxKQ7bXrdkic"
       --name "Canoe"
       --model "UVC G4 Dome"
-      --fw-version "4.69.55"
+      --fw-version "5.3.95"
       frigate
       --timestamp-modifier 90
       --snapshot-url "http://192.168.1.38:5050/api/canoe/latest.jpg"
@@ -116,7 +116,7 @@ services:
       --token "mZLBOQRasWKfnSOmLLr146bqMZMGeF85"
       --name "North Sidewalk"
       --model "UVC G4 Dome"
-      --fw-version "4.69.55"
+      --fw-version "5.3.95"
       frigate
       --timestamp-modifier 90
       --snapshot-url "http://192.168.1.38:5050/api/side_door/latest.jpg"
@@ -146,7 +146,7 @@ services:
       --token "duwm0lq2MXkyEqhMhMyDEellAHqIEh1O"
       --name "Porch"
       --model "UVC G4 Dome"
-      --fw-version "4.69.55"
+      --fw-version "5.3.95"
       frigate
       --timestamp-modifier 90
       --snapshot-url "http://192.168.1.38:5050/api/porch/latest.jpg"
