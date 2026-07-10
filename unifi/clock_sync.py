@@ -1,4 +1,4 @@
-""""
+"""
 Helper program to inject absolute wall clock time into FLV stream for recordings
 """
 
@@ -10,6 +10,26 @@ import time
 from flvlib3.astypes import FLVObject
 from flvlib3.primitives import make_ui8, make_ui32
 from flvlib3.tags import create_script_tag
+
+# FIX: the two byte sequences below aren't arbitrary padding -- read as
+# big-endian 24-bit integers they declare the CLOCK RATE the following
+# timestamp is expressed in: [1,95,144] = 90000, [0,43,17] = 11025.
+# Every call site previously computed the actual tick value as
+# `elapsed_seconds * args.timestamp_modifier * 1000` regardless of which
+# branch fired -- i.e. always on a 90000Hz basis (timestamp_modifier
+# defaults to 90, so *1000 = 90000). That's correct for video (is_packet=True,
+# rate 90000) but wrong for everything else (audio, script/metadata tags,
+# the injected onClockSync/onMpma sync tags), which all declare an 11025Hz
+# rate yet received a tick count computed on the 90000Hz basis. Downstream,
+# reconstructing wall time as ticks/declared_rate then runs audio at
+# 90000/11025 =~ 8.163x real speed -- matching the observed FeedData
+# audio/video desync growing at ~8x real-time exactly.
+#
+# Fix: compute the tick value INSIDE this function, using the rate that
+# matches whichever branch actually fires, so it's no longer possible for a
+# caller to pass a mismatched pre-scaled value.
+VIDEO_CLOCK_RATE = 90000
+AUDIO_CLOCK_RATE = 11025
 
 
 def read_bytes(source, num_bytes):
@@ -33,15 +53,28 @@ def write_log(data):
     sys.stderr.buffer.write(f"{data}\n".encode())
 
 
-def write_timestamp_trailer(is_packet, ts):
-    # Write 15 byte trailer
+def write_timestamp_trailer(is_packet, elapsed_seconds):
+    """
+    Write the 15-byte clock-sync trailer.
+
+    Args:
+        is_packet: True for video tags (FLV packet_type == 9), False for
+            audio/script/metadata tags.
+        elapsed_seconds: real elapsed time (now - start), UNSCALED. The
+            correct clock rate is applied internally based on is_packet,
+            rather than requiring the caller to pre-multiply by the right
+            modifier (which was the source of the audio/video desync bug --
+            see module-level comment).
+    """
     write(make_ui8(0))
     if is_packet:
-        write(bytes([1, 95, 144, 0, 0, 0, 0, 0, 0, 0, 0]))
+        write(bytes([1, 95, 144, 0, 0, 0, 0, 0, 0, 0, 0]))  # declares 90000Hz
+        rate = VIDEO_CLOCK_RATE
     else:
-        write(bytes([0, 43, 17, 0, 0, 0, 0, 0, 0, 0, 0]))
+        write(bytes([0, 43, 17, 0, 0, 0, 0, 0, 0, 0, 0]))  # declares 11025Hz
+        rate = AUDIO_CLOCK_RATE
 
-    write(make_ui32(int(ts * 1000)))
+    write(make_ui32(int(elapsed_seconds * rate)))
 
 
 def main(args):
@@ -98,6 +131,7 @@ def main(args):
         timestamp = struct.unpack(">i", combined)[0]
 
         now = time.time()
+        elapsed = now - start
         if not last_ts or now - last_ts >= 5:
             last_ts = now
             # Insert a custom packet every so often for time synchronization
@@ -108,8 +142,8 @@ def main(args):
             packet_to_inject = create_script_tag("onClockSync", data, timestamp)
             write(packet_to_inject)
 
-            # Write 15 byte trailer
-            write_timestamp_trailer(False, (now - start) * args.timestamp_modifier)
+            # Write 15 byte trailer (script/metadata tag -> audio-rate branch)
+            write_timestamp_trailer(False, elapsed)
 
             # Write mpma tag
             # {'cs': {'cur': 1500000.0,
@@ -145,8 +179,8 @@ def main(args):
 
             write(packet_to_inject)
 
-            # Write 15 byte trailer
-            write_timestamp_trailer(False, (now - start) * args.timestamp_modifier)
+            # Write 15 byte trailer (script/metadata tag -> audio-rate branch)
+            write_timestamp_trailer(False, elapsed)
 
             # Write rest of original packet minus previous packet size
             write(header)
@@ -159,10 +193,11 @@ def main(args):
         # Write previous packet size
         write(read_bytes(source, 3))
 
-        # Write 15 byte trailer
-        write_timestamp_trailer(
-            packet_type == 9, (now - start) * args.timestamp_modifier
-        )
+        # Write 15 byte trailer -- is_packet determines both the declared
+        # rate marker AND now the actual scale applied (see fix above):
+        # video tags (packet_type == 9) get the 90000Hz-scaled value,
+        # everything else (audio, script) gets the 11025Hz-scaled value.
+        write_timestamp_trailer(packet_type == 9, elapsed)
 
         # Write mpma tag
         i += 1
@@ -174,7 +209,14 @@ def parse_args():
         "--timestamp-modifier",
         type=int,
         default="90",
-        help="Modify the timestamp correction factor (default: 90)",
+        help=(
+            "DEPRECATED / no longer used to scale the timestamp trailer -- "
+            "kept only for CLI compatibility with existing callers. The "
+            "video clock rate (90000Hz) and audio clock rate (11025Hz) are "
+            "now both fixed constants applied internally based on tag type, "
+            "since using a single shared modifier for both was the cause of "
+            "the audio/video clock desync bug (see write_timestamp_trailer)."
+        ),
     )
     return parser.parse_args()
 
