@@ -1,0 +1,98 @@
+services:
+  bonacres-driveway:
+    container_name: bonacres-driveway
+    restart: unless-stopped
+    build: .
+    environment:
+      - TZ=America/Toronto
+    volumes:
+      - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
+    command: >-
+      unifi-cam-proxy
+      --verbose
+      --host 192.168.1.85
+      --mac 'BB:BB:BB:BB:BB:AA'
+      --ip 192.168.10.41
+      --cert /client.pem
+      --token "Kk75OW4jnz4QBJFcONsBOfzlWfl4eGVP"
+      --name "Driveway"
+      --model "UVC G4 Dome"
+      --fw-version "5.3.95"
+      frigate
+      --timestamp-modifier 90
+      --snapshot-url "http://192.168.1.3:5000/api/bonacres_driveway/latest.jpg"
+      --ffmpeg-args='-c:v copy -c:a copy'
+      --frigate-camera bonacres_driveway
+      --mqtt-host 192.168.1.3
+      --mqtt-prefix frigate
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/bonacres_driveway_src
+    #  --video3 rtsp://192.168.1.3:8554/bonacres_driveway_video3
+
+# --ffmpeg-args='-c:v libx264 -preset veryfast -tune zerolatency -b:v 1200k -maxrate 2000k -bufsize 2400k -c:a aac -b:a 32k -ar 32000 -ac 1'
+
+  bonacres-porch:
+    container_name: bonacres-porch
+    restart: unless-stopped
+    build: .
+    environment:
+      - TZ=America/Toronto
+    volumes:
+      - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
+    command: >-
+      unifi-cam-proxy
+      --verbose
+      --host 192.168.1.85
+      --mac 'BB:BB:BB:BB:BB:BB'
+      --ip 192.168.10.42
+      --cert /client.pem
+      --token "Ep6UnSvjnCDDkz96f8OKnt82DCjKkRcr"
+      --name "Bonacres Porch"
+      --model "UVC G4 Dome"
+      --fw-version "5.3.95"
+      frigate
+      --timestamp-modifier 90
+      --snapshot-url "http://192.168.1.3:5000/api/bonacres_porch/latest.jpg"
+      --ffmpeg-args='-c:v copy -c:a copy'
+      --frigate-camera bonacres_porch
+      --mqtt-host 192.168.1.3
+      --mqtt-prefix frigate
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/bonacres_porch_src
+    #  --video3 rtsp://192.168.1.3:8554/bonacres_porch_src
+
+  bonacres-driveway-eufy:
+    container_name: bonacres-driveway-eufy
+    restart: unless-stopped
+    build: .
+    environment:
+      - TZ=America/Toronto
+    volumes:
+      - "./client.pem:/client.pem"
+      - "./unifi:/app/unifi"
+    command: >-
+      unifi-cam-proxy
+      --verbose
+      --host 192.168.1.85
+      --mac 'BB:BB:BB:BB:BB:CC'
+      --ip 192.168.10.20
+      --cert /client.pem
+      --token "xlEjgbU1YJ6IYYSCTgJNaWRpbZdIiQes"
+      --name "Bonacres Driveway Eufy"
+      --model "UVC G4 Dome"
+      --fw-version "5.3.95"
+      frigate
+      --timestamp-modifier 90
+      --snapshot-url "http://192.168.1.38:5000/api/bonacres_driveway_eufy/latest.jpg"
+      --ffmpeg-args='-c:v copy -c:a copy'
+      --frigate-camera bonacres_driveway_eufy
+      --mqtt-host 192.168.1.3
+      --mqtt-prefix frigate
+      --frigate-http-url http://192.168.1.3:5000
+      --frigate-time-sync-ms 1105
+      --video1 rtsp://192.168.1.3:8554/bonacres_driveway_eufy_src
+      --video3 rtsp://192.168.1.3:8554/bonacres_driveway_eufy_src
