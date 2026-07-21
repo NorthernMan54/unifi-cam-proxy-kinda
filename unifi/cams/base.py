@@ -46,17 +46,13 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         self._motion_snapshot_fov: Optional[Path] = None
         self._motion_heatmap: Optional[Path] = None
 
-        # KNOWN DEVIATION FROM REAL DEVICE BEHAVIOR: real UniFi Protect cameras
-        # run INDEPENDENT eventId sequences per function -- EventSmartDetect and
-        # EventSmartMotion each increment their own counter (confirmed from real
-        # captures: EventSmartDetect ran 36150->36203 while EventSmartMotion ran
-        # 3464->3467 concurrently over the same session). This implementation
-        # uses one shared counter across both, which will interleave/jump the
-        # sequence relative to what a real device produces. Flagging rather than
-        # changing unilaterally since splitting this affects both event paths --
-        # worth a deliberate pass (e.g. separate _smart_detect_event_id /
-        # _smart_motion_event_id counters) once confirmed desired.
-        self._motion_event_id: int = 0
+        # FIXED: real UniFi Protect cameras run INDEPENDENT eventId sequences per
+        # function -- EventSmartDetect and EventSmartMotion each increment their
+        # own counter (confirmed from real captures: EventSmartDetect ran
+        # 36150->36203 while EventSmartMotion ran 3464->3467 concurrently over
+        # the same session).
+        self._smart_detect_event_id: int = 0  # For EventSmartDetect messages
+        self._motion_event_id: int = 0        # For EventSmartMotion messages
 
         self._analytics_event_history: dict[int, dict[str, Any]] = {}
         self._active_analytics_event_id: Optional[int] = None
@@ -76,6 +72,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
 
         self.lingerEventStart: int = 1000
         self._analytics_start_task: Optional[asyncio.Task] = None
+        self._motion_pulse_task: Optional[asyncio.Task] = None
+
+        # Motion zone configuration: map zone IDs to names, default to zone "1"
+        self._motion_zone_id: str = "1"
+        self._motion_zone_config: dict[str, str] = {"1": "Default"}
+
+        # Motion confidence level for pulse events
+        self._motion_confidence_level: int = 50
 
         self.motionEvents: bool = True
 
@@ -189,6 +193,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
+            "hotplug":{"extender":{"attached":False}}
         }
 
     ###
@@ -343,10 +348,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         current_time = time.time()
 
         epoch_ms = int(time.time() * 1000)
-        event_id = epoch_ms * 1000 + (self._motion_event_id % 1000)
-        self._motion_event_id += 1
-
-        # event_id = self._motion_event_id
+        event_id = epoch_ms * 1000 + (self._smart_detect_event_id % 1000)
+        self._smart_detect_event_id += 1
         
         # Check if we already have an active smart detect event with this event_id
         if event_id in self._active_smart_events:
@@ -378,7 +381,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "enter",
-            "eventId": self._motion_event_id,
+            "eventId": self._smart_detect_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": "",
             "smartDetectSnapshotFullFoVHeight": 0,
@@ -410,6 +413,10 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "heatmap_path": None,
             "snapshot_width": None,
             "snapshot_height": None,
+            # Per-trackerID snapshots: {tracker_id: {crop: Path, fov: Path}}
+            # Populated by _fetch_and_cache_frigate_event_snapshot so each
+            # trackerID in the stop payload uses its own Frigate event snapshot.
+            "tracker_snapshots": {},
         }
 
         if custom_descriptor:
@@ -497,7 +504,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 "snapshot_height": snapshot_height,
             })
 
-        self._motion_event_id += 1
+        self._smart_detect_event_id += 1
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime() * 1000),
             "clockStream": int(self.get_uptime() * 1000),
@@ -506,7 +513,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "descriptors": descriptors,
             "displayTimeoutMSec": 10000,
             "edgeType": "moving",
-            "eventId": self._motion_event_id,
+            "eventId": self._smart_detect_event_id,
             "objectTypes": [object_type.value],
             "smartDetectSnapshotFullFoV": "",
             "smartDetectSnapshotFullFoVHeight": 0,
@@ -517,6 +524,58 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
 
         self.logger.debug(
             f"Updating smart detect event {target_event_id} for {object_type.value}"
+        )
+
+        await self.send(
+            self.gen_response("EventSmartDetect", payload=payload)
+        )
+
+    async def trigger_smart_detect_stationary(
+        self,
+        custom_descriptor: Optional[dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
+        zonesStatus: Optional[dict[str, Any]] = None,
+        event_id: Optional[int] = None,
+    ) -> None:
+        """
+        Emit edgeType='none' for a stationary background tracker.
+
+        Used when Frigate reports stationary=true on an update: the object is
+        still visible but is not occupying any zone and has not moved.  Real
+        devices use this heartbeat roughly every ~5 minutes; objectTypes is
+        empty and all zonesStatus entries are at level 0 / status 'none'
+        (protocol spec Section 7).
+        """
+        if event_id is not None and event_id not in self._active_smart_events:
+            self.logger.debug(
+                f"trigger_smart_detect_stationary called with event_id={event_id} "
+                f"but it is not active. Skipping."
+            )
+            return
+
+        self._smart_detect_event_id += 1
+        descriptors = [custom_descriptor] if custom_descriptor else []
+
+        payload: dict[str, Any] = {
+            "clockMonotonic": int(self.get_uptime() * 1000),
+            "clockStream": int(self.get_uptime() * 1000),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "descriptors": descriptors,
+            "displayTimeoutMSec": 300,
+            "edgeType": "none",
+            "eventId": self._smart_detect_event_id,
+            "objectTypes": [],
+            "smartDetectSnapshotFullFoV": "",
+            "smartDetectSnapshotFullFoVHeight": 0,
+            "smartDetectSnapshotFullFoVWidth": 0,
+            "smartDetectSnapshots": [],
+            "zonesStatus": zonesStatus,
+        }
+
+        self.logger.debug(
+            f"Sending stationary heartbeat (edgeType=none) for "
+            f"trackerID={custom_descriptor.get('trackerID') if custom_descriptor else 'unknown'}"
         )
 
         await self.send(
@@ -598,11 +657,15 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             }]
 
         best_descriptors_by_tracker: dict[int, dict[str, Any]] = {}
+        latest_descriptors_by_tracker: dict[int, dict[str, Any]] = {}
 
         for desc_entry in descriptors_to_process:
             descriptor = desc_entry["descriptor"]
             tracker_id = descriptor.get("trackerID", 1)
             confidence = descriptor.get("confidenceLevel", 0)
+
+            # Track the latest update for each tracker (for stationary state)
+            latest_descriptors_by_tracker[tracker_id] = desc_entry
 
             if tracker_id not in best_descriptors_by_tracker:
                 best_descriptors_by_tracker[tracker_id] = desc_entry
@@ -611,15 +674,38 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 if confidence > existing_confidence:
                     best_descriptors_by_tracker[tracker_id] = desc_entry
 
+        # Split: stationary bystanders go into descriptors[], active/departing
+        # trackers go into smartDetectSnapshots + trackerIDAttrMap.
+        # Protocol spec Section 7: stationary objects that are still visible at
+        # the time of departure appear as descriptors only -- they are NOT
+        # recorded as event participants.
+        bystander_descriptors: list[dict[str, Any]] = []
+
         for tracker_id, desc_entry in best_descriptors_by_tracker.items():
             descriptor = desc_entry["descriptor"]
+
+            # Use the LATEST state for the stationary check (a tracker might
+            # have started moving then gone stationary, or vice versa).
+            latest_entry = latest_descriptors_by_tracker.get(tracker_id, desc_entry)
+            is_stationary = latest_entry["descriptor"].get("stationary", False)
+
+            if is_stationary:
+                # Carry-along bystander: include in descriptors, skip snapshot/attrmap
+                bystander_descriptors.append(latest_entry["descriptor"])
+                continue
+
             zones = descriptor.get("zones", [1])
             descriptor_object_type = descriptor.get("objectType", object_type.value)
 
             snapshot_width = desc_entry.get("snapshot_width") or active_event.get("snapshot_width") or 640
             snapshot_height = desc_entry.get("snapshot_height") or active_event.get("snapshot_height") or 360
 
-            snapshot_crop_path = active_event.get("snapshot_crop_path")
+            # Prefer the per-tracker snapshot (keyed by trackerID, fetched from
+            # /api/events/{frigate_id}/snapshot.jpg for the specific Frigate track).
+            # Fall back to the shared smart-event snapshot if not available.
+            tracker_snapshots = active_event.get("tracker_snapshots", {})
+            per_tracker = tracker_snapshots.get(tracker_id, {})
+            snapshot_crop_path = per_tracker.get("crop") or active_event.get("snapshot_crop_path")
             snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"smartdetectsnap_zone_{tracker_id}_{desc_entry['timestamp_ms']}.jpg"
 
             smart_detect_snapshots.append({
@@ -670,16 +756,18 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             fov_width = active_event.get("snapshot_width") or 640
             fov_height = active_event.get("snapshot_height") or 360
 
-        self._motion_event_id += 1
+        self._smart_detect_event_id += 1
         payload: dict[str, Any] = {
             "clockMonotonic": int(self.get_uptime() * 1000),
             "clockStream": int(self.get_uptime() * 1000),
             "clockStreamRate": 1000,
             "clockWall": event_timestamp or int(round(time.time() * 1000)),
-            "descriptors": [],
+            # Stationary bystanders (still visible at departure time) go here;
+            # the departing active tracker(s) are in smartDetectSnapshots instead.
+            "descriptors": bystander_descriptors,
             "displayTimeoutMSec": 2000,
             "edgeType": "leave",
-            "eventId": self._motion_event_id,
+            "eventId": self._smart_detect_event_id,
             # FIX: real devices clear objectTypes to [] in lockstep with
             # descriptors on the terminal "leave" message -- confirmed against
             # multiple real captures (protocol spec Section 3). Previously this
@@ -715,14 +803,15 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 self._motion_event_ts = None
 
     # API for subclasses - Analytics (Motion) Events
-    async def _send_analytics_start_event(
+    async def _send_motion_start_event(
         self,
         event_id: int,
         event_timestamp: Optional[float] = None,
     ) -> None:
+        """Send EventSmartMotion start message with motion zone confidence levels."""
         if event_id not in self._analytics_event_history:
             self.logger.debug(
-                f"Analytics event {event_id} was stopped before linger period elapsed. "
+                f"Motion event {event_id} was stopped before linger period elapsed. "
                 f"Not sending start event."
             )
             return
@@ -731,11 +820,22 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
 
         if active_event.get("end_time") is not None:
             self.logger.debug(
-                f"Analytics event {event_id} already ended. Not sending start event."
+                f"Motion event {event_id} already ended. Not sending start event."
             )
             return
 
         self._motion_event_id += 1
+        active_event["motion_event_id"] = self._motion_event_id
+
+        # Use motion_levels from event history (initialized with default zone)
+        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 50})
+
+        # Generate motion snapshot filenames
+        motion_heatmap_filename = f"heatmap_{self._motion_event_id:08d}.png"
+        motion_snapshot_filename = f"motionsnap_{self._motion_event_id:08d}.jpg"
+        motion_snapshot_fov_filename = f"motionsnap_{self._motion_event_id:08d}_fullfov.jpg"
+        motion_raw_heatmap_npz = f"motion_raw_heatmap_{int(round(event_timestamp or time.time() * 1000))}.npz"
+
         payload: dict[str, Any] = {
             "clockBestMonotonic": 0,
             "clockBestWall": 0,
@@ -746,31 +846,112 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "edgeType": "start",
             "eventId": self._motion_event_id,
             "eventType": "motion",
-            # NOTE: real ChangeSmartMotionSettings configures the single
-            # full-frame smart-motion zone as "1", not "0" -- this hardcoded
-            # "0" key won't match the zone ID the controller actually assigned.
-            # Left as-is pending confirmation of whether this event path
-            # (functionName below) is even the right one -- see note above.
-            "levels": {"0": 47},
-            "motionHeatmap": "motionHeatmapline101.png",
-            "motionSnapshot": "motionSnapshotline102.png",
+            "levels": motion_levels,
+            "motionHeatmap": motion_heatmap_filename,
+            "motionHeatmapHeight": 90,
+            "motionHeatmapWidth": 160,
+            "motionSnapshot": motion_snapshot_filename,
+            "motionSnapshotFullFoV": motion_snapshot_fov_filename,
+            "motionSnapshotFullFoVHeight": 360,
+            "motionSnapshotFullFoVWidth": 640,
+            "motionSnapshotHeight": 360,
+            "motionSnapshotWidth": 360,
+            "motionRawHeatmapNPZ": motion_raw_heatmap_npz,
         }
 
         self.logger.info(
-            f"Sending analytics start event {event_id} after {self.lingerEventStart}ms linger period "
-            f"(active smart events: {len(self._active_smart_events)})"
+            f"Sending motion start event {self._motion_event_id} (analytics {event_id}) "
+            f"with levels: {motion_levels}, pulse task running: {self._motion_pulse_task is not None and not self._motion_pulse_task.done()}"
         )
 
-        # NOTE: every real device capture reviewed sends this payload shape
-        # under functionName "EventSmartMotion" -- "EventAnalytics" has never
-        # been observed on the wire. Verify against your controller/logs before
-        # relying on this path; if confirmed wrong, change both this and the
-        # stop event below.
         await self.send(
-            self.gen_response("EventAnalytics", payload=payload)
+            self.gen_response("EventSmartMotion", payload=payload)
         )
 
         active_event["start_event_sent"] = True
+
+        # Cancel any previous pulse task and start a new one
+        if self._motion_pulse_task and not self._motion_pulse_task.done():
+            self._motion_pulse_task.cancel()
+            try:
+                await self._motion_pulse_task
+            except asyncio.CancelledError:
+                pass
+
+        self._motion_pulse_task = asyncio.create_task(
+            self._pulse_motion_events(event_id)
+        )
+
+    async def _send_motion_pulse_event(
+        self,
+        event_id: int,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """Send EventSmartMotion pulse message (every 2-3s during motion window)."""
+        if event_id not in self._analytics_event_history:
+            return
+
+        active_event = self._analytics_event_history[event_id]
+
+        # Rate limit pulses to every 2-3 seconds
+        current_time = time.time()
+        last_pulse = active_event.get("last_pulse_time")
+        if last_pulse and (current_time - last_pulse) < 2.0:
+            return
+
+        motion_levels_updated_at = float(active_event.get("motion_levels_updated_at") or 0.0)
+        last_pulse_levels_updated_at = float(active_event.get("last_pulse_motion_levels_updated_at") or 0.0)
+        if motion_levels_updated_at <= last_pulse_levels_updated_at:
+            return
+
+        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 50})
+
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime() * 1000),
+            "clockStream": int(self.get_uptime() * 1000),
+            "clockStreamRate": 1000,
+            "clockWall": event_timestamp or int(round(time.time() * 1000)),
+            "edgeType": "unknown",
+            "eventId": 18446744073709551615,  # Special sentinel: max uint64 / -1 for pulse events
+            "eventType": "pulse",
+            "levels": motion_levels,
+        }
+
+        self.logger.debug(
+            f"Sending motion pulse event with levels: {motion_levels}"
+        )
+
+        await self.send(
+            self.gen_response("EventSmartMotion", payload=payload)
+        )
+
+        active_event["last_pulse_time"] = current_time
+        active_event["last_pulse_motion_levels_updated_at"] = motion_levels_updated_at
+
+    async def _pulse_motion_events(self, event_id: int) -> None:
+        """Background task that emits motion pulse events every 2-3 seconds."""
+        try:
+            while True:
+                await asyncio.sleep(2.5)  # Emit pulse every 2.5 seconds
+                if event_id not in self._analytics_event_history:
+                    break
+                active_event = self._analytics_event_history[event_id]
+                if active_event.get("end_time") is not None:
+                    break
+                await self._send_motion_pulse_event(event_id)
+        except asyncio.CancelledError:
+            self.logger.debug(f"Motion pulse task for event {event_id} cancelled")
+            raise
+
+    async def _send_analytics_start_event(
+        self,
+        event_id: int,
+        event_timestamp: Optional[float] = None,
+    ) -> None:
+        """Wrapper for backward compatibility - calls _send_motion_start_event."""
+        await self._send_motion_start_event(event_id, event_timestamp)
 
     async def trigger_analytics_start(
         self,
@@ -816,6 +997,20 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "snapshot_fov_path": None,
             "heatmap_path": None,
             "smart_detect_event_ids": [],
+            # Motion-specific fields for EventSmartMotion
+            "motion_event_id": None,
+            "motion_heatmap_path": None,
+            "motion_snapshot_path": None,
+            "motion_snapshot_fov_path": None,
+            "motion_raw_heatmap_npz_path": None,
+            "motion_levels": {self._motion_zone_id: 50},
+            "recordings_motion_level": None,
+            "recordings_motion_last_fetch": 0.0,
+            "motion_levels_source": "default",
+            "motion_levels_updated_at": 0.0,
+            "last_pulse_motion_levels_updated_at": 0.0,
+            "last_pulse_time": None,
+            "pulse_snapshot_counter": 0,
         }
         self._active_analytics_event_id = event_id
 
@@ -861,6 +1056,15 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             self._active_analytics_event_id = None
             return
 
+        # Cancel the pulse task before processing stop
+        if self._motion_pulse_task and not self._motion_pulse_task.done():
+            self._motion_pulse_task.cancel()
+            try:
+                await self._motion_pulse_task
+            except asyncio.CancelledError:
+                pass
+            self.logger.debug(f"Cancelled motion pulse task for event {event_id}")
+
         if self._analytics_start_task and not self._analytics_start_task.done():
             self._analytics_start_task.cancel()
             try:
@@ -868,7 +1072,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             except asyncio.CancelledError:
                 pass
             self.logger.info(
-                f"Analytics event {event_id} stopped before {self.lingerEventStart}ms linger period. "
+                f"Motion event {event_id} stopped before {self.lingerEventStart}ms linger period. "
                 f"No start/stop events will be sent."
             )
             del self._analytics_event_history[event_id]
@@ -894,7 +1098,7 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 heatmap_path = smart_event.get("heatmap_path")
                 self.logger.info(
                     f"Using snapshots from smart detect event {most_recent_smart_id} "
-                    f"for analytics event {event_id}"
+                    f"for motion event {event_id}"
                 )
             else:
                 self.logger.warning(
@@ -904,29 +1108,34 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
 
         if not snapshot_crop_path or not snapshot_fov_path or not heatmap_path:
             self.logger.info(
-                f"No smart detect snapshots available for analytics event {event_id}, "
+                f"No smart detect snapshots available for motion event {event_id}, "
                 f"fetching fresh snapshots"
             )
             try:
                 snapshot_crop_path, snapshot_fov_path, heatmap_path = await self.fetch_snapshots_for_event(
-                    event_id, "analytics"
+                    event_id, "motion"
                 )
                 self.logger.info(
-                    f"Fetched fresh snapshots for analytics event {event_id}: "
+                    f"Fetched fresh snapshots for motion event {event_id}: "
                     f"crop={snapshot_crop_path is not None}, "
                     f"fov={snapshot_fov_path is not None}, "
                     f"heatmap={heatmap_path is not None}"
                 )
             except Exception as e:
-                self.logger.error(f"Error fetching snapshots for analytics event {event_id}: {e}")
+                self.logger.error(f"Error fetching snapshots for motion event {event_id}: {e}")
 
         active_event["snapshot_crop_path"] = snapshot_crop_path
         active_event["snapshot_fov_path"] = snapshot_fov_path
         active_event["heatmap_path"] = heatmap_path
+        active_event["motion_snapshot_path"] = snapshot_crop_path
+        active_event["motion_snapshot_fov_path"] = snapshot_fov_path
+        active_event["motion_heatmap_path"] = heatmap_path
+        active_event["motion_raw_heatmap_npz_path"] = None  # Could be generated if needed
 
-        snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"snapshot_{event_id}.jpg"
-        snapshot_fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"snapshot_fov_{event_id}.jpg"
-        heatmap_filename = str(heatmap_path) if heatmap_path else f"heatmap_{event_id}.jpg"
+        snapshot_filename = str(snapshot_crop_path) if snapshot_crop_path else f"motionsnap_{event_id}.jpg"
+        snapshot_fov_filename = str(snapshot_fov_path) if snapshot_fov_path else f"motionsnap_{event_id}_fullfov.jpg"
+        heatmap_filename = str(heatmap_path) if heatmap_path else f"heatmap_{event_id}.png"
+        raw_heatmap_npz = f"motion_raw_heatmap_{int(round(event_timestamp or time.time() * 1000))}.npz"
 
         active_event["snapshot_filename"] = snapshot_filename
         active_event["snapshot_fov_filename"] = snapshot_fov_filename
@@ -934,6 +1143,8 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         active_event["end_time"] = time.time()
 
         self._motion_event_id += 1
+        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 0})
+
         payload: dict[str, Any] = {
             "clockBestMonotonic": int(self.get_uptime() * 1000),
             "clockBestWall": int(round(active_event["start_time"] * 1000)),
@@ -944,23 +1155,30 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
             "edgeType": "stop",
             "eventId": self._motion_event_id,
             "eventType": "motion",
-            "levels": {"0": 49},
+            "levels": motion_levels,
             "motionHeatmap": heatmap_filename,
+            "motionHeatmapHeight": 90,
+            "motionHeatmapWidth": 160,
             "motionSnapshot": snapshot_filename,
             "motionSnapshotFullFoV": snapshot_fov_filename,
+            "motionSnapshotFullFoVHeight": 360,
+            "motionSnapshotFullFoVWidth": 640,
+            "motionSnapshotHeight": 360,
+            "motionSnapshotWidth": 360,
+            "motionRawHeatmapNPZ": raw_heatmap_npz,
         }
 
         duration = time.time() - active_event["start_time"]
         self.logger.info(
-            f"Stopping analytics event {event_id} (duration: {duration:.1f}s, "
+            f"Stopping motion event {event_id} (duration: {duration:.1f}s, "
             f"smart_detect_events: {len(smart_detect_ids)})"
         )
         self.logger.debug(
-            f"Analytics event snapshots: crop={snapshot_filename}, fov={snapshot_fov_filename}, heatmap={heatmap_filename}"
+            f"Motion event snapshots: crop={snapshot_filename}, fov={snapshot_fov_filename}, heatmap={heatmap_filename}"
         )
 
         await self.send(
-            self.gen_response("EventAnalytics", payload=payload)
+            self.gen_response("EventSmartMotion", payload=payload)
         )
 
         self._active_analytics_event_id = None
@@ -996,6 +1214,14 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
         }
 
     async def stop_all_motion_events(self) -> None:
+        # Cancel pulse task if running
+        if self._motion_pulse_task and not self._motion_pulse_task.done():
+            self._motion_pulse_task.cancel()
+            try:
+                await self._motion_pulse_task
+            except asyncio.CancelledError:
+                pass
+
         smart_event_ids = list(self._active_smart_events.keys())
         for event_id in smart_event_ids:
             event = self._active_smart_events[event_id]
@@ -1011,11 +1237,23 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
                 )
 
         if self._active_analytics_event_id is not None:
-            self.logger.info("Force stopping analytics event")
+            self.logger.info("Force stopping motion event")
             try:
                 await self.trigger_motion_stop()
             except Exception as e:
-                self.logger.error(f"Error stopping analytics event: {e}")
+                self.logger.error(f"Error stopping motion event: {e}")
+
+    def set_motion_zone_config(self, zone_config: dict[str, str]) -> None:
+        """
+        Configure motion zone IDs and names.
+        
+        Args:
+            zone_config: Dict mapping zone IDs to zone names, e.g., {"1": "Front Door", "2": "Driveway"}
+        """
+        self._motion_zone_config = zone_config
+        if zone_config:
+            self._motion_zone_id = next(iter(zone_config.keys()), "1")
+        self.logger.debug(f"Motion zone config updated: {self._motion_zone_config}")
 
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
         try:

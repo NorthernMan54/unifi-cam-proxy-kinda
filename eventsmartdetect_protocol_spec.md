@@ -136,21 +136,104 @@ Given your existing dual-dict label mapping and dataclass hierarchy in `unifi/pr
 
 This is enough to drive `trigger_smart_detect_enter`/`_moving`/`_leave` (or equivalent) calls in your existing `UnifiCamBase` API from a Frigate MQTT event stream with correct field population.
 
-## 7. TODO: Loitering object handling (future investigation)
+## 7. Stationary Tracker Behavior — `edgeType: "none"`
 
-**Issue:** Current implementation treats all Frigate `type: "update"` events identically, sending them as `edgeType: "moving"` messages. However, stationary/idle objects (e.g., parked cars, loitering persons) should use a different `edgeType` value.
+**Confirmed from real device capture (2026-07-01/02, trackers 716235/716236, camera F4E2C60D4B4C).**
 
-**Protocol spec guidance (Section 5):** Stationary objects are mentioned as cycling through `enter` → `none` → `leave` messages independently from actively moving tracks. The `edgeType: "none"` appears to correspond to idle/stationary state.
+### `edgeType: "none"` — stationary background heartbeat
 
-**Current code state:** 
-- The `stationary` boolean is extracted from Frigate events and populated in the descriptor
-- The `loiterZones[]` field in descriptors is always empty (connection to this feature unclear)
-- No distinction is made between moving and stationary objects when determining message type
+When an object is tracked by the camera but is **stationary and not occupying any configured zone**, the device emits periodic updates with `edgeType: "none"` roughly every 5 minutes instead of `"moving"`:
 
-**Questions to resolve:**
-1. When Frigate marks an object `stationary: true`, should we emit `edgeType: "none"` instead of `moving`?
-2. Should `loiterZones[]` be populated when an object is stationary? If so, with which zones?
-3. Should stationary objects send continuous updates while idle, or only a state-transition message?
-4. Do we need to implement the "cycling" behavior mentioned in Section 5 (re-announcing long-term loiterers every ~5 minutes), or is this background noise filtering not applicable to the bridge?
+```json
+{
+  "edgeType": "none",
+  "objectTypes": [],
+  "displayTimeoutMSec": 308,
+  "descriptors": [
+    { "trackerID": 716236, "stationary": true, "zones": [], "boxColor": "white", ... }
+  ],
+  "zonesStatus": { "1": {"level": 0, "status": "none"}, "2": {"level": 0, "status": "none"}, "3": {"level": 0, "status": "none"} }
+}
+```
 
-**Next step:** Obtain a real device capture containing parked vehicles or stationary persons, then confirm the expected `edgeType` and `zonesStatus` values for loitering objects before implementing.
+**Rules for `edgeType: "none"` messages:**
+- `objectTypes: []` — stationary background objects are NOT reported as active detections
+- All `zonesStatus` entries: `level: 0`, `status: "none"` — no zone transitions
+- `displayTimeoutMSec: ~300` (much lower than active `"moving"` messages at ~10000)
+- `descriptors` still carries the stationary tracker with its current position and `stationary: true`
+- Does NOT trigger zone enter/exit transitions in Protect's UI
+
+**Implementation mapping (Frigate → bridge):**
+- When Frigate `type: "update"` has `after.stationary: true` → emit `edgeType: "none"` via `trigger_smart_detect_stationary()`
+- When Frigate `type: "new"` has `after.stationary: true` → still emit `edgeType: "enter"` (first appearance)
+- Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
+
+### Stationary bystanders in `leave` messages
+
+When an active (non-stationary) tracker departs its zone, the resulting `leave` message may still have stationary background trackers visible. These are handled with a strict payload split:
+
+| Payload field | Active (departing) tracker | Stationary bystander tracker |
+|---|---|---|
+| `descriptors[]` | ❌ empty (already in final update) | ✅ included (carry-along visibility ping) |
+| `smartDetectSnapshots[]` | ✅ included with best-confidence snapshot | ❌ excluded |
+| `trackerIDAttrMap` | ✅ included | ❌ excluded |
+
+**From the captured leave message (eventId 36203, 2026-07-02T00:02:50):**
+- `descriptors`: carried stationary animal 716236 (still visible, background noise)
+- `smartDetectSnapshots`: only person 716259 (the departing active tracker)
+- `trackerIDAttrMap`: only `"716259": {"objectType": "person", "zone": [2,3,1]}`
+
+**Implementation rule:** In `trigger_smart_detect_stop`, use the LATEST known state of each tracker to decide which bucket it goes into. A tracker whose most recent descriptor has `stationary: true` is a bystander — include it in `descriptors` only, not in `smartDetectSnapshots`/`trackerIDAttrMap`.
+
+### Multiple trackers batched in one message
+
+Real device messages frequently carry multiple trackers in a single `descriptors` array within one message (e.g. both 716235 and 716236 in the 23:32 message). Our bridge emits one message per Frigate object update due to MQTT event granularity — this is a minor shape difference and does not affect correctness in Protect's UI.
+
+## 8. EventSmartMotion — Motion Window Heartbeat Protocol
+
+`EventSmartMotion` runs concurrently with `EventSmartDetect`, representing the raw motion detector signal (independent of object classification). It uses a separate, independent `eventId` counter.
+
+### Message types
+
+| `edgeType` | `eventType` | When sent |
+|---|---|---|
+| `start` | `motion` | Motion window opens (after `lingerEventStartMSec` delay) |
+| `unknown` | `pulse` | Heartbeat every ~2-3 seconds while motion window is open |
+| `stop` | `motion` | Motion window closes |
+
+### `levels` field — Motion Intensity (0–100)
+
+The `levels` field is a dict keyed by zone ID string → integer 0–100:
+
+```json
+"levels": {"1": 75}
+```
+
+**Recommended implementation: prefer Frigate recordings motion, fall back to bounding-box area**
+
+Prefer the motion percentage returned by Frigate's recordings API for the active camera/event window. It is already normalized to a 0-100 scale and matches the semantics of EventSmartMotion better than raw geometry. If the recordings API is unavailable or returns no usable segment, fall back to the most recent Frigate event's `after.area` (bounding box area in pixels within the Frigate detection frame):
+
+```
+level = clamp(int(after.area / (frigate_detect_width * frigate_detect_height) * 100), 0, 100)
+```
+
+Where `frigate_detect_width` × `frigate_detect_height` is the Frigate detection resolution (default 1280×720). This gives a natural 0–100 scale proportional to how much of the frame the detected object occupies.
+
+When recordings motion is available, use that value directly as the zone level. Keep the area-derived value only as a fallback so EventSmartMotion still emits a stable level when the API cannot be queried.
+
+**Observed behavior:**
+- Levels fluctuate between pulses as the bounding box changes size (e.g. 75 → 82 → 100 → 50)
+- The level on the `stop` message reflects the final state
+- `levels` keys match the motion zone IDs from `ChangeSmartMotionSettings` (typically `{"1": N}` for a single full-frame zone)
+- Pulse events always use `eventId: 18446744073709551615` (max uint64 / sentinel), **not** the motion eventId counter
+
+### `clockBestMonotonic` / `clockBestWall`
+
+- `start` and `pulse`: both are `0` (not yet known)
+- `stop`: set to the monotonic/wall time of the **first motion frame** (i.e. when the motion window opened), not the stop time
+
+### Snapshot fields
+
+- `start`: filename stubs are populated (`motionHeatmap`, `motionSnapshot`, `motionSnapshotFullFoV`, `motionRawHeatmapNPZ`) with size fields set; actual data uploaded on `stop` GetRequest
+- `pulse`: all snapshot fields are empty strings / zero sizes
+- `stop`: populated with actual filenames; Protect immediately issues `GetRequest` for each file

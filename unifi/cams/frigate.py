@@ -498,9 +498,187 @@ class FrigateCam(RTSPCam):
         """
         return self._motion_smart_event_id
 
+    def _motion_level_from_area(self, area: int) -> int:
+        """
+        Convert a Frigate bounding-box area (pixels in the detection frame)
+        to an EventSmartMotion level (0-100).
+
+        Level = area / (detect_width * detect_height) * 100, clamped to [0, 100].
+        This gives a natural 0–100 scale where a box filling the whole frame
+        is 100 and an empty frame is 0.
+        """
+        total = self.args.frigate_detect_width * self.args.frigate_detect_height
+        if total <= 0:
+            return 50
+        return min(100, max(0, int(area * 100 / total)))
+
+    async def _fetch_recordings_motion_level(self, event_id: int) -> Optional[int]:
+        """
+        Fetch the most recent motion percentage from Frigate's recordings API.
+
+        The recordings endpoint already reports motion on a 0-100 scale, so it
+        is a better source for EventSmartMotion levels than re-deriving a value
+        from bounding-box area when it is available. Results are cached briefly
+        on the active analytics event to avoid hitting Frigate on every update.
+        """
+        if not self.args.frigate_http_url:
+            return None
+
+        event_data = self._analytics_event_history.get(event_id)
+        if not event_data:
+            return None
+
+        current_time = time.time()
+        last_fetch = float(event_data.get("recordings_motion_last_fetch") or 0.0)
+        cached_motion = event_data.get("recordings_motion_level")
+        if last_fetch and current_time - last_fetch < 3.0:
+            return cached_motion if isinstance(cached_motion, int) else None
+
+        start_time = float(event_data.get("start_time") or current_time)
+        after = max(0, int(start_time) - 5)
+        before = max(after + 1, int(current_time))
+        recordings_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/recordings"
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    recordings_url,
+                    params={"after": after, "before": before},
+                ) as response:
+                    event_data["recordings_motion_last_fetch"] = current_time
+                    if response.status != 200:
+                        self.logger.debug(
+                            f"Frigate recordings motion lookup failed for event {event_id}: "
+                            f"HTTP {response.status}"
+                        )
+                        return None
+
+                    payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as e:
+            event_data["recordings_motion_last_fetch"] = current_time
+            self.logger.debug(
+                f"Frigate recordings motion lookup failed for event {event_id}: {e}"
+            )
+            return None
+
+        if not isinstance(payload, list) or not payload:
+            return None
+
+        latest_recording = max(
+            payload,
+            key=lambda item: float(item.get("end_time") or item.get("start_time") or 0.0),
+        )
+
+        try:
+            motion_level = int(float(latest_recording.get("motion") or 0))
+        except (TypeError, ValueError):
+            return None
+
+        motion_level = min(100, max(0, motion_level))
+        event_data["recordings_motion_level"] = motion_level
+        event_data["recordings_motion_last_fetch"] = current_time
+        return motion_level
+
+    async def _update_motion_levels_from_recordings(
+        self,
+        frigate_msg: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        Update the active EventSmartMotion level using recordings motion when
+        available, falling back to area-derived motion only if the API doesn't
+        return a usable value.
+        """
+        if self._active_analytics_event_id is None:
+            return
+
+        active_event = self._analytics_event_history.get(self._active_analytics_event_id)
+        if not active_event:
+            return
+
+        recordings_level = await self._fetch_recordings_motion_level(self._active_analytics_event_id)
+        if recordings_level is not None:
+            active_event["motion_levels"] = {str(self._motion_zone_id): recordings_level}
+            active_event["motion_levels_source"] = "recordings"
+            active_event["motion_levels_updated_at"] = time.time()
+            return
+
+        after_area = frigate_msg.get("after", {}).get("area", 0) if frigate_msg else 0
+        if after_area:
+            active_event["motion_levels"] = {
+                str(self._motion_zone_id): self._motion_level_from_area(after_area)
+            }
+            active_event["motion_levels_source"] = "area"
+            active_event["motion_levels_updated_at"] = time.time()
+
     def _is_motion_window_active(self) -> bool:
         """Return whether an analytics motion window is currently active."""
         return self._active_analytics_event_id is not None
+
+    async def _fetch_and_cache_frigate_event_snapshot(
+        self, frigate_event_id: str, smart_event_id: int
+    ) -> None:
+        """
+        Fetch the event-specific snapshot from Frigate's API and cache it per-tracker
+        on the smart event. Uses ?crop=1 for the thumbnail (native Frigate crop to the
+        detected object). Snapshots are stored under
+        smart_event['tracker_snapshots'][tracker_id] so that the stop payload can
+        assign each trackerID its own image rather than sharing one file.
+        """
+        if not self.args.frigate_http_url:
+            return
+
+        tracker_id = self.frigate_id_to_tracker_id.get(frigate_event_id)
+        if tracker_id is None:
+            return
+
+        base_url = f"{self.args.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
+        full_url = base_url
+        thumbnail_url = f"{base_url}?crop=1&quality=80"
+
+        self.logger.debug(
+            f"Using Frigate event-specific snapshot URLs for event {smart_event_id} "
+            f"(Frigate: {frigate_event_id}, trackerID: {tracker_id}): {base_url}"
+        )
+
+        async def fetch_url(url: str) -> Optional[Path]:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                        if response.status == 200:
+                            data = await response.read()
+                            f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                            f.write(data)
+                            f.close()
+                            return Path(f.name)
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch snapshot {url}: {e}")
+            return None
+
+        fov_path, crop_path = await asyncio.gather(
+            fetch_url(full_url),
+            fetch_url(thumbnail_url),
+        )
+
+        smart_event = self._active_smart_events.get(smart_event_id)
+        if smart_event and (crop_path or fov_path):
+            # Per-tracker snapshot map: tracker_id -> {crop, fov}
+            if 'tracker_snapshots' not in smart_event:
+                smart_event['tracker_snapshots'] = {}
+            smart_event['tracker_snapshots'][tracker_id] = {
+                'crop': crop_path,
+                'fov': fov_path,
+            }
+            # Also keep the shared fallback updated (most-recently-fetched tracker wins)
+            if crop_path:
+                smart_event['snapshot_crop_path'] = crop_path
+            if fov_path:
+                smart_event['snapshot_fov_path'] = fov_path
+                smart_event['heatmap_path'] = fov_path
+            self.logger.debug(
+                f"Cached snapshots for smart event {smart_event_id} trackerID {tracker_id}: "
+                f"crop={crop_path}, fov={fov_path}"
+            )
 
     async def fetch_snapshots_for_event(
         self, event_id: int, event_type: str = "analytics"
@@ -519,15 +697,27 @@ class FrigateCam(RTSPCam):
             self.logger.warning("Cannot fetch snapshots: frigate_http_url not configured")
             return (None, None, None)
 
+        # Check if we already have cached snapshots on the smart event itself
+        if event_type in ("smart_detect", "motion"):
+            # For smart detect events, check _active_smart_events cache
+            smart_event_id = event_id if event_type == "smart_detect" else None
+            if event_type == "motion" and event_id in self._analytics_event_history:
+                smart_detect_ids = self._analytics_event_history[event_id].get("smart_detect_event_ids", [])
+                if smart_detect_ids:
+                    smart_event_id = smart_detect_ids[-1]
+            if smart_event_id is not None:
+                smart_event = self._active_smart_events.get(smart_event_id)
+                if smart_event:
+                    crop = smart_event.get('snapshot_crop_path')
+                    fov = smart_event.get('snapshot_fov_path')
+                    heatmap = smart_event.get('heatmap_path') or fov
+                    if crop and fov:
+                        self.logger.debug(
+                            f"Using pre-cached event-specific snapshots for event {event_id}"
+                        )
+                        return (crop, fov, heatmap)
+
         frigate_event_id = None
-        if event_type == "smart_detect":
-            # In the new architecture, we don't have a direct mapping from motion window
-            # smart event ID to individual Frigate event IDs. All objects in a motion
-            # window use the same smart event context. For now, use generic snapshot URLs.
-            self.logger.debug(
-                f"Smart detect event {event_id} does not map to a specific Frigate event "
-                f"(all objects share motion window). Using generic camera snapshots."
-            )
 
         if frigate_event_id:
             base_url = f"{self.args.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
@@ -640,6 +830,9 @@ class FrigateCam(RTSPCam):
                                 f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/motion"
                             ):
                                 tg.create_task(self.handle_motion_event(message))
+                            elif message.topic.matches(
+                                f"{self.args.mqtt_prefix}/reviews"):
+                                self.logger.debug(f"Received Frigate review event: {message.payload.decode()}")
             except MqttError:
                 if not has_connected:
                     raise
@@ -745,6 +938,7 @@ class FrigateCam(RTSPCam):
                     f"Motion window started immediately (analytics_event_id={self._active_analytics_event_id}); "
                     "ready for object detections"
                 )
+                await self._update_motion_levels_from_recordings()
             except Exception as e:
                 self.logger.error(f"Failed to start motion window: {e}")
                 self._motion_smart_event_id = None
@@ -921,6 +1115,8 @@ class FrigateCam(RTSPCam):
                 self._frigate_event_object_types[event_id] = object_type
                 self.event_last_update[event_id] = time.time()
 
+                await self._update_motion_levels_from_recordings(frigate_msg)
+
                 self.logger.info(
                     f"Frigate: Object entering zone (Frigate: {event_id}, trackerID: {tracker_id}, "
                         f"{label}). Motion smart-detect event: {self._motion_smart_event_id}. "
@@ -972,6 +1168,16 @@ class FrigateCam(RTSPCam):
                         frame_time_ms,
                         zonesStatus=zones_status,
                     )
+                elif custom_descriptor.get("stationary", False):
+                    # Stationary background object: emit edgeType="none" heartbeat.
+                    # objectTypes=[] and zones remain at level 0 / status "none"
+                    # (protocol spec Section 7 — stationary tracker behavior).
+                    await self.trigger_smart_detect_stationary(
+                        custom_descriptor=custom_descriptor,
+                        event_timestamp=frame_time_ms,
+                        zonesStatus=zones_status,
+                        event_id=self._motion_smart_event_id,
+                    )
                 else:
                     await self.trigger_smart_detect_update(
                         object_type,
@@ -983,6 +1189,24 @@ class FrigateCam(RTSPCam):
 
                 self.event_last_update[event_id] = time.time()
                 self._frigate_event_object_types[event_id] = object_type
+
+                await self._update_motion_levels_from_recordings(frigate_msg)
+
+                # Eagerly fetch and cache snapshot when Frigate has one ready.
+                # This mirrors the old version's behaviour: use the event-specific
+                # Frigate snapshot URL (with native crop) rather than latest.jpg.
+                after_data = frigate_msg.get('after', {})
+                if after_data.get('has_snapshot') and self._motion_smart_event_id is not None:
+                    smart_event = self._active_smart_events.get(self._motion_smart_event_id)
+                    if smart_event and not smart_event.get('snapshot_crop_path'):
+                        self.logger.debug(
+                            f"Event {event_id} has updated snapshot, fetching and caching all types..."
+                        )
+                        asyncio.ensure_future(
+                            self._fetch_and_cache_frigate_event_snapshot(
+                                event_id, self._motion_smart_event_id
+                            )
+                        )
 
             elif event_type == "end":
                 if event_id not in self._active_frigate_events:
@@ -1013,6 +1237,8 @@ class FrigateCam(RTSPCam):
                 )
                 end_time_ms = int(frigate_msg.get('after', {}).get('end_time', 0) * 1000) - self.args.frigate_time_sync_ms
                 frame_time_ms = int(frigate_msg.get('after', {}).get('frame_time', 0) * 1000) - self.args.frigate_time_sync_ms
+
+                await self._update_motion_levels_from_recordings(frigate_msg)
                 
                 track_duration = time.time() - self.event_last_update.get(event_id, self._motion_start_time)
                 self.logger.info(
