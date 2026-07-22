@@ -164,10 +164,15 @@ When an object is tracked by the camera but is **stationary and not occupying an
 - Does NOT trigger zone enter/exit transitions in Protect's UI
 
 **Implementation mapping (Frigate → bridge):**
-- When Frigate `type: "update"` has `after.stationary: true` → emit `edgeType: "none"` via `trigger_smart_detect_stationary()`
-- When Frigate `type: "new"` has `after.stationary: true` → still emit `edgeType: "enter"` (first appearance)
-- Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
 
+- When Frigate `type: "new"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+- When Frigate `type: "update"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+- When Frigate `type: "end"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+
+- When Frigate `type: "update"` has `before.position_changes = 0 and after.position_changes > 0` → emit `edgeType: "enter"` (first appearance)
+
+- Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
+  
 ### Stationary bystanders in `leave` messages
 
 When an active (non-stationary) tracker departs its zone, the resulting `leave` message may still have stationary background trackers visible. These are handled with a strict payload split:
