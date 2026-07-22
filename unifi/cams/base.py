@@ -147,6 +147,31 @@ class UnifiCamBase(ProtocolHandlers, VideoStreamHandlers, SnapshotHandlers, meta
     async def run(self) -> None:
         return
 
+    async def send_mcu_event_message(self, payload: dict[str, Any]) -> None:
+        """Send MCUEventMessage to UniFi Protect.
+        
+        This method sends doorbell ring events using the MCUEventMessage function name
+        as specified in the protocol spec.
+        
+        Format:
+        {
+            "from": "ubnt_avclient",
+            "functionName": "MCUEventMessage",
+            "inResponseTo": 0,
+            "messageId": <incrementing counter>,
+            "payload": {
+                "eventType": "EventRingButtonPressed"
+            },
+            "responseExpected": false,
+            "timeStamp": "ISO timestamp",
+            "to": "UniFiVideo"
+        }
+        """
+
+        await self.send(
+            self.gen_response("MCUEventMessage", payload=payload)
+        )
+
     async def get_video_settings(self) -> dict[str, Any]:
         return {}
 

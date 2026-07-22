@@ -256,10 +256,19 @@ class FrigateCam(RTSPCam):
                 'ChangeSmartDetectSettings on connect.'
             ),
         )
+        parser.add_argument(
+            "--doorbell",
+            action="store_true",
+            default=False,
+            help="Enable doorbell event forwarding from Frigate",
+        )
 
     async def get_feature_flags(self) -> dict[str, Any]:
+        flags = await super().get_feature_flags()
+        # Set doorbell flag based on --doorbell argument
+        flags["doorbell"] = self.args.doorbell
         return {
-            **await super().get_feature_flags(),
+            **flags,
             **{
                 "mic": True,
                 "smartDetect": [
@@ -830,6 +839,10 @@ class FrigateCam(RTSPCam):
                                 f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/motion"
                             ):
                                 tg.create_task(self.handle_motion_event(message))
+                            elif self.args.doorbell and message.topic.matches(
+                                f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/doorbell"
+                            ):
+                                tg.create_task(self.handle_doorbell_event(message))
                             elif message.topic.matches(
                                 f"{self.args.mqtt_prefix}/reviews"):
                                 self.logger.debug(f"Received Frigate review event: {message.payload.decode()}")
@@ -1302,6 +1315,49 @@ class FrigateCam(RTSPCam):
         except Exception as e:
             self.logger.exception(
                 f"Unexpected error handling detection event: {e}, payload: {msg}"
+            )
+
+    async def handle_doorbell_event(self, message: Message) -> None:
+        """Handle Frigate doorbell ring events.
+        
+        Sends MCUEventMessage for doorbell ring events, as per the protocol spec.
+        """
+        if not isinstance(message.payload, bytes):
+            self.logger.warning(
+                f"Unexpectedly received non-bytes payload for doorbell event: {message.payload}"
+            )
+            return
+
+        try:
+            msg = message.payload.decode()
+            frigate_msg = json.loads(msg)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.logger.warning(
+                f"Could not decode doorbell event: {e}, payload: {msg}"
+            )
+            return
+
+        self.logger.debug(
+            f"Received Frigate doorbell event: {msg[:200]}..." if len(msg) > 200 else f"Received Frigate doorbell event: {msg}"
+        )
+
+        # Convert Frigate doorbell event to MCUEventMessage format
+        try:
+
+            # Build MCUEventMessage payload as per protocol spec
+            mcu_payload = {
+                "eventType": "EventRingButtonPressed"
+            }
+
+            # Send MCUEventMessage to UniFi Protect
+            await self.send_mcu_event_message(mcu_payload)
+
+            self.logger.info(
+                f"Forwarded Frigate doorbell ring to UniFi Protect"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to forward doorbell ring to UniFi Protect: {e}"
             )
 
     async def handle_snapshot_event(self, message: Message) -> None:

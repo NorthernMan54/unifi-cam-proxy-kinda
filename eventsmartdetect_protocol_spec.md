@@ -237,3 +237,124 @@ When recordings motion is available, use that value directly as the zone level. 
 - `start`: filename stubs are populated (`motionHeatmap`, `motionSnapshot`, `motionSnapshotFullFoV`, `motionRawHeatmapNPZ`) with size fields set; actual data uploaded on `stop` GetRequest
 - `pulse`: all snapshot fields are empty strings / zero sizes
 - `stop`: populated with actual filenames; Protect immediately issues `GetRequest` for each file
+
+## 9. Doorbell-Specific Protocol
+
+### MCUEventMessage — Doorbell Event Format
+
+Doorbell events (ring/chime) are sent via the `MCUEventMessage` function name. The log shows this is a distinct message type from the object tracking protocols above.
+
+**Example from `ds-extracted-doorbell.log`:**
+```json
+{
+    "from":"ubnt_avclient",
+    "functionName":"MCUEventMessage",
+    "inResponseTo":0,
+    "messageId":85427379,
+    "payload":{
+        "eventType":"EventRingButtonPressed"
+        },
+    "responseExpected":false,
+    "timeStamp":"2026-07-21T13:54:06.440+00:00",
+    "to":"UniFiVideo"
+}
+```
+
+**Key characteristics:**
+- `functionName`: `MCUEventMessage` (distinct from `EventSmartDetect` and `EventSmartMotion`)
+- `payload.event.type`: `"ring"` for doorbell ring events
+- `payload.doorbell`: `true` flag indicating this is a doorbell device
+- `payload.event.smartDetect`: may contain object tracking data if smart detection is active
+- `messageId`: monotonically increasing counter shared across all message types on the connection
+
+### ubnt_avclient_hello — Doorbell Feature Detection
+
+The `ubnt_avclient_hello` message includes a `features` object that indicates whether the device is a doorbell. This is how your emulator should detect doorbell vs. camera devices.
+
+**Doorbell detection from `ubnt_avclient_hello`:**
+```json
+{
+  "from": "ubnt_avclient",
+  "functionName": "ubnt_avclient_hello",
+  "payload": {
+    "features": {
+      "doorbell": true,
+      "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "faceEnhancedByAiKey", "lprEnhancedByAiKey", "alrmSmoke", "alrmCmonx", "alrmBabyCry", "alrmSpeak"],
+      "motionDetect": ["enhanced"],
+      "mic": true,
+      "speaker": true,
+      "doorAccessConfig": false,
+      "chimeControl": false,
+      "welcomeLed": true,
+      "ringVolume": 1,
+      "audioCodecs": ["aac", "opus"],
+      "audioStyle": ["nature", "noiseReduced"],
+      "talkback": {
+        "typeFmt": "aac",
+        "typeIn": "serverudp",
+        "bindAddr": "0.0.0.0",
+        "bindPort": 7004
+      },
+      "videoCodecs": ["h264", "h265", "mjpg"],
+      "downScaleLevels": ["2K+", "2K", "HD"],
+      "streamEncryptable": true
+    },
+    "model": "UVC Doorbell Lite",
+    "name": "Wasaga Doorbell",
+    "protocolVersion": 67,
+    "uptime": 569595
+  }
+}
+```
+
+**Doorbell-specific features observed:**
+- `doorbell: true` — primary indicator of doorbell device type
+- `mic: true` / `speaker: true` — audio capabilities for two-way talkback
+- `welcomeLed: true` — LED indicator for doorbell rings
+- `talkback` settings — configured for doorbell audio communication
+- `ringVolume` — ring notification volume level
+- `smartDetect` — includes person/vehicle/animal detection for motion events
+- `chimeControl` — may be used to control ring chime behavior
+
+**Implementation guidance:**
+- When `features.doorbell` is `true`, route the connection to doorbell-specific handlers
+- Doorbell events should be processed via `MCUEventMessage` rather than `EventSmartDetect`
+- Ring events may include `smartDetect` object data if motion was detected with object classification
+- Audio stream settings differ from standard cameras (talkback, ring volume, chime control)
+
+### Doorbell Event Flow
+
+```
+Device connects
+  └─ ubnt_avclient_hello (features.doorbell: true)
+     └─ Identify as doorbell device
+     
+Ring occurs
+  └─ MCUEventMessage (functionName: "MCUEventMessage")
+     └─ payload.event.type: "ring"
+        └─ May include smartDetect object data
+           └─ payload.doorbell: true
+     
+Motion detection (optional)
+  └─ EventSmartDetect (if person/vehicle detected)
+     └─ Edge types: enter, moving, leave
+        └─ Triggers zone-based smart detect events
+```
+
+### Doorbell vs. Camera Protocol Differences
+
+| Feature | Doorbell | Standard Camera |
+|---|---|---|
+| `ubnt_avclient_hello.features.doorbell` | `true` | `false` or absent |
+| Primary event function | `MCUEventMessage` | `EventSmartDetect` |
+| Audio features | `mic: true`, `speaker: true` | May vary |
+| Talkback config | Configured for doorbell audio | Standard video audio |
+| Ring indicators | `welcomeLed: true`, `ringVolume` | N/A |
+| Smart detect scope | Ring events + motion | Motion + object tracking |
+| Chime control | `chimeControl` feature | N/A |
+
+This completes the doorbell protocol specification. Doorbell devices follow the same session framing and message envelope structure as standard cameras, but use `MCUEventMessage` for ring events and report `features.doorbell: true` in the hello message.
+
+
+
+TODO: Need to update support for stationary object - after.position_changes s/b > 0 for an active object, after.position_changes
