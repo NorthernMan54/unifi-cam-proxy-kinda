@@ -164,6 +164,13 @@ When an object is tracked by the camera but is **stationary and not occupying an
 - Does NOT trigger zone enter/exit transitions in Protect's UI
 
 **Implementation mapping (Frigate → bridge):**
+- When Frigate `type: "new"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+- When Frigate `type: "update"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+- When Frigate `type: "end"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
+
+- When Frigate `type: "update"` has `before.position_changes = 0 and after.position_changes > 0` → emit `edgeType: "enter"` (first appearance)
+
+- Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
 
 - When Frigate `type: "new"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
 - When Frigate `type: "update"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
@@ -360,6 +367,3 @@ Motion detection (optional)
 
 This completes the doorbell protocol specification. Doorbell devices follow the same session framing and message envelope structure as standard cameras, but use `MCUEventMessage` for ring events and report `features.doorbell: true` in the hello message.
 
-
-
-TODO: Need to update support for stationary object - after.position_changes s/b > 0 for an active object, after.position_changes
