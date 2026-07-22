@@ -171,14 +171,6 @@ When an object is tracked by the camera but is **stationary and not occupying an
 - When Frigate `type: "update"` has `before.position_changes = 0 and after.position_changes > 0` → emit `edgeType: "enter"` (first appearance)
 
 - Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
-
-- When Frigate `type: "new"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
-- When Frigate `type: "update"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
-- When Frigate `type: "end"` has `after.position_changes = 0` → emit `edgeType: "none"` stationary object
-
-- When Frigate `type: "update"` has `before.position_changes = 0 and after.position_changes > 0` → emit `edgeType: "enter"` (first appearance)
-
-- Stationary objects always have `zones: []` (not in any configured zone) in the observed captures
   
 ### Stationary bystanders in `leave` messages
 
