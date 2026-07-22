@@ -8,27 +8,15 @@ import coloredlogs
 from uiprotect import ProtectApiClient
 
 from unifi.cams import (
-    DahuaCam,
     FrigateCam,
-    HikvisionCam,
-    Reolink,
-    ReolinkNVRCam,
     RTSPCam,
-    TapoCam,
 )
 from unifi.core import Core
 from unifi.version import __version__
 
 CAMS = {
-    "amcrest": DahuaCam,
-    "dahua": DahuaCam,
     "frigate": FrigateCam,
-    "hikvision": HikvisionCam,
-    "lorex": DahuaCam,
-    "reolink": Reolink,
-    "reolink_nvr": ReolinkNVRCam,
     "rtsp": RTSPCam,
-    "tapo": TapoCam,
 }
 
 
