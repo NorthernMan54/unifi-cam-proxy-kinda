@@ -6,17 +6,34 @@ This plan implements support for stationary object detection in the Frigate → 
 
 ## Background
 
+### Architecture Context
+
+**Important:** The codebase has been refactored from the original documentation references. The event handling logic is now implemented as a mixin in `unifi/cams/frigate_lib/events.py`, not directly in `unifi/cams/frigate.py`.
+
+**File Structure:**
+- `unifi/cams/frigate.py` - Main FrigateCam class (`__init__`, state management)
+- `unifi/cams/frigate_lib/events.py` - Event handling mixin (`_handle_new_event`, `_handle_update_event`, `_handle_end_event`)
+- `unifi/cams/frigate_lib/descriptors.py` - Descriptor building (`build_descriptor_from_frigate_msg`)
+
 ### Current Behavior
-The current implementation in `unifi/cams/frigate.py` handles Frigate events but does not check `position_changes`:
+
+The current implementation handles Frigate events but does not check `position_changes`:
 - `type: "new"` → always calls `trigger_smart_detect_start()` with `edgeType` implicitly `"enter"`
 - `type: "update"` → always calls `trigger_smart_detect_update()` with `edgeType` implicitly `"moving"`
 - `type: "end"` → always calls `trigger_smart_detect_stop()` with `edgeType` implicitly `"leave"`
 
 ### Required Behavior (per protocol spec Section 7)
-- `type: "new"` with `after.position_changes = 0` → emit `edgeType: "none"` (stationary object)
-- `type: "update"` with `after.position_changes = 0` → emit `edgeType: "none"` (stationary update)
-- `type: "end"` with `after.position_changes = 0` → emit `edgeType: "none"` (stationary end)
-- `type: "update"` with `before.position_changes = 0` and `after.position_changes > 0` → emit `edgeType: "enter"` (first movement)
+
+| Frigate Event | position_changes | UniFi Edge Type | Action |
+|---------------|------------------|-----------------|--------|
+| `new` | `0` | `"none"` | `trigger_smart_detect_stationary()` |
+| `new` | `>0` | `"enter"` | `trigger_smart_detect_start()` |
+| `update` | `before=0, after>0` | `"enter"` | `trigger_smart_detect_start()` (first movement) |
+| `update` | `after=0` | `"none"` | `trigger_smart_detect_stationary()` |
+| `update` | `after>0` | `"moving"` | `trigger_smart_detect_update()` |
+| `end` | `0` | `"none"` | `trigger_smart_detect_stationary()` |
+| `end` | `>0` | `"leave"` | `trigger_smart_detect_stop()` |
+
 - Stationary objects always have `zones: []` (not in any configured zone)
 
 ## Implementation Plan
@@ -41,14 +58,14 @@ self._frigate_event_position_changes: dict[str, dict[str, int]] = {}
 
 #### 1.2 Extend build_descriptor_from_frigate_msg to extract position_changes
 
-**File:** `unifi/cams/frigate.py`
+**File:** `unifi/cams/frigate_lib/descriptors.py`
 
 **Changes:**
 - Extract `position_changes` from both `before` and `after` objects in the Frigate message
 - Store these values for later comparison
 
 ```python
-# In build_descriptor_from_frigate_msg (around line 335)
+# In build_descriptor_from_frigate_msg
 after = frigate_msg.get("after", {})
 before = frigate_msg.get("before", {})
 
@@ -73,248 +90,141 @@ descriptor = {
 
 #### 2.1 Modify "new" event handling
 
-**File:** `unifi/cam-proxy-kinda/unifi/cams/frigate.py`
+**File:** `unifi/cams/frigate_lib/events.py`
 
-**Location:** Around line 1077 (`if event_type == "new":`)
+**Location:** `_handle_new_event` function (around line 120-160)
 
 **Current logic:**
 ```python
-if event_type == "new":
-    if event_id in self._active_frigate_events:
-        return
-    # ... buffer check ...
-    
-    tracker_id = self._allocate_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    
-    if self._motion_smart_event_id is None:
-        await self.trigger_smart_detect_start(...)
-    else:
-        await self.trigger_smart_detect_update(...)
+if self._motion_smart_event_id is None:
+    self._motion_smart_event_id = await self.trigger_smart_detect_start(
+        object_type, descriptor, frame_time_ms, zonesStatus=zones_status
+    )
+else:
+    await self.trigger_smart_detect_update(
+        object_type, descriptor, frame_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
+    )
 ```
 
 **New logic:**
 ```python
-if event_type == "new":
-    if event_id in self._active_frigate_events:
-        return
-    
-    # Extract position_changes for stationary detection
-    after = frigate_msg.get("after", {})
-    position_changes = after.get("position_changes", 0)
-    
-    tracker_id = self._allocate_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    
-    # Track position_changes for this event
-    self._frigate_event_position_changes[event_id] = {
-        "before": 0,  # No "before" for "new" events
-        "after": position_changes
-    }
-    
-    # Determine edgeType based on position_changes
-    if position_changes == 0:
-        # Stationary object: emit edgeType="none"
-        await self.trigger_smart_detect_stationary(
-            custom_descriptor=custom_descriptor,
-            event_timestamp=frame_time_ms,
-            zonesStatus=zones_status,
-            event_id=self._motion_smart_event_id,
-        )
+position_changes = after.get("position_changes", 0)
+
+if position_changes == 0:
+    # Stationary object: emit edgeType="none"
+    await self.trigger_smart_detect_stationary(
+        custom_descriptor=custom_descriptor,
+        event_timestamp=frame_time_ms,
+        zonesStatus=zones_status,
+        event_id=self._motion_smart_event_id,
+    )
+else:
+    # Moving object: emit edgeType="enter"
+    if self._motion_smart_event_id is None:
+        self._motion_smart_event_id = await self.trigger_smart_detect_start(...)
     else:
-        # Moving object: emit edgeType="enter"
-        if self._motion_smart_event_id is None:
-            self._motion_smart_event_id = await self.trigger_smart_detect_start(
-                object_type,
-                custom_descriptor,
-                frame_time_ms,
-                zonesStatus=zones_status,
-            )
-        else:
-            await self.trigger_smart_detect_update(
-                object_type,
-                custom_descriptor,
-                frame_time_ms,
-                zonesStatus=zones_status,
-                event_id=self._motion_smart_event_id,
-            )
+        await self.trigger_smart_detect_update(...)
 ```
 
 #### 2.2 Modify "update" event handling
 
-**File:** `unifi/cams/frigate.py`
+**File:** `unifi/cams/frigate_lib/events.py`
 
-**Location:** Around line 1139 (`elif event_type == "update":`)
+**Location:** `_handle_update_event` function (around line 165-210)
 
 **Current logic:**
 ```python
-elif event_type == "update":
-    if event_id not in self._active_frigate_events:
-        # ... missed event handling ...
-        return
-    
-    tracker_id = self._get_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    frame_time_ms = ...
-    
-    zones_status = self._update_zone_status_for_track(...)
-    
-    if custom_descriptor.get("stationary", False):
-        await self.trigger_smart_detect_stationary(...)
-    else:
-        await self.trigger_smart_detect_update(...)
+if self._motion_smart_event_id is None:
+    # ... missed event handling ...
+    return
+
+# ... existing logic ...
 ```
 
 **New logic:**
 ```python
-elif event_type == "update":
-    if event_id not in self._active_frigate_events:
-        # ... missed event handling ...
-        return
-    
-    # Extract position_changes for stationary detection
-    after = frigate_msg.get("after", {})
-    before = frigate_msg.get("before", {})
-    position_changes_before = before.get("position_changes", 0) if before else 0
-    position_changes_after = after.get("position_changes", 0)
-    
-    tracker_id = self._get_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    frame_time_ms = ...
-    
-    # Update position_changes tracking
-    if event_id in self._frigate_event_position_changes:
-        self._frigate_event_position_changes[event_id]["before"] = position_changes_before
-        self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+# Extract position_changes for stationary detection
+after = frigate_msg.get("after", {})
+before = frigate_msg.get("before", {})
+position_changes_before = before.get("position_changes", 0) if before else 0
+position_changes_after = after.get("position_changes", 0)
+
+# Update position_changes tracking
+if event_id in self._frigate_event_position_changes:
+    self._frigate_event_position_changes[event_id]["before"] = position_changes_before
+    self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+else:
+    self._frigate_event_position_changes[event_id] = {
+        "before": position_changes_before,
+        "after": position_changes_after
+    }
+
+# Determine edgeType based on position_changes transition
+if position_changes_after == 0:
+    # Stationary object: emit edgeType="none"
+    await self.trigger_smart_detect_stationary(...)
+elif position_changes_before == 0 and position_changes_after > 0:
+    # First movement: emit edgeType="enter"
+    if self._motion_smart_event_id is None:
+        self._motion_smart_event_id = await self.trigger_smart_detect_start(...)
     else:
-        self._frigate_event_position_changes[event_id] = {
-            "before": position_changes_before,
-            "after": position_changes_after
-        }
-    
-    zones_status = self._update_zone_status_for_track(...)
-    
-    # Determine edgeType based on position_changes transition
-    if position_changes_after == 0:
-        # Stationary object: emit edgeType="none"
-        await self.trigger_smart_detect_stationary(
-            custom_descriptor=custom_descriptor,
-            event_timestamp=frame_time_ms,
-            zonesStatus=zones_status,
-            event_id=self._motion_smart_event_id,
-        )
-    elif position_changes_before == 0 and position_changes_after > 0:
-        # First movement: emit edgeType="enter"
-        if self._motion_smart_event_id is None:
-            self._motion_smart_event_id = await self.trigger_smart_detect_start(
-                object_type,
-                custom_descriptor,
-                frame_time_ms,
-                zonesStatus=zones_status,
-            )
-        else:
-            await self.trigger_smart_detect_update(
-                object_type,
-                custom_descriptor,
-                frame_time_ms,
-                zonesStatus=zones_status,
-                event_id=self._motion_smart_event_id,
-            )
-    else:
-        # Already moving: emit edgeType="moving" (via update)
-        await self.trigger_smart_detect_update(
-            object_type,
-            custom_descriptor,
-            frame_time_ms,
-            zonesStatus=zones_status,
-            event_id=self._motion_smart_event_id,
-        )
+        await self.trigger_smart_detect_update(...)
+else:
+    # Already moving: emit edgeType="moving" (via update)
+    await self.trigger_smart_detect_update(...)
 ```
 
 #### 2.3 Modify "end" event handling
 
-**File:** `unifi/cams/frigate.py`
+**File:** `unifi/cams/frigate_lib/events.py`
 
-**Location:** Around line 1224 (`elif event_type == "end":`)
+**Location:** `_handle_end_event` function (around line 215-260)
 
 **Current logic:**
 ```python
-elif event_type == "end":
-    if event_id not in self._active_frigate_events:
-        # ... missed event handling ...
-        return
-    
-    tracker_id = self._get_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    frame_time_ms = ...
-    
-    zones_status = self._update_zone_status_for_track(...)
-    
-    await self.trigger_smart_detect_stop(...)
+# ... existing logic ...
+await self.trigger_smart_detect_stop(...)
 ```
 
 **New logic:**
 ```python
-elif event_type == "end":
-    if event_id not in self._active_frigate_events:
-        # ... missed event handling ...
-        return
-    
-    # Extract position_changes for stationary detection
-    after = frigate_msg.get("after", {})
-    before = frigate_msg.get("before", {})
-    position_changes_before = before.get("position_changes", 0) if before else 0
-    position_changes_after = after.get("position_changes", 0)
-    
-    tracker_id = self._get_tracker_id(event_id)
-    custom_descriptor = self.build_descriptor_from_frigate_msg(...)
-    frame_time_ms = ...
-    
-    # Update position_changes tracking
-    if event_id in self._frigate_event_position_changes:
-        self._frigate_event_position_changes[event_id]["before"] = position_changes_before
-        self._frigate_event_position_changes[event_id]["after"] = position_changes_after
-    else:
-        self._frigate_event_position_changes[event_id] = {
-            "before": position_changes_before,
-            "after": position_changes_after
-        }
-    
-    zones_status = self._update_zone_status_for_track(...)
-    
-    # Determine edgeType based on position_changes
-    if position_changes_after == 0:
-        # Stationary object leaving: emit edgeType="none"
-        await self.trigger_smart_detect_stationary(
-            custom_descriptor=custom_descriptor,
-            event_timestamp=frame_time_ms,
-            zonesStatus=zones_status,
-            event_id=self._motion_smart_event_id,
-        )
-    else:
-        # Moving object leaving: emit edgeType="leave"
-        await self.trigger_smart_detect_stop(
-            object_type,
-            custom_descriptor,
-            event_timestamp=frame_time_ms,
-            event_id=event_id,
-            frame_time_ms=frame_time_ms,
-            zonesStatus=zones_status,
-        )
+# Extract position_changes for stationary detection
+after = frigate_msg.get("after", {})
+before = frigate_msg.get("before", {})
+position_changes_before = before.get("position_changes", 0) if before else 0
+position_changes_after = after.get("position_changes", 0)
+
+# Update position_changes tracking
+if event_id in self._frigate_event_position_changes:
+    self._frigate_event_position_changes[event_id]["before"] = position_changes_before
+    self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+else:
+    self._frigate_event_position_changes[event_id] = {
+        "before": position_changes_before,
+        "after": position_changes_after
+    }
+
+# Determine edgeType based on position_changes
+if position_changes_after == 0:
+    # Stationary object leaving: emit edgeType="none"
+    await self.trigger_smart_detect_stationary(...)
+else:
+    # Moving object leaving: emit edgeType="leave"
+    await self.trigger_smart_detect_stop(...)
 ```
 
 ### Phase 3: Cleanup and Memory Management
 
 #### 3.1 Clean up position_changes tracking on event removal
 
-**File:** `unifi/cams/frigate.py`
+**Files:** `unifi/cams/frigate_lib/events.py` and `unifi/cams/frigate.py`
 
 **Changes:**
 - When removing an event from `_active_frigate_events`, also remove from `_frigate_event_position_changes`
-- Location: In the cleanup logic after `trigger_smart_detect_stop()` completes
+- Location: In `_forget_track` function in events.py
 
 ```python
-# After trigger_smart_detect_stop() in the "end" handler
+# In _forget_track function
 self._active_frigate_events.discard(event_id)
 self._frigate_event_object_types.pop(event_id, None)
 self._frigate_event_position_changes.pop(event_id, None)  # NEW
@@ -423,4 +333,6 @@ self.logger.debug(
 
 - `unifi/cams/frigate.py` - Main implementation
 - `unifi/cams/base.py` - Smart detect methods (no changes needed)
+- `unifi/cams/frigate_lib/events.py` - Event handling mixin
+- `unifi/cams/frigate_lib/descriptors.py` - Descriptor building
 - `eventsmartdetect_protocol_spec.md` - Protocol specification reference
