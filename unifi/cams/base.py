@@ -17,15 +17,15 @@ import websockets
 from unifi.core import RetryableError
 from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers
 from unifi.cams.handlers.snapshot_handlers import SnapshotHandlers
-from unifi.cams.managers.smart_motion_manager import SmartMotionEventManager
-from unifi.cams.managers.smart_detect_manager import SmartDetectEventManager, SmartDetectObjectType
+from unifi.cams.types import AVClientRequest, AVClientResponse
+from unifi.cams.managers.smart_detect_manager import SmartDetectObjectType
 
 AVClientRequest = AVClientResponse = dict[str, Any]
 
 # Re-exported so existing call sites doing
 # `from unifi.cams.base import SmartDetectObjectType` keep working --
 # the enum's canonical home is now smart_detect_manager.py.
-__all__ = ["UnifiCamBase", "SmartDetectObjectType", "AVClientRequest", "AVClientResponse"]
+__all__ = ["AVClientRequest", "AVClientResponse"]
 
 
 class UnifiCamBase(
@@ -66,14 +66,15 @@ class UnifiCamBase(
             "video3": (640, 360),
         }
 
-        self.motionEvents: bool = True
+        from unifi.cams.managers.smart_motion_manager import SmartMotionEventManager
+        from unifi.cams.managers.smart_detect_manager import SmartDetectEventManager
 
         # -- event lifecycle managers ----------------------------------
         # SmartMotionEventManager needs to be able to pull cached snapshots
         # from whichever smart-detect event most recently occurred during
         # its window, so it's constructed with a getter into the smart
         # events manager rather than a direct reference to its internals.
-        self._motion_analytics = SmartMotionEventManager(
+        self._smart_motion = SmartMotionEventManager(
             logger=self.logger,
             send=self.send,
             gen_response=self.gen_response,
@@ -87,11 +88,8 @@ class UnifiCamBase(
             gen_response=self.gen_response,
             get_uptime=self.get_uptime,
             detected_resolutions=self._detected_resolutions,
-            on_event_started=self._motion_analytics.link_smart_detect,
+            on_event_started=self._smart_motion.link_smart_detect,
         )
-        # motionEvents flag is read by SmartMotionEventManager.trigger_start;
-        # keep the two in sync since subclasses toggle self.motionEvents.
-        self._motion_analytics.motionEvents = self.motionEvents
 
         self._ssl_context = ssl.create_default_context()
         self._ssl_context.check_hostname = False
@@ -103,16 +101,16 @@ class UnifiCamBase(
     @property
     def _active_analytics_event_id(self) -> Optional[int]:
         """Backward-compatible property for subclasses accessing this directly."""
-        return self._motion_analytics.active_event_id
+        return self._smart_motion.active_event_id
 
     @_active_analytics_event_id.setter
     def _active_analytics_event_id(self, value: Optional[int]) -> None:
-        self._motion_analytics.active_event_id = value
+        self._smart_motion.active_event_id = value
 
     @property
     def _analytics_event_history(self) -> dict:
         """Backward-compatible property for subclasses accessing this directly."""
-        return self._motion_analytics.event_history
+        return self._smart_motion.event_history
 
     @property
     def _active_smart_events(self) -> dict:
@@ -122,19 +120,19 @@ class UnifiCamBase(
     @property
     def _motion_zone_id(self) -> str:
         """Backward-compatible property for subclasses accessing this directly."""
-        return self._motion_analytics._motion_zone_id
+        return self._smart_motion._motion_zone_id
 
     @_motion_zone_id.setter
     def _motion_zone_id(self, value: str) -> None:
-        self._motion_analytics._motion_zone_id = value
+        self._smart_motion._motion_zone_id = value
 
     @property
     def lingerEventStart(self) -> int:
-        return self._motion_analytics.lingerEventStart
+        return self._smart_motion.lingerEventStart
 
     @lingerEventStart.setter
     def lingerEventStart(self, value: int) -> None:
-        self._motion_analytics.lingerEventStart = value
+        self._smart_motion.lingerEventStart = value
 
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
@@ -311,23 +309,23 @@ class UnifiCamBase(
     # -- Motion / Analytics Events: thin delegation ------------------------
 
     async def trigger_analytics_start(self, event_timestamp: Optional[float] = None) -> None:
-        await self._motion_analytics.trigger_start(event_timestamp)
+        await self._smart_motion.trigger_start(event_timestamp)
 
     async def trigger_analytics_stop(self, event_timestamp: Optional[float] = None) -> None:
-        await self._motion_analytics.trigger_stop(event_timestamp)
+        await self._smart_motion.trigger_stop(event_timestamp)
 
     def set_motion_zone_config(self, zone_config: dict[str, str]) -> None:
-        self._motion_analytics.set_motion_zone_config(zone_config)
+        self._smart_motion.set_motion_zone_config(zone_config)
 
     def get_active_events_summary(self) -> dict[str, Any]:
         smart_summary = self._smart_events.summary()
         return {
-            "analytics_event": self._motion_analytics.summary(),
+            "analytics_event": self._smart_motion.summary(),
             "smart_detect_events": smart_summary,
             "total_active_events": (
-                (1 if self._motion_analytics.has_active_event() else 0) + len(smart_summary)
+                (1 if self._smart_motion.has_active_event() else 0) + len(smart_summary)
             ),
-            "analytics_history_count": len(self._motion_analytics.event_history),
+            "analytics_history_count": len(self._smart_motion.event_history),
         }
 
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
@@ -458,7 +456,8 @@ class UnifiCamBase(
             "ChangeAnalyticsSettings": self.process_analytics_settings,
             "GetRequest": self.process_snapshot_request,
             "UpdateFaceDBRequest": self.process_update_face_db,
-            "ChangeSmartMotionSettings": self.process_smart_motion_settings,
+            "ChangeSmartMotionSettings": self._smart_motion.process_smart_motion_settings,
+            "ChangeSmartDetectSettings": self._smart_events.process_smart_detect_settings,
             "ContinuousMove": self.process_continuous_move,
         }
 
@@ -467,7 +466,6 @@ class UnifiCamBase(
         return {
             "AnalyticsTest",
             "UpdateUsernamePassword",
-            "ChangeSmartDetectSettings",
             "ChangeAudioEventsSettings",
             "ChangeTalkbackSettings",
             "SmartMotionTest",
@@ -540,11 +538,36 @@ class UnifiCamBase(
                 except Exception as e:
                     self.logger.error(f"Error stopping smart detect event {event_id}: {e}")
         
-        if self._motion_analytics.active_event_id is not None:
+        if self._smart_motion.active_event_id is not None:
             self.logger.info("Force stopping motion event")
             try:
-                await self._motion_analytics.trigger_stop()
+                await self._smart_motion.trigger_stop()
             except Exception as e:
                 self.logger.error(f"Error stopping motion event: {e}")
         
         self.close_streams()
+
+    # -- Settings handlers delegated from manager modules ------------------
+
+
+
+    async def process_smart_detect_settings(
+        self, msg: AVClientRequest
+    ) -> AVClientResponse:
+        """Process smart detect settings change request and update smartDetectEvents."""
+        payload = msg.get("payload", {})
+        
+        if "enableSmartDetect" in payload:
+            self._smart_events.smartDetectEvents = payload["enableSmartDetect"]
+            self.logger.info(
+                f"Smart detect events {'enabled' if self._smart_events.smartDetectEvents else 'disabled'} from ChangeSmartDetectSettings"
+            )
+
+        if self._smart_events.smartDetectEvents:
+            await self._smart_events.force_stop()
+            await asyncio.sleep(0.1)
+            await self._smart_events.force_stop()
+        
+        return self.gen_response(
+            "ChangeSmartDetectSettings", msg["messageId"], payload
+        )

@@ -127,7 +127,7 @@ class SnapshotHandlers:
         # Delegate the dict-shape knowledge to whichever manager owns it --
         # this mixin no longer knows what an analytics/smart-detect event
         # dict looks like internally.
-        found = self._motion_analytics.find_snapshot_by_path(snapshot_type, filename, original_filename)
+        found = self._smart_events.find_snapshot_by_path(snapshot_type, filename, original_filename)
         if found:
             return found
 

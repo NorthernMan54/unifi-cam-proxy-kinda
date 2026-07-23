@@ -153,14 +153,14 @@ class FrigateEventHandlerMixin:
             )
             return
 
-        if not self._is_motion_window_active():
-            self.logger.warning(
-                f"Received Frigate 'new' event {event_id} but no active motion window. "
-                f"Buffering object detection until motion starts."
-            )
-            # In production, Frigate should not send objects outside a motion
-            # window, but handle gracefully by waiting for motion to trigger.
-            return
+#        if not self._is_motion_window_active():
+#            self.logger.warning(
+#                f"Received Frigate 'new' event {event_id} but no active motion window. "
+#                f"Buffering object detection until motion starts."
+#            )
+#            # In production, Frigate should not send objects outside a motion
+#            # window, but handle gracefully by waiting for motion to trigger.
+#            return
 
         self.event_snapshot_ready[event_id] = asyncio.Event()
 

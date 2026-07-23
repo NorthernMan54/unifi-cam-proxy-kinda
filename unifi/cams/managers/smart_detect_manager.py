@@ -15,11 +15,13 @@ That's MotionAnalyticsManager's data to own, so instead of reaching into its
 internals directly, this manager calls an injected `on_event_started`
 callback and lets the analytics manager decide what to do with it.
 """
+import asyncio
 import logging
 import time
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
+from unifi.cams.types import AVClientRequest, AVClientResponse
 from unifi.cams.handlers.snapshot_utils import calculate_snapshot_dimensions, get_image_dimensions
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
@@ -51,6 +53,8 @@ class SmartDetectEventManager:
         self._detected_resolutions = detected_resolutions
         self._on_event_started = on_event_started
 
+        self.smartDetectEvents: bool = False
+
         self._event_id_counter: int = 0
         self.active_events: dict[int, dict[str, Any]] = {}
 
@@ -60,10 +64,6 @@ class SmartDetectEventManager:
         self.last_object_type: Optional[SmartDetectObjectType] = None
         self.last_descriptor: Optional[dict[str, Any]] = None
         self.last_event_ts: Optional[float] = None
-
-        # On startup, send a stop event to clear any lingering smart-detect state on the controller.
-        # force_stop() is async and cannot be called from synchronous __init__.
-        # The close() method in UnifiCamBase handles force stopping on shutdown.
 
     # -- lifecycle -----------------------------------------------------
 
@@ -577,3 +577,26 @@ class SmartDetectEventManager:
                 await self.trigger_stop(object_type=event["object_type"])
             except Exception as e:
                 self.logger.error(f"Error stopping smart detect event {event_id}: {e}")
+
+    # -- Settings handlers delegated from manager modules ------------------
+
+    async def process_smart_detect_settings(
+        self, msg: AVClientRequest
+    ) -> AVClientResponse:
+        """Process smart detect settings change request and update smartDetectEvents."""
+        payload = msg.get("payload", {})
+        
+        if "enableSmartDetect" in payload:
+            self.smartDetectEvents = payload["enableSmartDetect"]
+            self.logger.info(
+                f"Smart detect events {'enabled' if self.smartDetectEvents else 'disabled'} from ChangeSmartDetectSettings"
+            )
+
+        if self.smartDetectEvents:
+            await self.force_stop()
+            await asyncio.sleep(0.1)
+            await self.force_stop()
+        
+        return self._gen_response(
+            "ChangeSmartDetectSettings", msg["messageId"], payload
+        )

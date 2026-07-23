@@ -19,6 +19,8 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Optional
 
+from unifi.cams.types import AVClientRequest, AVClientResponse
+
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 GenResponseFn = Callable[..., dict[str, Any]]
 GetUptimeFn = Callable[[], float]
@@ -58,12 +60,6 @@ class SmartMotionEventManager:
         self._motion_zone_config: dict[str, str] = {"1": "Default"}
 
         self.last_event_ts: Optional[float] = None
-
-        # On startup send a stop event to clear any lingering motion state on the controller.
-
-        self.force_stop()
-        time.sleep(0.1)  # allow any lingering tasks to cancel before we start a new one
-        self.force_stop()
 
     def set_motion_zone_config(self, zone_config: dict[str, str]) -> None:
         """Configure motion zone IDs and names, e.g. {"1": "Front Door"}."""
@@ -510,3 +506,30 @@ class SmartMotionEventManager:
             except Exception as e:
                 self.logger.error(f"Error stopping motion event: {e}")
 
+    async def process_smart_motion_settings(
+        self, msg: AVClientRequest
+    ) -> AVClientResponse:
+        """Process smart motion settings change request and update lingerEventStart and motionEvents."""
+        payload = msg.get("payload", {})
+        
+        # Update motion event enable/disable flag
+        if "enable" in payload:
+            self.motionEvents = payload["enable"]
+            self.logger.info(
+                f"Motion events {'enabled' if self.motionEvents else 'disabled'} from ChangeSmartMotionSettings"
+            )
+
+        if self.motionEvents:
+            await self.force_stop()
+            await asyncio.sleep(0.1)
+            await self.force_stop()
+        
+        if "lingerEventStartMSec" in payload:
+            self.lingerEventStart = payload["lingerEventStartMSec"]
+            self.logger.info(
+                f"Updated lingerEventStart to {self.lingerEventStart}ms from ChangeSmartMotionSettings"
+            )
+
+        return self._gen_response(
+            "ChangeSmartMotionSettings", msg["messageId"], payload
+        )
