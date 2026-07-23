@@ -2,6 +2,7 @@ import argparse
 import logging
 import subprocess
 import tempfile
+import asyncio
 from pathlib import Path
 
 from aiohttp import web
@@ -47,7 +48,13 @@ class RTSPCam(UnifiCamBase):
                 self.configured_streams.add("video3")
         
         if not self.args.snapshot_url:
-            self.start_snapshot_stream()
+            self._ensure_snapshot_stream()
+        
+        # Start monitoring task if no snapshot URL
+        if not self.args.snapshot_url:
+            self._snapshot_monitor_task = asyncio.create_task(
+                self._monitor_snapshot_stream()
+            )
 
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
@@ -92,9 +99,14 @@ class RTSPCam(UnifiCamBase):
             help="HTTP endpoint to fetch snapshot image from",
         )
 
-    def start_snapshot_stream(self) -> None:
-        if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
-            # Use video3 (lowest quality) for snapshots
+    def _ensure_snapshot_stream(self) -> None:
+        """Ensure snapshot stream is running, creating it if necessary."""
+        if self.snapshot_stream is None or self.snapshot_stream.poll() is not None:
+            self._start_snapshot_stream()
+
+    def _start_snapshot_stream(self) -> None:
+        """Start a new snapshot stream process."""
+        if not self.snapshot_stream:
             snapshot_source = self.stream_source.get("video3", self.stream_source["video1"])
             cmd = (
                 f"AV_LOG_FORCE_NOCOLOR=1 ffmpeg -loglevel level+{self.args.loglevel} "
@@ -113,8 +125,30 @@ class RTSPCam(UnifiCamBase):
         if self.args.snapshot_url:
             await self.fetch_to_file(self.args.snapshot_url, img_file)
         else:
-            self.start_snapshot_stream()
+            self._ensure_snapshot_stream()
+            # Brief sleep to ensure the file is written before returning
+            await asyncio.sleep(0.1)
         return img_file
+
+    async def _monitor_snapshot_stream(self) -> None:
+        """Monitor snapshot stream and restart if it fails."""
+        while True:
+            try:
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+                if self.snapshot_stream is None:
+                    continue
+                
+                # Check if process has exited unexpectedly
+                if self.snapshot_stream.poll() is not None:
+                    exit_code = self.snapshot_stream.poll()
+                    self.logger.warning(f"Snapshot stream process exited with code {exit_code}, restarting...")
+                    self._start_snapshot_stream()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error monitoring snapshot stream: {e}")
+                # Continue monitoring even if error occurs
 
     async def run(self) -> None:
         if self.args.http_api:
@@ -146,7 +180,23 @@ class RTSPCam(UnifiCamBase):
             await self.runner.cleanup()
 
         if self.snapshot_stream:
-            self.snapshot_stream.kill()
+            self.logger.info("Stopping snapshot stream")
+            try:
+                self.snapshot_stream.terminate()
+                self.snapshot_stream.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.logger.warning("Snapshot stream did not terminate gracefully, killing")
+                self.snapshot_stream.kill()
+            except Exception as e:
+                self.logger.error(f"Error stopping snapshot stream: {e}")
+
+        # Cancel monitor task if it exists
+        if hasattr(self, '_snapshot_monitor_task') and not self._snapshot_monitor_task.done():
+            self._snapshot_monitor_task.cancel()
+            try:
+                await self._snapshot_monitor_task
+            except asyncio.CancelledError:
+                pass
 
     async def get_stream_source(self, stream_index: str) -> str:
         # Return source if stream is explicitly configured

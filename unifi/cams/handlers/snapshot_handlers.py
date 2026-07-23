@@ -1,308 +1,158 @@
-import asyncio
+"""
+Mixin providing snapshot management functionality: serving cached snapshots
+back to UniFi Protect on GetRequest, or falling back to a fresh Frigate/
+camera snapshot when nothing is cached.
+
+Refactored (Phase 2.5) to no longer reach directly into
+SmartDetectEventManager / MotionAnalyticsManager internals -- it now asks
+each manager `find_snapshot_by_path(...)` instead of walking their event
+dicts by hand. Upload I/O (fetch-from-url-and-post, or read-file-and-post)
+is delegated to SnapshotUploader, which also fixes a file-descriptor leak
+that existed in the previous inline implementation.
+"""
 import logging
 from pathlib import Path
 from typing import Any, Optional
 
-import aiohttp
+from unifi.cams.handlers.snapshot_uploader import SnapshotUploader
+from unifi.cams.handlers.snapshot_utils import build_frigate_fallback_url, get_image_dimensions
 
 
 class SnapshotHandlers:
-    """Mixin class providing snapshot management functionality"""
+    # Note: this is a plain mixin with no __init__ of its own -- UnifiCamBase
+    # doesn't call super().__init__() through its MRO, so state here is
+    # lazily created on first use rather than in a constructor.
+
+    @property
+    def _uploader(self) -> SnapshotUploader:
+        if getattr(self, "_snapshot_uploader", None) is None:
+            self._snapshot_uploader = SnapshotUploader(self._ssl_context, self.logger)
+        return self._snapshot_uploader
 
     def update_motion_snapshot(self, path: Path) -> None:
         """
-        Update motion snapshot (legacy method).
-        By default, updates all three snapshot types to the same path.
-        For more granular control, use update_motion_snapshots().
+        Legacy method: updates all three snapshot types to the same path.
+        For granular control, use update_motion_snapshots() instead.
         """
         self._motion_snapshot = path
         self._motion_snapshot_crop = path
         self._motion_snapshot_fov = path
         self._motion_heatmap = path
-    
+
     def update_motion_snapshots(
         self,
         crop: Optional[Path] = None,
         fov: Optional[Path] = None,
         heatmap: Optional[Path] = None,
     ) -> None:
-        """
-        Update specific motion snapshot types.
-        
-        Args:
-            crop: Path to cropped snapshot with bounding box (motionSnapshot)
-            fov: Path to full field-of-view snapshot with bounding box (motionSnapshotFullFoV)
-            heatmap: Path to heatmap visualization (motionHeatmap)
-        """
+        """Update specific motion snapshot types (crop, full-FoV, heatmap)."""
         if crop is not None:
             self._motion_snapshot_crop = crop
-            self._motion_snapshot = crop  # Update legacy field
+            self._motion_snapshot = crop  # keep legacy field in sync
         if fov is not None:
             self._motion_snapshot_fov = fov
         if heatmap is not None:
             self._motion_heatmap = heatmap
 
-    async def process_snapshot_request(
-        self, msg: dict[str, Any]
-    ) -> Optional[dict[str, Any]]:
-        """
-        Process a snapshot request from UniFi Protect.
-        
-        Handles cached snapshot files (from motion events) and fallback to Frigate API.
-        """
+    async def process_snapshot_request(self, msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Process a GetRequest snapshot request from UniFi Protect."""
         snapshot_type = msg["payload"]["what"]
         filename = msg["payload"].get("filename", "")
-        
+
         self.logger.debug(f"Snapshot request: type={snapshot_type}, filename={filename}")
-        
-        # Try to find cached snapshot file from event history
+
         cached_path = self._find_cached_snapshot(filename, snapshot_type)
         snapshot_path = None
-        
+
         if cached_path and cached_path.exists():
-            # Serve cached snapshot
             snapshot_path = cached_path
             self.logger.info(f"Serving cached {snapshot_type} from {cached_path}")
-            await self._upload_file_to_protect(
+            await self._uploader.upload_file(
                 cached_path,
                 msg["payload"]["uri"],
                 msg["payload"].get("formFields", {}),
-                snapshot_type
+                snapshot_type,
             )
         else:
-            # Fallback to Frigate API or regular snapshot
-            use_frigate = (
-                hasattr(self.args, 'frigate_http_url') and 
-                self.args.frigate_http_url
-            )
-            
-            if use_frigate:
-                # Fetch from Frigate latest.jpg endpoint
-                snapshot_url = self._build_frigate_fallback_url(snapshot_type)
+            frigate_http_url = getattr(self.args, "frigate_http_url", None)
+
+            if frigate_http_url:
+                snapshot_url = build_frigate_fallback_url(
+                    frigate_http_url, self.args.frigate_camera, snapshot_type
+                )
                 self.logger.info(f"Fetching {snapshot_type} from Frigate (no cached): {snapshot_url}")
-                await self._fetch_and_upload_snapshot(
+                await self._uploader.fetch_and_upload(
                     snapshot_url,
                     msg["payload"]["uri"],
                     msg["payload"].get("formFields", {}),
-                    snapshot_type
+                    snapshot_type,
                 )
             else:
-                # Use regular snapshot method
                 snapshot_path = await self._process_motion_event_snapshot(msg, snapshot_type)
-        
+
         if msg["responseExpected"]:
-            # Get image dimensions for the response
-            width, height = (640, 360)  # Default dimensions
-            if snapshot_path and hasattr(self, '_get_image_dimensions'):
-                width, height = self._get_image_dimensions(snapshot_path)
-            
+            width, height = (640, 360)
+            if snapshot_path:
+                width, height = get_image_dimensions(snapshot_path, self.logger)
+
             return self.gen_response(
-                "GetRequest", 
+                "GetRequest",
                 response_to=msg["messageId"],
-                payload={"height": height, "width": width}
+                payload={"height": height, "width": width},
             )
 
     def _find_cached_snapshot(self, filename: str, snapshot_type: str) -> Optional[Path]:
         """
-        Find cached snapshot file from event history.
-        
-        Args:
-            filename: Filename from GetRequest (is actually a file path in our implementation)
-            snapshot_type: Type of snapshot requested
-            
-        Returns:
-            Path to cached snapshot file, or None if not found
+        Find a cached snapshot file matching a GetRequest's filename.
+
+        UniFi Protect appends "_fullfov" to the filename it requests for
+        full-field-of-view snapshots (e.g. /tmp/x.jpg -> /tmp/x_fullfov.jpg),
+        so we strip that back off to find the original cached path first.
+        Falls back to asking each event manager whether it's tracking a
+        snapshot matching either the original or modified filename.
         """
-        # UniFi Protect modifies filenames for FoV snapshots by appending _fullfov before extension
-        # e.g., /tmp/tmpvgwqfkeo.jpg -> /tmp/tmpvgwqfkeo_fullfov.jpg
-        # Strip this suffix to find the original cached file
         original_filename = filename
         if filename and snapshot_type == "motionSnapshotFullFoV" and "_fullfov" in filename:
-            # Remove _fullfov suffix to get original filename
             original_filename = filename.replace("_fullfov", "")
             self.logger.debug(
                 f"UniFi modified FoV filename: {filename} -> looking for original: {original_filename}"
             )
-        
-        # The filename is actually the cached file path that we set in trigger_analytics_stop
+
         if original_filename and "/" in original_filename:
-            # It's a file path - try to use it directly
             path = Path(original_filename)
             if path.exists():
                 self.logger.debug(f"Found cached snapshot at original path: {path}")
                 return path
-        
-        # Fallback: search through event history for matching snapshots
-        # This handles edge cases where filename doesn't match expected format
-        
-        # First check analytics events
-        for event_data in self._analytics_event_history.values():
-            # Match based on snapshot type
-            if snapshot_type == "motionSnapshot":
-                cached_path = event_data.get("snapshot_crop_path")
-            elif snapshot_type == "motionSnapshotFullFoV":
-                cached_path = event_data.get("snapshot_fov_path")
-            elif snapshot_type == "motionHeatmap":
-                cached_path = event_data.get("heatmap_path")
-            else:
-                continue
-            
-            if cached_path and isinstance(cached_path, Path) and cached_path.exists():
-                # Check if this matches the requested filename (original or modified)
-                if (filename and str(cached_path) == filename) or \
-                   (original_filename and str(cached_path) == original_filename):
-                    return cached_path
-        
-        # Also check smart detect events for smartDetectZoneSnapshot requests
-        if snapshot_type == "smartDetectZoneSnapshot" and hasattr(self, '_active_smart_events'):
-            for event_data in self._active_smart_events.values():
-                # For smart detect, use the crop snapshot
-                cached_path = event_data.get("snapshot_crop_path")
-                
-                if cached_path and isinstance(cached_path, Path) and cached_path.exists():
-                    # Check if this matches the requested filename
-                    if (filename and str(cached_path) == filename) or \
-                       (original_filename and str(cached_path) == original_filename):
-                        return cached_path
-        
-        return None
 
-    def _build_frigate_fallback_url(self, snapshot_type: str) -> str:
-        """
-        Build Frigate fallback URL for latest snapshot.
-        
-        Args:
-            snapshot_type: Type of snapshot requested
-            
-        Returns:
-            URL to Frigate's latest.jpg endpoint
-        """
-        base_url = f"{self.args.frigate_http_url}/api/{self.args.frigate_camera}/latest.jpg".lower()
-        
-        # Add quality params for thumbnails
-        if snapshot_type == "motionSnapshot":
-            return f"{base_url}?height=360&quality=80"
-        
-        return base_url
+        # Delegate the dict-shape knowledge to whichever manager owns it --
+        # this mixin no longer knows what an analytics/smart-detect event
+        # dict looks like internally.
+        found = self._motion_analytics.find_snapshot_by_path(snapshot_type, filename, original_filename)
+        if found:
+            return found
 
-
-    async def _fetch_and_upload_snapshot(
-        self, 
-        snapshot_url: str, 
-        upload_uri: str, 
-        form_fields: dict[str, Any],
-        snapshot_type: str
-    ) -> bool:
-        """
-        Fetch snapshot from URL and upload to UniFi Protect.
-        
-        Args:
-            snapshot_url: URL to fetch snapshot from
-            upload_uri: UniFi Protect upload endpoint
-            form_fields: Additional form fields for upload
-            snapshot_type: Type of snapshot for logging
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(snapshot_url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                    if response.status != 200:
-                        error_body = await response.text()
-                        self.logger.warning(
-                            f"Failed to fetch {snapshot_type}: HTTP {response.status}, {error_body} from {snapshot_url}"
-                        )
-                        return False
-                    
-                    image_data = await response.read()
-                    self.logger.info(f"Fetched {snapshot_type} from Frigate ({len(image_data)} bytes)")
-                    
-                    # Upload to UniFi Protect
-                    files = {"payload": image_data}
-                    files.update(form_fields)
-                    
-                    await session.post(upload_uri, data=files, ssl=self._ssl_context)
-                    self.logger.debug(f"Uploaded {snapshot_type}")
-                    return True
-                    
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching {snapshot_type} from {snapshot_url}")
-            return False
-        except aiohttp.ClientError:
-            self.logger.exception(f"Failed to fetch/upload {snapshot_type} from {snapshot_url}")
-            return False
-
-    async def _upload_file_to_protect(
-        self, 
-        file_path: Optional[Path], 
-        upload_uri: str, 
-        form_fields: dict[str, Any], 
-        snapshot_type: str
-    ) -> bool:
-        """
-        Upload a file from disk to UniFi Protect.
-        
-        Args:
-            file_path: Path to snapshot file
-            upload_uri: UniFi Protect upload endpoint
-            form_fields: Additional form fields for upload
-            snapshot_type: Type of snapshot for logging
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if not file_path or not file_path.exists():
-            self.logger.warning(f"Snapshot file {file_path} not ready for {snapshot_type}")
-            return False
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                files = {"payload": open(file_path, "rb")}
-                files.update(form_fields)
-                await session.post(upload_uri, data=files, ssl=self._ssl_context)
-                self.logger.debug(f"Uploaded {snapshot_type} from {file_path}")
-                return True
-        except aiohttp.ClientError:
-            self.logger.exception(f"Failed to upload {snapshot_type}")
-            return False
-
+        return self._smart_events.find_snapshot_by_path(snapshot_type, filename, original_filename)
 
     async def _process_motion_event_snapshot(
         self, msg: dict[str, Any], snapshot_type: str
     ) -> Optional[Path]:
-        """
-        Process motion event snapshot (crop, FoV, heatmap).
-        
-        Args:
-            msg: Message from UniFi Protect
-            snapshot_type: Type of snapshot requested
-            
-        Returns:
-            Path to the snapshot file that was uploaded
-        """
-        # Select appropriate snapshot based on request type
+        """Fallback path when nothing is cached and there's no Frigate URL configured."""
         if snapshot_type == "motionSnapshot":
-            # Cropped image with bounding box
             path = self._motion_snapshot_crop or self._motion_snapshot
         elif snapshot_type == "motionSnapshotFullFoV":
-            # Full field of view image with bounding box
             path = self._motion_snapshot_fov or self._motion_snapshot
         elif snapshot_type == "motionHeatmap":
-            # Heatmap visualization (use FoV as fallback)
             path = self._motion_heatmap or self._motion_snapshot_fov or self._motion_snapshot
         elif snapshot_type == "smartDetectZoneSnapshot":
-            # Smart detect zone snapshot (use crop)
             path = self._motion_snapshot_crop or self._motion_snapshot
         else:
-            # Regular snapshot request (fallback to get_snapshot method)
             path = await self.get_snapshot()
 
-        await self._upload_file_to_protect(
+        await self._uploader.upload_file(
             path,
             msg["payload"]["uri"],
             msg["payload"].get("formFields", {}),
-            snapshot_type
+            snapshot_type,
         )
-        
+
         return path
