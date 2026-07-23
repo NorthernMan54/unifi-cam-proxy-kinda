@@ -17,7 +17,7 @@ import websockets
 from unifi.core import RetryableError
 from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers
 from unifi.cams.handlers.snapshot_handlers import SnapshotHandlers
-from unifi.cams.managers.motion_analytics_manager import MotionAnalyticsManager
+from unifi.cams.managers.smart_motion_manager import SmartMotionEventManager
 from unifi.cams.managers.smart_detect_manager import SmartDetectEventManager, SmartDetectObjectType
 
 AVClientRequest = AVClientResponse = dict[str, Any]
@@ -40,7 +40,7 @@ class UnifiCamBase(
     Owns the websocket connection/protocol plumbing, snapshot caching, and
     ffmpeg stream management directly. Smart-detect and motion/analytics
     event *lifecycle* is delegated to SmartDetectEventManager and
-    MotionAnalyticsManager (see those modules) -- this class just wires them
+    SmartMotionEventManager (see those modules) -- this class just wires them
     together and exposes the same public trigger_* methods subclasses
     (e.g. FrigateCam) already call, so no caller-side changes are required.
     """
@@ -69,11 +69,11 @@ class UnifiCamBase(
         self.motionEvents: bool = True
 
         # -- event lifecycle managers ----------------------------------
-        # MotionAnalyticsManager needs to be able to pull cached snapshots
+        # SmartMotionEventManager needs to be able to pull cached snapshots
         # from whichever smart-detect event most recently occurred during
         # its window, so it's constructed with a getter into the smart
         # events manager rather than a direct reference to its internals.
-        self._motion_analytics = MotionAnalyticsManager(
+        self._motion_analytics = SmartMotionEventManager(
             logger=self.logger,
             send=self.send,
             gen_response=self.gen_response,
@@ -89,7 +89,7 @@ class UnifiCamBase(
             detected_resolutions=self._detected_resolutions,
             on_event_started=self._motion_analytics.link_smart_detect,
         )
-        # motionEvents flag is read by MotionAnalyticsManager.trigger_start;
+        # motionEvents flag is read by SmartMotionEventManager.trigger_start;
         # keep the two in sync since subclasses toggle self.motionEvents.
         self._motion_analytics.motionEvents = self.motionEvents
 

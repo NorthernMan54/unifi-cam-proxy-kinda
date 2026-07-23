@@ -172,12 +172,6 @@ class FrigateEventHandlerMixin:
         after = frigate_msg.get("after", {})
         position_changes = after.get("position_changes", 0)
 
-        # Initialize position_changes tracking
-        self._frigate_event_position_changes[event_id] = {
-            "before": 0,  # "new" event has no "before"
-            "after": position_changes
-        }
-
         zones_status = self._update_zone_status_for_track(
             tracker_id, descriptor["zones"], descriptor["confidenceLevel"], active=True
         )
@@ -261,16 +255,6 @@ class FrigateEventHandlerMixin:
                 f"(event_id={event_id}, label={label}) in motion window {self._motion_smart_event_id}."
             )
 
-            # Initialize position_changes tracking for this recovered event
-            if event_id not in self._frigate_event_position_changes:
-                self._frigate_event_position_changes[event_id] = {
-                    "before": 0,  # Assume stationary before we saw the update
-                    "after": 0 # TODO: Fix this logic, as we don't need to store postition changes.  Frigate messages have before and after which is the delta tracking.
-                }
-            self.logger.debug(
-                f"Initialized position_changes tracking for recovered event {event_id}"
-            )
-
         tracker_id = self.tracker_ids.get(event_id)
         descriptor = self._build_descriptor(frigate_msg, object_type, tracker_id)
         frame_time_ms = int(frigate_msg["after"].get("frame_time", 0) * 1000) - self.args.frigate_time_sync_ms
@@ -281,33 +265,9 @@ class FrigateEventHandlerMixin:
         position_changes_before = before.get("position_changes", 0) if before else 0
         position_changes_after = after.get("position_changes", 0)
 
-        # Update position_changes tracking
-        if event_id in self._frigate_event_position_changes:
-            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
-            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
-        else:
-            self._frigate_event_position_changes[event_id] = {
-                "before": position_changes_before,
-                "after": position_changes_after
-            }
-
         zones_status = self._update_zone_status_for_track(
             tracker_id, descriptor["zones"], descriptor["confidenceLevel"], active=True
         )
-
-        # Update position_changes tracking
-        if event_id in self._frigate_event_position_changes:
-            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
-            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
-        else:
-            # "new" event was missed - initialize tracking
-            self._frigate_event_position_changes[event_id] = {
-                "before": 0,  # Assume stationary before we saw the update
-                "after": position_changes_after
-            }
-            self.logger.debug(
-                f"Initialized position_changes tracking for event {event_id} (missed 'new' event)"
-            )
 
         # Determine edgeType based on position_changes transitions (protocol spec Section 7)
         if position_changes_after == 0:
@@ -388,20 +348,6 @@ class FrigateEventHandlerMixin:
         before = frigate_msg.get("before", {})
         position_changes_before = before.get("position_changes", 0) if before else 0
         position_changes_after = after.get("position_changes", 0)
-
-        # Update position_changes tracking
-        if event_id in self._frigate_event_position_changes:
-            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
-            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
-        else:
-            # "new" event was missed - initialize tracking
-            self._frigate_event_position_changes[event_id] = {
-                "before": 0,  # Assume stationary before we saw the update
-                "after": position_changes_after
-            }
-            self.logger.debug(
-                f"Initialized position_changes tracking for event {event_id} (missed 'new' event)"
-            )
 
         await self._update_motion_levels_from_recordings(frigate_msg)
 

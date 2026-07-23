@@ -61,6 +61,10 @@ class SmartDetectEventManager:
         self.last_descriptor: Optional[dict[str, Any]] = None
         self.last_event_ts: Optional[float] = None
 
+        # On startup, send a stop event to clear any lingering smart-detect state on the controller.
+        # force_stop() is async and cannot be called from synchronous __init__.
+        # The close() method in UnifiCamBase handles force stopping on shutdown.
+
     # -- lifecycle -----------------------------------------------------
 
     def _cleanup_old_events(self) -> None:
@@ -562,7 +566,7 @@ class SmartDetectEventManager:
             for event_id, event in self.active_events.items()
         }
 
-    async def force_stop_all(self) -> None:
+    async def force_stop(self) -> None:
         """Force-stop every currently active smart detect event."""
         for event_id in list(self.active_events.keys()):
             event = self.active_events[event_id]

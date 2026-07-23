@@ -26,7 +26,7 @@ FetchSnapshotsFn = Callable[[int, str], Awaitable[tuple]]
 GetSmartSnapshotsFn = Callable[[int], tuple]
 
 
-class MotionAnalyticsManager:
+class SmartMotionEventManager:
     def __init__(
         self,
         logger: logging.Logger,
@@ -58,6 +58,12 @@ class MotionAnalyticsManager:
         self._motion_zone_config: dict[str, str] = {"1": "Default"}
 
         self.last_event_ts: Optional[float] = None
+
+        # On startup send a stop event to clear any lingering motion state on the controller.
+
+        self.force_stop()
+        time.sleep(0.1)  # allow any lingering tasks to cancel before we start a new one
+        self.force_stop()
 
     def set_motion_zone_config(self, zone_config: dict[str, str]) -> None:
         """Configure motion zone IDs and names, e.g. {"1": "Front Door"}."""
@@ -160,7 +166,7 @@ class MotionAnalyticsManager:
             "motion_snapshot_path": None,
             "motion_snapshot_fov_path": None,
             "motion_raw_heatmap_npz_path": None,
-            "motion_levels": {self._motion_zone_id: 50},
+            "motion_levels": {self._motion_zone_id: 30},
             "recordings_motion_level": None,
             "recordings_motion_last_fetch": 0.0,
             "motion_levels_source": "default",
@@ -207,7 +213,7 @@ class MotionAnalyticsManager:
         self._motion_event_id_counter += 1
         active_event["motion_event_id"] = self._motion_event_id_counter
 
-        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 50})
+        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 30})
 
         motion_heatmap_filename = f"heatmap_{self._motion_event_id_counter:08d}.png"
         motion_snapshot_filename = f"motionsnap_{self._motion_event_id_counter:08d}.jpg"
@@ -276,7 +282,7 @@ class MotionAnalyticsManager:
         if motion_levels_updated_at <= last_pulse_updated_at:
             return
 
-        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 50})
+        motion_levels = active_event.get("motion_levels", {self._motion_zone_id: 30})
 
         payload: dict[str, Any] = {
             "clockBestMonotonic": 0,
@@ -289,6 +295,16 @@ class MotionAnalyticsManager:
             "eventId": 18446744073709551615,  # sentinel: max uint64 / -1 for pulse events
             "eventType": "pulse",
             "levels": motion_levels,
+            "motionHeatmap":"",
+            "motionHeatmapHeight":0,
+            "motionHeatmapWidth":0,
+            "motionRawHeatmapNPZ":"",
+            "motionSnapshot":"",
+            "motionSnapshotFullFoV":"",
+            "motionSnapshotFullFoVHeight":0,
+            "motionSnapshotFullFoVWidth":0,
+            "motionSnapshotHeight":0,
+            "motionSnapshotWidth":0
         }
 
         self.logger.debug(f"Sending motion pulse event with levels: {motion_levels}")
@@ -425,7 +441,7 @@ class MotionAnalyticsManager:
             "edgeType": "stop",
             "eventId": self._motion_event_id_counter,
             "eventType": "motion",
-            "levels": motion_levels,
+        #    "levels": motion_levels,
             "motionHeatmap": heatmap_filename,
             "motionHeatmapHeight": 90,
             "motionHeatmapWidth": 160,
@@ -493,3 +509,4 @@ class MotionAnalyticsManager:
                 await self.trigger_stop()
             except Exception as e:
                 self.logger.error(f"Error stopping motion event: {e}")
+

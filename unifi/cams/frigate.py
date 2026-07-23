@@ -61,9 +61,6 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
         self._active_frigate_events: set[str] = set()
         # Frigate event.id -> object type, used for label-aware snapshot matching.
         self._frigate_event_object_types: dict[str, SmartDetectObjectType] = {}
-        # Track position_changes for stationary object detection.
-        # Format: {event_id: {\"before\": int, \"after\": int}}
-        self._frigate_event_position_changes: dict[str, dict[str, int]] = {}
 
     @property
     def frigate_detect_fps(self) -> float:
@@ -372,6 +369,4 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
         self._frigate_event_object_types.pop(frigate_event_id, None)
         self.event_last_update.pop(frigate_event_id, None)
         self.event_snapshot_ready.pop(frigate_event_id, None)
-        # Clean up position_changes tracking
-        self._frigate_event_position_changes.pop(frigate_event_id, None)
 
