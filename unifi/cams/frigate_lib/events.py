@@ -168,18 +168,47 @@ class FrigateEventHandlerMixin:
         descriptor = self._build_descriptor(frigate_msg, object_type, tracker_id)
         frame_time_ms = int(frigate_msg["after"].get("frame_time", 0) * 1000) - self.args.frigate_time_sync_ms
 
+        # Extract position_changes for stationary object detection
+        after = frigate_msg.get("after", {})
+        position_changes = after.get("position_changes", 0)
+
+        # Initialize position_changes tracking
+        self._frigate_event_position_changes[event_id] = {
+            "before": 0,  # "new" event has no "before"
+            "after": position_changes
+        }
+
         zones_status = self._update_zone_status_for_track(
             tracker_id, descriptor["zones"], descriptor["confidenceLevel"], active=True
         )
 
-        if self._motion_smart_event_id is None:
-            self._motion_smart_event_id = await self.trigger_smart_detect_start(
-                object_type, descriptor, frame_time_ms, zonesStatus=zones_status
+        # Determine edgeType based on position_changes (protocol spec Section 7)
+        if position_changes == 0:
+            # Stationary object: emit edgeType="none"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes={position_changes}, "
+                f"stationary=True → edgeType=none, calling trigger_smart_detect_stationary()"
+            )
+            await self.trigger_smart_detect_stationary(
+                custom_descriptor=descriptor,
+                event_timestamp=frame_time_ms,
+                zonesStatus=zones_status,
+                event_id=self._motion_smart_event_id,
             )
         else:
-            await self.trigger_smart_detect_update(
-                object_type, descriptor, frame_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
+            # Moving object: emit edgeType="enter"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes={position_changes}, "
+                f"stationary=False → edgeType=enter"
             )
+            if self._motion_smart_event_id is None:
+                self._motion_smart_event_id = await self.trigger_smart_detect_start(
+                    object_type, descriptor, frame_time_ms, zonesStatus=zones_status
+                )
+            else:
+                await self.trigger_smart_detect_update(
+                    object_type, descriptor, frame_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
+                )
 
         self._active_frigate_events.add(event_id)
         self._frigate_event_object_types[event_id] = object_type
@@ -197,12 +226,28 @@ class FrigateEventHandlerMixin:
         self, frigate_msg: dict[str, Any], event_id: str, object_type: SmartDetectObjectType, label: str
     ) -> None:
         if event_id not in self._active_frigate_events:
+            # "new" event was missed - this could be an update for a known event
+            # or a late-joining object. Handle gracefully.
             if not self._is_motion_window_active():
-                self.logger.warning(
-                    f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
-                    f"(label={label}) with no active motion window; dropping update."
-                )
-                return
+                # Check if this is a stationary object (position_changes=0)
+                # If so, we can still track it even without motion window
+                after = frigate_msg.get("after", {})
+                position_changes_after = after.get("position_changes", 0)
+                
+                if position_changes_after == 0:
+                    # Stationary object: create tracker and send stationary message
+                    # even without active motion window
+                    self.logger.info(
+                        f"Stationary object detected without motion window: "
+                        f"event_id={event_id}, label={label} -> creating tracker"
+                    )
+                else:
+                    # Moving object: require active motion window
+                    self.logger.warning(
+                        f"MISSED EVENT: Received 'update' for unknown Frigate event_id={event_id} "
+                        f"(label={label}) with no active motion window; dropping update."
+                    )
+                    return
 
             # Recovery path for out-of-order/missed MQTT delivery: if a
             # Frigate update arrives before we saw its "new" event, adopt it
@@ -216,29 +261,87 @@ class FrigateEventHandlerMixin:
                 f"(event_id={event_id}, label={label}) in motion window {self._motion_smart_event_id}."
             )
 
+            # Initialize position_changes tracking for this recovered event
+            if event_id not in self._frigate_event_position_changes:
+                self._frigate_event_position_changes[event_id] = {
+                    "before": 0,  # Assume stationary before we saw the update
+                    "after": 0 # TODO: Fix this logic, as we don't need to store postition changes.  Frigate messages have before and after which is the delta tracking.
+                }
+            self.logger.debug(
+                f"Initialized position_changes tracking for recovered event {event_id}"
+            )
+
         tracker_id = self.tracker_ids.get(event_id)
         descriptor = self._build_descriptor(frigate_msg, object_type, tracker_id)
         frame_time_ms = int(frigate_msg["after"].get("frame_time", 0) * 1000) - self.args.frigate_time_sync_ms
+
+        # Extract position_changes for stationary detection and transition detection
+        after = frigate_msg.get("after", {})
+        before = frigate_msg.get("before", {})
+        position_changes_before = before.get("position_changes", 0) if before else 0
+        position_changes_after = after.get("position_changes", 0)
+
+        # Update position_changes tracking
+        if event_id in self._frigate_event_position_changes:
+            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
+            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+        else:
+            self._frigate_event_position_changes[event_id] = {
+                "before": position_changes_before,
+                "after": position_changes_after
+            }
 
         zones_status = self._update_zone_status_for_track(
             tracker_id, descriptor["zones"], descriptor["confidenceLevel"], active=True
         )
 
-        if self._motion_smart_event_id is None:
-            self._motion_smart_event_id = await self.trigger_smart_detect_start(
-                object_type, descriptor, frame_time_ms, zonesStatus=zones_status
+        # Update position_changes tracking
+        if event_id in self._frigate_event_position_changes:
+            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
+            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+        else:
+            # "new" event was missed - initialize tracking
+            self._frigate_event_position_changes[event_id] = {
+                "before": 0,  # Assume stationary before we saw the update
+                "after": position_changes_after
+            }
+            self.logger.debug(
+                f"Initialized position_changes tracking for event {event_id} (missed 'new' event)"
             )
-        elif descriptor.get("stationary", False):
-            # Stationary background object: emit edgeType="none" heartbeat.
-            # objectTypes=[] and zones remain at level 0 / status "none"
-            # (protocol spec Section 7 -- stationary tracker behavior).
+
+        # Determine edgeType based on position_changes transitions (protocol spec Section 7)
+        if position_changes_after == 0:
+            # Stationary object: emit edgeType="none"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes_before={position_changes_before}, "
+                f"position_changes_after={position_changes_after} → edgeType=none, calling trigger_smart_detect_stationary()"
+            )
             await self.trigger_smart_detect_stationary(
                 custom_descriptor=descriptor,
                 event_timestamp=frame_time_ms,
                 zonesStatus=zones_status,
                 event_id=self._motion_smart_event_id,
             )
+        elif position_changes_before == 0 and position_changes_after > 0:
+            # First movement detected (object was stationary, now moving): emit edgeType="enter"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes_before={position_changes_before}, "
+                f"position_changes_after={position_changes_after} → FIRST MOVEMENT detected, edgeType=enter"
+            )
+            if self._motion_smart_event_id is None:
+                self._motion_smart_event_id = await self.trigger_smart_detect_start(
+                    object_type, descriptor, frame_time_ms, zonesStatus=zones_status
+                )
+            else:
+                await self.trigger_smart_detect_update(
+                    object_type, descriptor, frame_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
+                )
         else:
+            # Already moving: emit via update (edgeType="moving" is implicit)
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes_before={position_changes_before}, "
+                f"position_changes_after={position_changes_after} → already moving, calling trigger_smart_detect_update()"
+            )
             await self.trigger_smart_detect_update(
                 object_type, descriptor, frame_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
             )
@@ -280,6 +383,26 @@ class FrigateEventHandlerMixin:
         end_time_ms = int(frigate_msg["after"].get("end_time", 0) * 1000) - self.args.frigate_time_sync_ms
         frame_time_ms = int(frigate_msg["after"].get("frame_time", 0) * 1000) - self.args.frigate_time_sync_ms
 
+        # Extract position_changes for stationary detection
+        after = frigate_msg.get("after", {})
+        before = frigate_msg.get("before", {})
+        position_changes_before = before.get("position_changes", 0) if before else 0
+        position_changes_after = after.get("position_changes", 0)
+
+        # Update position_changes tracking
+        if event_id in self._frigate_event_position_changes:
+            self._frigate_event_position_changes[event_id]["before"] = position_changes_before
+            self._frigate_event_position_changes[event_id]["after"] = position_changes_after
+        else:
+            # "new" event was missed - initialize tracking
+            self._frigate_event_position_changes[event_id] = {
+                "before": 0,  # Assume stationary before we saw the update
+                "after": position_changes_after
+            }
+            self.logger.debug(
+                f"Initialized position_changes tracking for event {event_id} (missed 'new' event)"
+            )
+
         await self._update_motion_levels_from_recordings(frigate_msg)
 
         track_duration = time.time() - self.event_last_update.get(event_id, self._motion_start_time)
@@ -288,29 +411,46 @@ class FrigateEventHandlerMixin:
             f"Duration: {track_duration:.1f}s"
         )
 
-        # Send a final update carrying the last-known position/confidence
-        # before removing the track. This mirrors real device behavior: the
-        # last real detection frame arrives as a live update immediately
-        # before the object leaves the zone.
-        zones_status_final_update = self._update_zone_status_for_track(
-            tracker_id, final_descriptor["zones"], final_descriptor["confidenceLevel"], active=True
-        )
-        await self.trigger_smart_detect_update(
-            object_type, final_descriptor, frame_time_ms,
-            zonesStatus=zones_status_final_update, event_id=self._motion_smart_event_id,
-        )
+        # Determine edgeType based on position_changes (protocol spec Section 7)
+        if position_changes_after == 0:
+            # Stationary object leaving: emit edgeType="none"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes_after={position_changes_after} → edgeType=none, "
+                f"calling trigger_smart_detect_stationary()"
+            )
+            zones_status = self._update_zone_status_for_track(
+                tracker_id, final_descriptor["zones"], final_descriptor["confidenceLevel"], active=True
+            )
+            await self.trigger_smart_detect_stationary(
+                custom_descriptor=final_descriptor,
+                event_timestamp=end_time_ms,
+                zonesStatus=zones_status,
+                event_id=self._motion_smart_event_id,
+            )
+        else:
+            # Moving object leaving: emit edgeType="leave"
+            self.logger.debug(
+                f"Frigate event {event_id}: position_changes_after={position_changes_after} → edgeType=leave"
+            )
+            zones_status_final_update = self._update_zone_status_for_track(
+                tracker_id, final_descriptor["zones"], final_descriptor["confidenceLevel"], active=True
+            )
+            await self.trigger_smart_detect_update(
+                object_type, final_descriptor, frame_time_ms,
+                zonesStatus=zones_status_final_update, event_id=self._motion_smart_event_id,
+            )
 
-        # This track is closing -- remove its contribution from the shared
-        # zone tracker (other tracks' occupancy is unaffected, per protocol
-        # spec Section 3) and capture the resulting post-departure
-        # zonesStatus, overridden so any zone it still occupied reports as
-        # "leave".
-        zones_status = self._update_zone_status_for_track(tracker_id, [], 0, active=False)
-        ZoneStatusTracker.mark_all_departed(zones_status)
+            # This track is closing -- remove its contribution from the shared
+            # zone tracker (other tracks' occupancy is unaffected, per protocol
+            # spec Section 3) and capture the resulting post-departure
+            # zonesStatus, overridden so any zone it still occupied reports as
+            # "leave".
+            zones_status = self._update_zone_status_for_track(tracker_id, [], 0, active=False)
+            ZoneStatusTracker.mark_all_departed(zones_status)
 
-        await self.trigger_smart_detect_update(
-            object_type, final_descriptor, end_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
-        )
+            await self.trigger_smart_detect_update(
+                object_type, final_descriptor, end_time_ms, zonesStatus=zones_status, event_id=self._motion_smart_event_id
+            )
 
         self._forget_track(event_id)
 

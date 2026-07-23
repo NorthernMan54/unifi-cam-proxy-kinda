@@ -107,6 +107,11 @@ def build_descriptor_from_frigate_msg(
 
     stationary = after.get("stationary", False)
 
+    # Extract position_changes for stationary object detection
+    before = frigate_msg.get("before", {})
+    position_changes_before = before.get("position_changes", 0) if before else 0
+    position_changes_after = after.get("position_changes", 0)
+
     current_zones = after.get("current_zones", [])
     zones = translate_zones(current_zones, zone_name_to_id, logger, camera_name)
 
@@ -170,6 +175,8 @@ def build_descriptor_from_frigate_msg(
         )
 
     descriptor = {
+        "positionChangesBefore": position_changes_before,
+        "positionChangesAfter": position_changes_after,
         "attributes": None,
         "boxColor": box_color,
         "confidenceLevel": confidence_level,
@@ -200,3 +207,4 @@ def build_descriptor_from_frigate_msg(
     )
 
     return descriptor
+
