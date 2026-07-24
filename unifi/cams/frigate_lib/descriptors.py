@@ -118,9 +118,6 @@ def build_descriptor_from_frigate_msg(
     # boxColor: If stationary, white; if moving, red.
     box_color = "white" if stationary else "red"
 
-    average_speed = after.get("average_estimated_speed", 0)
-    speed = float(average_speed) if average_speed > 0 else None
-
     # License plate (vehicles) via Frigate's recognized_license_plate.
     license_plate_data = after.get("recognized_license_plate")
     license_plate = None
@@ -196,7 +193,7 @@ def build_descriptor_from_frigate_msg(
 
     logger.debug(
         f"Built descriptor: trackerID={tracker_id}, confidence={confidence_level}, "
-        f"coord={coord}, stationary={stationary}, speed={speed}, "
+        f"coord={coord}, stationary={stationary}, "
         f"licensePlate={license_plate}, zones={zones}, boxColor={box_color}, name={name!r}"
     )
 
