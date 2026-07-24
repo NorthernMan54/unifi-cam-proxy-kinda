@@ -100,7 +100,7 @@ MQTT motion: OFF
 
 ### `descriptors[]` object fields
 
-| Field | Notes |
+| Field | Notes | 
 |---|---|
 | `trackerID` | Persistent per-track integer ID, stable across all messages for one continuous track. Assign once per Frigate `event.id` (map Frigate's string ID → an incrementing int). |
 | `objectType` | `person` / `animal` (and presumably `vehicle`, `package`, etc. — not seen here but expected). Maps directly to your existing `_frigate_to_unifi`/`_LABEL_TO_TYPE` dicts. |

@@ -175,14 +175,11 @@ def build_descriptor_from_frigate_msg(
         )
 
     descriptor = {
-        "positionChangesBefore": position_changes_before,
-        "positionChangesAfter": position_changes_after,
         "attributes": None,
         "boxColor": box_color,
         "confidenceLevel": confidence_level,
         "coord": coord,
         "coord3d": [-1, -1],
-        "depth": None,
         "firstShownTimeMs": int(after.get("start_time", 0) * 1000) - frigate_time_sync_ms,
         "idleSinceTimeMs": idle_since_ms,
         "lines": [],
@@ -190,7 +187,6 @@ def build_descriptor_from_frigate_msg(
         "name": name,
         "objectType": object_type.value,
         "secondLensZones": [],
-        "speed": speed,
         "stationary": stationary,
         "tag": tag,
         "trackerID": tracker_id,
