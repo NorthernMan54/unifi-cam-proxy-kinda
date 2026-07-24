@@ -400,18 +400,55 @@ class UnifiCamBase(
         )
 
     async def process_upgrade(self, msg: AVClientRequest) -> None:
-        url = msg["payload"]["uri"]
-        headers = {"Range": "bytes=0-100"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, ssl=False) as r:
-                content = await r.content.readexactly(54)
-                version = ""
-                for i in range(0, 50):
-                    b = content[4 + i]
-                    if b != b"\x00":
-                        version += chr(b)
-                self.logger.debug(f"Pretending to upgrade to: {version}")
-                self.args.fw_version = version
+        """
+        Process UpdateFirmwareRequest from UniFi Video.
+        
+        Extracts firmware version from the URI and updates self.args.fw_version.
+        This is an emulator - no actual download is performed.
+        """
+        payload = msg["payload"]
+        
+        # Extract firmware version from URI
+        # Example URI: https://192.168.1.1:7444/internal/update/s5l/uvc/firmware/5.4.114/FFFFFFFFFFBB
+        fw_version = self._extract_firmware_version(payload["uri"])
+        
+        self.logger.info(f"Processing firmware update request for version: {fw_version}")
+        self.logger.debug(f"Firmware URI: {payload['uri']}")
+        self.logger.debug(f"Firmware timeout: {payload.get('timeoutMs', 600000)}ms")
+        self.logger.debug(f"Firmware MD5: {payload.get('md5', 'N/A')}")
+        
+        # Update fw_version (this is what the emulator needs)
+        self.args.fw_version = fw_version
+        
+        # No response expected per protocol
+        return
+
+    def _extract_firmware_version(self, uri: str) -> str:
+        """
+        Extract firmware version from URI.
+        
+        Example URI:
+        https://192.168.1.1:7444/internal/update/s5l/uvc/firmware/5.4.114/FFFFFFFFFFBB
+        
+        Returns:
+            Firmware version string (e.g., "5.4.114")
+        """
+        import re
+        
+        # Pattern: /firmware/VERSION/
+        match = re.search(r'/firmware/(\d+\.\d+\.\d+)/', uri)
+        if match:
+            return match.group(1)
+        
+        # Fallback: extract last path segment before hash
+        parts = uri.rstrip('/').rsplit('/', 2)
+        if len(parts) >= 2:
+            return parts[-2]
+        
+        # Last resort: return last segment
+        return uri.split('/')[-1]
+
+ 
 
     def gen_response(
         self, name: str, response_to: int = 0, payload: Optional[dict[str, Any]] = None
