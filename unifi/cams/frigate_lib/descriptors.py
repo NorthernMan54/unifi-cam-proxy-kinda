@@ -115,10 +115,8 @@ def build_descriptor_from_frigate_msg(
     current_zones = after.get("current_zones", [])
     zones = translate_zones(current_zones, zone_name_to_id, logger, camera_name)
 
-    # boxColor: real devices show "red" for objects actively occupying a zone
-    # of interest and "white" for background/idle detections outside any zone
-    # (protocol spec Section 3, descriptors[].boxColor).
-    box_color = "red" if zones else "white"
+    # boxColor: If stationary, white; if moving, red.
+    box_color = "white" if stationary else "red"
 
     average_speed = after.get("average_estimated_speed", 0)
     speed = float(average_speed) if average_speed > 0 else None
