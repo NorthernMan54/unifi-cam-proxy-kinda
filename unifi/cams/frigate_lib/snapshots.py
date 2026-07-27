@@ -64,7 +64,7 @@ class FrigateSnapshotClient:
     def event_snapshot_urls(self, frigate_event_id: str) -> tuple[str, str]:
         """URLs for a specific Frigate event's snapshot: (full, cropped-thumbnail)."""
         base_url = f"{self.frigate_http_url}/api/events/{frigate_event_id}/snapshot.jpg"
-        return base_url, f"{base_url}?crop=1&quality=80"
+        return base_url, f"{base_url}?crop=1&bbox=1&quality=80"
 
     def latest_snapshot_urls(self, timestamp: Optional[int] = None) -> tuple[str, str]:
         """URLs for the camera's current live snapshot: (full, thumbnail)."""
