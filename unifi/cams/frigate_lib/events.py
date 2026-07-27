@@ -314,14 +314,12 @@ class FrigateEventHandlerMixin:
         # Eagerly fetch and cache snapshot when Frigate has one ready. Uses
         # the event-specific Frigate snapshot URL (with native crop) rather
         # than the live latest.jpg.
-        after_data = frigate_msg.get("after", {})
-        if after_data.get("has_snapshot") and self._motion_smart_event_id is not None:
-            smart_event = self._active_smart_events.get(self._motion_smart_event_id)
-            if smart_event and not smart_event.get("snapshot_crop_path"):
-                self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
-                asyncio.ensure_future(
-                    self._fetch_and_cache_frigate_event_snapshot(event_id, self._motion_smart_event_id)
-                )
+        
+        if after.get("has_snapshot"):
+            self.logger.debug(f"Event {event_id} has updated snapshot, fetching and caching all types...")
+            asyncio.ensure_future(
+                self._fetch_and_cache_frigate_event_snapshot(event_id, self._motion_smart_event_id)
+            )
 
     async def _handle_end_event(
         self, frigate_msg: dict[str, Any], event_id: str, object_type: SmartDetectObjectType, label: str
