@@ -11,6 +11,7 @@ Things that work:
 * Live streaming
 * Full-time recording
 * Motion detection with certain cameras
+* Doorbell events from Frigate
 * Smart Detections using [Frigate](https://github.com/blakeblackshear/frigate)
 
 ## Documentation
