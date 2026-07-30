@@ -307,6 +307,8 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
                 ) as client:
                     has_connected = True
                     self.logger.info(f"Connected to {self.args.mqtt_host}:{self.args.mqtt_port}")
+                    if self.args.doorbell:
+                        self.logger.info(f"Doorbell enabled on Topic {self.args.mqtt_prefix}/{self.args.frigate_camera}/doorbell")
                     await client.subscribe(f"{self.args.mqtt_prefix}/#")
                     async with asyncio.TaskGroup() as tg:
                         tg.create_task(self.monitor_event_timeouts())
