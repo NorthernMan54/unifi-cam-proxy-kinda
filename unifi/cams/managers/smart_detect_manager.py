@@ -15,7 +15,9 @@ That's MotionAnalyticsManager's data to own, so instead of reaching into its
 internals directly, this manager calls an injected `on_event_started`
 callback and lets the analytics manager decide what to do with it.
 """
+import argparse
 import asyncio
+import json
 import logging
 import time
 from enum import Enum
@@ -45,7 +47,9 @@ class SmartDetectEventManager:
         get_uptime: GetUptimeFn,
         detected_resolutions: dict[str, tuple[int, int]],
         on_event_started: Optional[Callable[[int], None]] = None,
+        args: argparse.Namespace | None = None,
     ) -> None:
+        self.args = args
         self.logger = logger
         self._send = send
         self._gen_response = gen_response
@@ -585,6 +589,33 @@ class SmartDetectEventManager:
     ) -> AVClientResponse:
         """Process smart detect settings change request and update smartDetectEvents."""
         payload = msg.get("payload", {})
+
+        unifi_zone_ids = list(payload.get("zones", {}).keys())
+
+        frigate_zone_map = json.loads(self.args.zone_map)
+
+        self.logger.debug(f"Unifi zone IDs: {unifi_zone_ids}")
+        self.logger.debug(f"Frigate zone map: {frigate_zone_map}")
+
+        # Convert Frigate zone map to UniFi zone ID -> Frigate zone name
+        frigate_zone_names = {
+            str(zone_id): zone_name
+            for zone_name, zone_id in frigate_zone_map.items()
+        }
+
+        # Validate that every UniFi zone has a corresponding Frigate zone
+        missing_zones = [
+            zone_id
+            for zone_id in unifi_zone_ids
+            if zone_id not in frigate_zone_names
+        ]
+
+        if missing_zones:
+            raise ValueError(
+                f"UniFi smart detect zones {missing_zones} do not have "
+                f"corresponding Frigate zones. "
+                f"Configured Frigate zones: {frigate_zone_map}"
+            )
         
         if "enableSmartDetect" in payload:
             self.smartDetectEvents = payload["enableSmartDetect"]

@@ -14,6 +14,7 @@ prefers whatever the most recent linked smart-detect event captured. Rather
 than reaching into SmartDetectEventManager's internal dict, it goes through
 `get_smart_event_snapshots`, injected at construction time.
 """
+import argparse
 import asyncio
 import logging
 import time
@@ -38,7 +39,9 @@ class SmartMotionEventManager:
         fetch_snapshots_for_event: FetchSnapshotsFn,
         get_smart_event_snapshots: Optional[GetSmartSnapshotsFn] = None,
         linger_event_start_ms: int = 1000,
+        args: argparse.Namespace | None = None,
     ) -> None:
+        self.args = args
         self.logger = logger
         self._send = send
         self._gen_response = gen_response

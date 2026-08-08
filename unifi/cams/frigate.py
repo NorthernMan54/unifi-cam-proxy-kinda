@@ -371,4 +371,3 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
         self._frigate_event_object_types.pop(frigate_event_id, None)
         self.event_last_update.pop(frigate_event_id, None)
         self.event_snapshot_ready.pop(frigate_event_id, None)
-
