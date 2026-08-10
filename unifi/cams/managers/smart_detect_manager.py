@@ -584,6 +584,8 @@ class SmartDetectEventManager:
 
     # -- Settings handlers delegated from manager modules ------------------
 
+    # --zone-map '{"road": 1, "parking": 2, "plants":3, "front_door":4}'
+
     async def process_smart_detect_settings(
         self, msg: AVClientRequest
     ) -> AVClientResponse:
@@ -623,6 +625,7 @@ class SmartDetectEventManager:
                 f"Smart detect events {'enabled' if self.smartDetectEvents else 'disabled'} from ChangeSmartDetectSettings"
             )
 
+        # When changing smart detect settings, if there are any active events, force stop them to avoid inconsistencies.
         if self.smartDetectEvents:
             await self.force_stop()
             await asyncio.sleep(0.1)
