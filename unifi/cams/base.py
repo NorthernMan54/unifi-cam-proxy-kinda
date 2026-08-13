@@ -81,6 +81,7 @@ class UnifiCamBase(
             get_uptime=self.get_uptime,
             fetch_snapshots_for_event=self.fetch_snapshots_for_event,
             get_smart_event_snapshots=lambda event_id: self._smart_events.get_snapshot_paths(event_id),
+            args=self.args,
         )
         self._smart_events = SmartDetectEventManager(
             logger=self.logger,
@@ -89,6 +90,7 @@ class UnifiCamBase(
             get_uptime=self.get_uptime,
             detected_resolutions=self._detected_resolutions,
             on_event_started=self._smart_motion.link_smart_detect,
+            args=self.args,
         )
 
         self._ssl_context = ssl.create_default_context()

@@ -328,6 +328,21 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
                                 tg.create_task(self.handle_doorbell_event(message))
                             elif message.topic.matches(f"{self.args.mqtt_prefix}/reviews"):
                                 self.logger.debug(f"Received Frigate review event: {message.payload.decode()}")
+                            elif message.topic.matches(
+                                f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/audio/#"
+                            ):
+                                if not (
+                                    message.topic.matches(
+                                        f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/audio/dBFS"
+                                    )
+                                    or message.topic.matches(
+                                        f"{self.args.mqtt_prefix}/{self.args.frigate_camera}/audio/rms"
+                                    )
+                                ):
+                                    self.logger.debug(
+                                        f"Received Frigate audio message on {message.topic}: "
+                                        f"{message.payload.decode()}"
+                                    )
             except MqttError:
                 if not has_connected:
                     raise
@@ -371,4 +386,3 @@ class FrigateCam(FrigateEventHandlerMixin, RTSPCam):
         self._frigate_event_object_types.pop(frigate_event_id, None)
         self.event_last_update.pop(frigate_event_id, None)
         self.event_snapshot_ready.pop(frigate_event_id, None)
-

@@ -39,23 +39,25 @@ def translate_zones(
     camera_name: str,
 ) -> list[int]:
     """
-    Frigate's `current_zones` -> Protect numeric zone IDs via the static
-    per-camera map. Order preserved as given (most-recently-entered first,
-    matching Frigate's own convention); unmapped zone names are dropped
-    rather than raising, so a config gap degrades to "zone-less" instead of
-    crashing the bridge.
+    Translate Frigate zone names to Protect numeric zone IDs using the
+    static per-camera map.
+
+    Every current Frigate zone must have a corresponding entry in
+    zone_name_to_id. Any unmapped zones are treated as a configuration
+    error. Order is preserved as given by Frigate.
     """
-    translated = []
-    for zname in current_zones:
-        zid = zone_name_to_id.get(zname)
-        if zid is not None:
-            translated.append(zid)
-        else:
-            logger.debug(
-                f"Frigate zone '{zname}' has no entry in --zone-map for "
-                f"camera '{camera_name}'; omitting from zones[]"
-            )
-    return translated
+    missing_zones = [
+        zname for zname in current_zones if zname not in zone_name_to_id
+    ]
+
+    if missing_zones:
+        raise ValueError(
+            f"Frigate zones {missing_zones} have no entries in --zone-map "
+            f"for camera '{camera_name}'. "
+            f"Configured zones: {list(zone_name_to_id.keys())}"
+        )
+
+    return [zone_name_to_id[zname] for zname in current_zones]
 
 
 def build_descriptor_from_frigate_msg(
