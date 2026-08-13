@@ -28,7 +28,7 @@ services:
       --mqtt-prefix fregate_flynn
       --frigate-http-url http://192.168.1.38:5050
       --frigate-time-sync-ms 1105
-      --zone-map '{"road": 1, "parking": 2, "plants":3, "front_door":4}'
+      --zone-map '{"road": 1, "parking": 5, "plants": 6, "front_door": 7}'
       --video1 rtsp://192.168.1.38:8554/driveway_src
       --video3 rtsp://192.168.1.38:8554/driveway_video3
 
@@ -41,6 +41,8 @@ services:
     volumes:
       - "./client.pem:/client.pem"
       - "./unifi:/app/unifi"
+    environment:
+      - TZ=America/Toronto
     command: >-
       unifi-cam-proxy
       --verbose
@@ -72,6 +74,8 @@ services:
     volumes:
       - "./client.pem:/client.pem"
       - "./unifi:/app/unifi"
+    environment:
+      - TZ=America/Toronto
     command: >-
       unifi-cam-proxy
       --verbose
