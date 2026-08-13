@@ -359,3 +359,106 @@ Motion detection (optional)
 
 This completes the doorbell protocol specification. Doorbell devices follow the same session framing and message envelope structure as standard cameras, but use `MCUEventMessage` for ring events and report `features.doorbell: true` in the hello message.
 
+## 10. EventSmartAudio — Classified Audio Event Protocol
+
+**Observed from a four-message device capture on 2026-08-12. The capture contains two complete `alrmSpeak` events. The nine classified-audio field names are independently confirmed by the UniFi Protect OpenAPI `smartDetectAudioTypes` enum; edge behavior for classes other than `alrmSpeak` still needs a class-specific wire capture.**
+
+`EventSmartAudio` reports classified sounds independently of `EventSmartDetect` and `EventSmartMotion`. Each audio class is represented by its own payload field, whose value is an edge state. In the observed speech events the device emitted an `enter` message when speech began and a matching `leave` message when it ended; there were no pulse or moving messages between them.
+
+### Message envelope and example
+
+The normal device-to-backend envelope is used. `messageId` comes from the same connection-wide sequence as other function names, and the message remains fire-and-forget (`inResponseTo: 0`, `responseExpected: false`).
+
+```json
+{
+  "from": "ubnt_avclient",
+  "functionName": "EventSmartAudio",
+  "inResponseTo": 0,
+  "messageId": 81499615,
+  "payload": {
+    "alrmBabyCry": "none",
+    "alrmBark": "none",
+    "alrmBurglar": "none",
+    "alrmCarHorn": "none",
+    "alrmCmonx": "none",
+    "alrmGlassBreak": "none",
+    "alrmSiren": "none",
+    "alrmSmoke": "none",
+    "alrmSpeak": "enter",
+    "clockMonotonic": 1582444314,
+    "clockStream": 1582420877,
+    "clockStreamRate": 1000,
+    "clockWall": 1786570205352,
+    "eventId": 1582458314,
+    "leveldB": 0,
+    "levels": 0,
+    "loudNoise": "none",
+    "soundLoss": "none"
+  },
+  "responseExpected": false,
+  "timeStamp": "2026-08-12T21:30:19.383+00:00",
+  "to": "UniFiVideo"
+}
+```
+
+### Audio edge fields and advertised capabilities
+
+Protect's camera feature model separates object and audio capabilities:
+
+- `smartDetectTypes`: `person`, `vehicle`, `package`, `licensePlate`, `face`, `animal`
+- `smartDetectAudioTypes`: `alrmSmoke`, `alrmCmonx`, `alrmSiren`, `alrmBabyCry`, `alrmSpeak`, `alrmBark`, `alrmBurglar`, `alrmCarHorn`, `alrmGlassBreak`
+
+This confirms that the nine `alrm*` keys in `EventSmartAudio` are Protect's supported classified-audio type identifiers, not object types. A camera's `smartDetectAudioTypes` array advertises which classifications it supports; an `EventSmartAudio` payload reports state edges using the corresponding keys.
+
+| Field | Sound class / meaning | OpenAPI audio type | Captured wire value |
+|---|---|---|---|
+| `alrmBabyCry` | Baby crying | Yes | `none` |
+| `alrmBark` | Dog barking | Yes | `none` |
+| `alrmBurglar` | Burglar/intrusion sound | Yes | `none` |
+| `alrmCarHorn` | Vehicle horn | Yes | `none` |
+| `alrmCmonx` | Carbon-monoxide alarm | Yes | `none` |
+| `alrmGlassBreak` | Breaking glass | Yes | `none` |
+| `alrmSiren` | Siren | Yes | `none` |
+| `alrmSmoke` | Smoke alarm | Yes | `none` |
+| `alrmSpeak` | Speech | Yes | `enter`, then `leave` |
+| `loudNoise` | Generic loud-noise threshold | No | `none` |
+| `soundLoss` | Loss of audio input | No | `none` |
+
+Every audio edge/status field was present in every captured message. The active class alone changed to `enter` or `leave`; all other fields remained `none`. Preserve this complete shape rather than emitting only the active field. The likely state vocabulary is `enter` / `leave` / `none`, although only `alrmSpeak` was observed transitioning. `loudNoise` and `soundLoss` are wire-level status fields but are not members of the OpenAPI `smartDetectAudioTypes` capability enum.
+
+The class names align with values advertised by `ubnt_avclient_hello.features.smartDetect` (for example `alrmSmoke`, `alrmCmonx`, `alrmBabyCry`, and `alrmSpeak`). `ChangeAudioEventsSettings` is the corresponding backend-to-device configuration request; the current bridge acknowledges it but does not yet store or apply its settings.
+
+### Timing and identifiers
+
+| Field | Observed behavior |
+|---|---|
+| `clockMonotonic` | Millisecond device-uptime time for the detected audio edge. |
+| `clockStream` | Millisecond stream clock. It trailed `clockMonotonic` by 23,437–23,438 ms in all four messages. |
+| `clockStreamRate` | Always `1000`. |
+| `clockWall` | Epoch-ms wall time corresponding to `clockMonotonic`; `clockWall - clockMonotonic` stayed constant within 1 ms across the capture. |
+| `eventId` | Equal to `clockMonotonic + 14,000` in all four messages. This looks time-derived rather than like the increment-by-one `EventSmartDetect` ID, so it should not be generated from the object-event counter. |
+| envelope `timeStamp` | Approximately 14.03 seconds after `clockWall`, consistent with the `eventId` offset. This indicates that the device reports an audio edge after an approximately 14-second classification/confirmation delay while retaining the edge's original clocks. |
+
+The two captured speech intervals were approximately 31.70 seconds and 14.05 seconds when measured from the payload clocks. Both `enter` and `leave` were delivered with the same roughly 14-second delay.
+
+`leveldB` and `levels` were numeric scalar `0` in every message (not dictionaries like `EventSmartMotion.levels`). Their useful non-zero range and precise semantics are not established by this capture; emit numeric zero unless an audio source provides confirmed measurements.
+
+### Lifecycle and implementation mapping
+
+```text
+Audio classifier reports speech start at time T
+  └─ after ~14 s, EventSmartAudio
+       └─ alrmSpeak: "enter"; every other audio edge: "none"
+
+Audio classifier reports speech end at time U
+  └─ after ~14 s, EventSmartAudio
+       └─ alrmSpeak: "leave"; every other audio edge: "none"
+```
+
+Recommended bridge behavior:
+
+1. Map each supported source audio label to its `EventSmartAudio` field and keep per-class active/inactive state.
+2. Emit one complete payload on a state transition: `enter` on inactive → active and `leave` on active → inactive. Set every non-transitioning class field to `none`.
+3. Use the shared connection-wide `messageId`, but maintain EventSmartAudio's time-derived `eventId` behavior separately from EventSmartDetect and EventSmartMotion counters.
+4. Keep the stream/monotonic offset consistent with the active camera stream and retain the original detection-edge time in `clockWall`, even if classification introduces a delivery delay.
+5. Do not synthesize periodic updates: none were observed between `enter` and `leave`.
