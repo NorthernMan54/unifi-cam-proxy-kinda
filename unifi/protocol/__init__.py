@@ -1,4 +1,4 @@
-"""Backward-compatible protocol type imports."""
+"""Types and helpers for the UniFi camera protocol."""
 
 from unifi.protocol.messages import AVClientRequest, AVClientResponse
 

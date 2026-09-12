@@ -46,11 +46,12 @@ all = ["unifi-cam-proxy[test]"]
 
 
 [project.scripts]
-unifi-cam-proxy = "unifi.main:main"
+unifi-cam-proxy = "unifi.cli:main"
 
 
-[tool.setuptools]
-package-dir = { "unifi" = "unifi" }
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["unifi*"]
 
 
 [tool.setuptools.dynamic]

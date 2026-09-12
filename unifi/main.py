@@ -7,11 +7,11 @@ from shutil import which
 import coloredlogs
 from uiprotect import ProtectApiClient
 
-from unifi.cams import (
+from unifi.cameras import (
     FrigateCam,
     RTSPCam,
 )
-from unifi.core import Core
+from unifi.runtime import run_camera
 from unifi.version import __version__
 
 CAMS = {
@@ -153,8 +153,7 @@ async def run():
         sys.exit(1)
 
     cam = klass(args, logger)
-    c = Core(args, cam, core_logger)
-    await c.run()
+    await run_camera(args, cam, core_logger)
 
 
 def main():

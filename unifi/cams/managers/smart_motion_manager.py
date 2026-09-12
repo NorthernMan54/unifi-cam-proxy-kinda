@@ -20,7 +20,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Optional
 
-from unifi.cams.types import AVClientRequest, AVClientResponse
+from unifi.protocol.messages import AVClientRequest, AVClientResponse
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 GenResponseFn = Callable[..., dict[str, Any]]

@@ -106,7 +106,7 @@ class RTSPCam(UnifiCamBase):
 
     def _start_snapshot_stream(self) -> None:
         """Start a new snapshot stream process."""
-        if not self.snapshot_stream:
+        if self.snapshot_stream is None or self.snapshot_stream.poll() is not None:
             snapshot_source = self.stream_source.get("video3", self.stream_source["video1"])
             cmd = (
                 f"AV_LOG_FORCE_NOCOLOR=1 ffmpeg -loglevel level+{self.args.loglevel} "
@@ -150,24 +150,24 @@ class RTSPCam(UnifiCamBase):
                 self.logger.error(f"Error monitoring snapshot stream: {e}")
                 # Continue monitoring even if error occurs
 
+    async def _http_start_motion(self, request):
+        self.logger.debug("Starting motion")
+        await self.trigger_analytics_start()
+        return web.Response(text="ok")
+
+    async def _http_stop_motion(self, request):
+        self.logger.debug("Stopping motion")
+        await self.trigger_analytics_stop()
+        return web.Response(text="ok")
+
     async def run(self) -> None:
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
 
             app = web.Application()
 
-            async def start_motion(request):
-                self.logger.debug("Starting motion")
-                await self.trigger_motion_start()
-                return web.Response(text="ok")
-
-            async def stop_motion(request):
-                self.logger.debug("Starting motion")
-                await self.trigger_motion_stop()
-                return web.Response(text="ok")
-
-            app.add_routes([web.get("/start_motion", start_motion)])
-            app.add_routes([web.get("/stop_motion", stop_motion)])
+            app.add_routes([web.get("/start_motion", self._http_start_motion)])
+            app.add_routes([web.get("/stop_motion", self._http_stop_motion)])
 
             self.runner = web.AppRunner(app)
             await self.runner.setup()

@@ -20,22 +20,15 @@ import asyncio
 import json
 import logging
 import time
-from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
-from unifi.cams.types import AVClientRequest, AVClientResponse
 from unifi.cams.handlers.snapshot_utils import calculate_snapshot_dimensions, get_image_dimensions
+from unifi.events.models import SmartDetectObjectType
+from unifi.protocol.messages import AVClientRequest, AVClientResponse
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 GenResponseFn = Callable[..., dict[str, Any]]
 GetUptimeFn = Callable[[], float]
-
-
-class SmartDetectObjectType(Enum):
-    PERSON = "person"
-    VEHICLE = "vehicle"
-    ANIMAL = "animal"
-    PACKAGE = "package"
 
 
 class SmartDetectEventManager:

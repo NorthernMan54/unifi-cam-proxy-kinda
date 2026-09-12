@@ -1,4 +1,4 @@
-"""Backward-compatible imports for the WebSocket transport."""
+"""Connection transports used by the camera runtime."""
 
 from unifi.transport.websocket import Core, RetryableError, WebSocketTransport
 

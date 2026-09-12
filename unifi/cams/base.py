@@ -14,13 +14,11 @@ from datetime import datetime, timezone
 import aiohttp
 import websockets
 
-from unifi.core import RetryableError
+from unifi.transport.websocket import RetryableError
 from unifi.cams.handlers import ProtocolHandlers, VideoStreamHandlers
 from unifi.cams.handlers.snapshot_handlers import SnapshotHandlers
-from unifi.cams.types import AVClientRequest, AVClientResponse
-from unifi.cams.managers.smart_detect_manager import SmartDetectObjectType
-
-AVClientRequest = AVClientResponse = dict[str, Any]
+from unifi.events.models import SmartDetectObjectType
+from unifi.protocol.messages import AVClientRequest, AVClientResponse
 
 # Re-exported so existing call sites doing
 # `from unifi.cams.base import SmartDetectObjectType` keep working --
