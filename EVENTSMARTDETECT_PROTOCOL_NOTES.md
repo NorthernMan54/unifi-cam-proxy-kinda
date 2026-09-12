@@ -1,6 +1,8 @@
 # EventSmartDetect Protocol Notes — Frigate → Protect Bridge Spec
 
-Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-07-01/02). This confirms and refines the wire format your `UnifiCamBase`/`FrigateCam` `trigger_smart_detect_*` path needs to emit.
+Derived from captured `DEVICE_TO_BACKEND` logs for camera `F4E2C60D4B4C` (2026-07-01/02, 2026-07-21). This confirms and refines the wire format your `UnifiCamBase`/`FrigateCam` `trigger_smart_detect_*` path needs to emit.
+
+> **Revision note (2026-07-21 capture):** This revision adds a previously-undocumented parallel "loiter" tracking subsystem and the `warmup` edgeType, and corrects the earlier claim about `objectTypes` staying populated for a track's full lifetime. See Section 11.
 
 ## 1. Log line / session framing (outside the JSON)
 
@@ -26,8 +28,8 @@ Derived from a captured `DEVICE_TO_BACKEND` log for camera `F4E2C60D4B4C` (2026-
 }
 ```
 
-- `messageId`: monotonically increasing per-connection counter across **all** message types (not just smart-detect) — increment a single counter in the emulator, don't scope it per-function.
-- `timeStamp` is set fractionally *after* `payload.clockWall` (tens of ms later) — i.e. it's stamped at send time, not detection time. Fine to set at emit time.
+- `messageId`: monotonically increasing per-connection counter across **all** message types (not just smart-detect) — increment a single counter in the emulator, don't scope it per-function. **Confirmed (2026-07-21 capture) this counter is also shared across the loiter and zone subsystems described in Section 11** — they are not independently numbered.
+- `timeStamp` is set fractionally *after* `payload.clockWall` (tens of ms later) — i.e. it's stamped at send time, not detection time. Fine to set at emit time. **Exception:** the terminal `leave` message can be held significantly longer before transmission — see Section 11.6.
 - `responseExpected: false`, `inResponseTo: 0` for all observed smart-detect pushes — this is fire-and-forget telemetry, not a request/response pair.
 
 ## 3. Architectural layers: Motion events vs. object tracking vs. EventSmartDetect
@@ -49,8 +51,9 @@ There are three distinct scopes to understand:
 **3. EventSmartDetect messages (per-object protocol messages)**
 - Sent per tracked object as it enters, moves, and exits zones
 - Sent *within* an active motion window (between `trigger_smart_detect_start()` and `trigger_smart_detect_stop()`)
-- Each message carries: `edgeType` (`enter`/`moving`/`leave`), object descriptor (`trackerID`, `zones`, confidence), and aggregated `zonesStatus`
+- Each message carries: `edgeType` (`enter`/`moving`/`leave`/`warmup` — see Section 11), object descriptor (`trackerID`, `zones`, confidence), and aggregated `zonesStatus`
 - Mapping: Frigate `event.id` (string) → Unifi `trackerID` (int, allocated per object for the bridge session)
+- **Update (Section 11):** a single tracked object can concurrently drive *two* independent EventSmartDetect state machines — a "zone" one (`zonesStatus`, this section's edgeTypes) and a "loiter" one (`loiterZonesStatus`, edgeType `warmup` plus presumably a loiter-triggered state not yet captured). Treat these as sibling emitters keyed by the same trackerID, not a single combined state machine.
 
 **Correct flow example:**
 ```
@@ -86,15 +89,16 @@ MQTT motion: OFF
 | `clockStream` | Stream-relative clock, ms, base rate given by `clockStreamRate`. Runs ~20-21s behind `clockMonotonic` in this capture (i.e. offset by stream start delay) — keep a fixed `clockMonotonic - clockStream` offset per stream/session. |
 | `clockStreamRate` | Always `1000` here (ms ticks, not 90kHz PTS) — simpler than the FLV path's 90k-based timestamps. |
 | `clockWall` | Epoch ms wall clock. This is what you'll derive directly from Frigate's event `frame_time`. |
-| `eventId` | Single incrementing counter, **shared across all tracked objects**, incremented once per emitted message (not per track). Persists for camera lifetime. |
-| `edgeType` | State of *zone occupancy* for this message: `enter`, `moving`, `leave`, or `none` (no zone transition, object idle/stationary). |
-| `objectTypes` | Top-level array — **correction from a second capture**: this is not a leak/bug as first assumed. It stays populated (e.g. `["person"]`) for the *entire* life of a track — `enter` through every `moving` message — and only clears to `[]` on the terminal `leave` (when `descriptors` also empties). Model it as "current active object types across all live tracks on this camera," cleared only when the last track closes. |
+| `eventId` | Single incrementing counter, **shared across all tracked objects, and (confirmed 2026-07-21) shared across the loiter and zone subsystems too**, incremented once per emitted message (not per track). Persists for camera lifetime. |
+| `edgeType` | State of *zone occupancy* for this message: `enter`, `moving`, `leave`, `none` (no zone transition, object idle/stationary — zone subsystem), or `warmup` (loiter subsystem; object being monitored for loitering but hasn't crossed the loiter threshold — see Section 11). |
+| `objectTypes` | Top-level array — **corrected in this revision.** Earlier capture suggested this stays populated (e.g. `["person"]`) for the entire life of a track. The 2026-07-21 capture shows this is only true *within zone-subsystem messages* (`enter`/`moving`): it is `[]` on the terminal zone `leave`, **and it is also `[]` on the sibling loiter-subsystem `warmup` message for the identical trackerID on the same tick.** Model it per-message, scoped to the subsystem/edgeType that emitted it, not as a single object-level flag. |
 | `displayTimeoutMSec` | UI staleness hint, ~300-360ms in this capture, jitters per message. Not safety-critical to model precisely; a value in that band is fine. |
 | `descriptors[]` | Per-tracked-object array, see below. |
-| `zonesStatus` | Dict keyed by zone ID string (`"1"`,`"2"`,`"3"`) → `{level, status}`. Every zone configured on the camera appears every message, not just the active one. |
-| `smartDetectSnapshotFullFoV` + dims | Only populated on the terminal `leave` message for a track. Filename pattern: `smartdetectsnap_zone_<something>_fullfov.jpg` (seen literal `00000000` placeholder in some, and a tracker-based name in others — treat as an internal reference id, not required to be globally meaningful, just resolvable by your snapshot server). |
-| `smartDetectSnapshots[]` | Also only on terminal `leave`. One entry per trackerID that closed, carrying the **best-confidence frame**. **Update from a second capture**: `confidenceLevel`, `coord`, and `framingRect` are not always present — one session included them, another omitted all three keys entirely rather than sending empty/zero values. Treat these three as optional; only `clockBestMonotonic`, `clockBestWall`, `smartDetectSnapshot`, `smartDetectSnapshotHeight`/`Width`, `smartDetectSnapshotName`, `smartDetectSnapshotType`, `trackerID` are reliably present. Your emitter can always include the full set (Protect's parser tolerates extra fields), but don't build validation logic that requires `confidenceLevel`/`coord`/`framingRect` on this specific sub-object. |
-| `smartDetectSnapshotFullFoV` filename | Confirmed pattern: `smartdetectsnap_zone_<8-digit zero-padded counter>_fullfov.jpg`. The counter does **not** match `eventId` or `messageId` in the observed session (fullFoV counter was `00000001` while `eventId` was already at `18`) — it appears to be an independent per-camera snapshot-save counter. Safe to implement as its own monotonic counter, incremented once per `leave` event, zero-padded to 8 digits. |
+| `zonesStatus` | Dict keyed by *zone* ID string (`"1"`,`"2"`,`"3"` in these captures) → `{level, status}`. Every configured zone appears every message, not just the active one. Belongs to the zone subsystem. |
+| `loiterZonesStatus` | **New in this revision.** Dict keyed by *loiter-zone* ID string (`"5"`,`"7"`,`"9"` in this capture — a distinct ID namespace from `zonesStatus`) → `{level, loiterTriggerTime, startStreakTime, status}`. Structurally parallel to `zonesStatus` but carries two extra timing fields, both observed as `0` in this capture (loiter threshold never tripped). Only appears on loiter-subsystem messages (`edgeType: "warmup"` or loiter `leave`), never alongside `zonesStatus` in the same message in this capture. |
+| `smartDetectSnapshotFullFoV` + dims | Only populated on the terminal `leave` message for a track. Filename pattern differs by subsystem — see Section 11.4. |
+| `smartDetectSnapshots[]` | Also only on terminal `leave`. One entry per trackerID that closed, carrying the **best-confidence frame**. `confidenceLevel`, `coord`, and `framingRect` are not always present — one session included them, another omitted all three keys entirely rather than sending empty/zero values. Treat these three as optional; only `clockBestMonotonic`, `clockBestWall`, `smartDetectSnapshot`, `smartDetectSnapshotHeight`/`Width`, `smartDetectSnapshotName`, `smartDetectSnapshotType`, `trackerID` are reliably present (confirmed again 2026-07-21, including an explicit empty-string `smartDetectSnapshotName`). Your emitter can always include the full set (Protect's parser tolerates extra fields), but don't build validation logic that requires `confidenceLevel`/`coord`/`framingRect` on this specific sub-object. |
+| `smartDetectSnapshotFullFoV` filename | Confirmed pattern: `smartdetectsnap_zone_<8-digit zero-padded counter>_fullfov.jpg` for the zone subsystem, and `smartdetectsnap_loiter_<8-digit zero-padded counter>_fullfov.jpg` for the loiter subsystem (new — see Section 11.4). The counter does **not** match `eventId` or `messageId` — it appears to be an independent per-camera-per-subsystem snapshot-save counter. The zone-subsystem counter's exact increment behavior across a session is not fully pinned down by current captures (see Section 11.4) — implement as its own monotonic counter per subsystem, but don't assume strict same-session incrementing until confirmed further. |
 | `smartDetectSnapshot` (per-tracker) filename | Confirmed formula: `smartdetectsnap_zone_<trackerID><clockBestWall>.jpg` — i.e. the trackerID and the best-frame epoch ms wall clock concatenated directly with no separator (e.g. trackerID `2` + clockBestWall `1766543821684` → `smartdetectsnap_zone_21766543821684.jpg`). |
 | `trackerIDAttrMap` | Also only on terminal `leave`. Summarizes the whole track: `{trackerID: {objectType, zone: [zones visited, most-recent-first]}}`. |
 
@@ -102,37 +106,40 @@ MQTT motion: OFF
 
 | Field | Notes | 
 |---|---|
-| `trackerID` | Persistent per-track integer ID, stable across all messages for one continuous track. Assign once per Frigate `event.id` (map Frigate's string ID → an incrementing int). |
+| `trackerID` | Persistent per-track integer ID, stable across all messages for one continuous track. Assign once per Frigate `event.id` (map Frigate's string ID → an incrementing int). Confirmed (2026-07-21) the same `trackerID` is reused across both the zone-subsystem and loiter-subsystem messages for one object. |
 | `objectType` | `person` / `animal` (and presumably `vehicle`, `package`, etc. — not seen here but expected). Maps directly to your existing `_frigate_to_unifi`/`_LABEL_TO_TYPE` dicts. |
 | `coord` | `[x, y, w, h]` in the **640×360 sub-stream** pixel space (matches your Hikvision `_video3` low-res stream) — scale Frigate's detection box (which is against the full-res `_src` frame) down accordingly. |
-| `boxColor` | `"red"` for the actively-tracked, in-zone object; `"white"` for background/idle detections not currently of interest (the stationary "animal" blobs in this capture, confidence 50-67%, never cross a zone). Treat as a UI hint: red when `edgeType != none` for that track, white otherwise. |
+| `boxColor` | `"red"` for the actively-tracked, in-zone object; `"white"` for background/idle detections not currently of interest (the stationary "animal" blobs in this capture, confidence 50-67%, never cross a zone). Treat as a UI hint: red when `edgeType != none` for that track, white otherwise. Confirmed `"red"` held constant through an entire zone-subsystem track in the 2026-07-21 capture. |
 | `confidenceLevel` | 0-100 int, matches Frigate's `score * 100`. |
-| `firstShownTimeMs` / `idleSinceTimeMs` | Epoch ms. For actively moving tracks these stay pinned to track start (`firstShownTimeMs` constant across all messages in a track) while `idleSinceTimeMs: 0` signals "not idle." For a stationary/idle object both fields equal the same fixed timestamp and don't advance — model this as: `idleSinceTimeMs = firstShownTimeMs` once `stationary=true`, else `0`. |
+| `firstShownTimeMs` / `idleSinceTimeMs` | Epoch ms. For actively moving tracks these stay pinned to track start (`firstShownTimeMs` constant across all messages in a track) while `idleSinceTimeMs: 0` signals "not idle." Confirmed constant (`1784642058431`) across ~40 messages of a single track in the 2026-07-21 capture. For a stationary/idle object both fields equal the same fixed timestamp and don't advance — model this as: `idleSinceTimeMs = firstShownTimeMs` once `stationary=true`, else `0`. |
 | `stationary` | bool — Frigate exposes a similar concept via `event.stationary`; pass through directly. |
-| `zones` | Array of zone IDs (ints) the object currently overlaps, ordered most-recent-first when in multiple (`[2,1]` while transitioning). Single zone → single-element array. Empty when not in any zone. |
+| `zones` | Array of zone IDs (ints) the object currently overlaps, ordered most-recent-first when in multiple (`[2,1]` while transitioning). Single zone → single-element array. Empty when not in any zone. **Note:** on loiter-subsystem (`warmup`) messages, `zones` was observed empty (`[]`) even while the sibling zone-subsystem message for the same tick had the object in `zones: [1]` — `zones` in a descriptor is scoped to whichever zone namespace that message's subsystem uses. |
 | `attributes`, `lines`, `loiterZones`, `secondLensZones`, `coord3d` | Not exercised in either capture — safe to emit as `null`/`[]`/`[-1,-1]` defaults. |
-| `name`, `tag` | **Update from a second capture**: not always empty. A session with a matched face returned a populated (redacted-in-log) value in both `name` and `tag` on every descriptor for that trackerID, for the life of the track. This is Protect's facial-recognition "known person" label, populated by the camera when it matches its local face DB — not something the wire protocol invents on its own. **Relevant to your bridge**: your Frigate stats show `face_recognition_speed` is active, meaning Frigate is already doing face recognition. If Frigate's face-recognition match returns a name for a `person` event, you can populate `name`/`tag` here with that matched name to get the same "recognized person" labeling behavior in Protect's UI; otherwise leave both as `""`. |
+| `name`, `tag` | Not always empty. A session with a matched face returned a populated (redacted-in-log) value in both `name` and `tag` on every descriptor for that trackerID, for the life of the track. This is Protect's facial-recognition "known person" label, populated by the camera when it matches its local face DB — not something the wire protocol invents on its own. **Relevant to your bridge**: your Frigate stats show `face_recognition_speed` is active, meaning Frigate is already doing face recognition. If Frigate's face-recognition match returns a name for a `person` event, you can populate `name`/`tag` here with that matched name to get the same "recognized person" labeling behavior in Protect's UI; otherwise leave both as `""`. |
 
-## 5. Observed message lifecycle for one track
+## 5. Observed message lifecycle for one track (zone subsystem)
 
 1. **enter** — first zone crossing. `objectTypes` populated, `edgeType: "enter"`, that zone's `zonesStatus[..].status: "enter"`.
-2. **moving** — repeated every ~250-500ms while the object is tracked and changing zones/position. `objectTypes: []`, box color stays `"red"`.
+2. **moving** — repeated every ~250-500ms while the object is tracked and changing zones/position. `objectTypes` stays populated on these messages, box color stays `"red"`. **Confirmed 2026-07-21:** each "moving" tick's `objectTypes: ["person"]` is specific to the zone-subsystem message; the sibling loiter-subsystem message for the same instant carries `objectTypes: []` (Section 11).
 3. (object may cross into/out of multiple zones — messages show 2 zones simultaneously non-empty during a transition frame, e.g. `zones:[2,1]`)
-4. **leave** — terminal message for the track. This stop message explicitly carries the post-departure zone state in `zonesStatus`, with the active zone reporting `status: "leave"` (e.g. `"zonesStatus": {"2": {"level": 68, "status": "leave"}}`). Other configured zones remain present and may be `"none"`. This same terminal message also carries the enriched summary payload (`smartDetectSnapshotFullFoV`, `smartDetectSnapshots`, `trackerIDAttrMap`). This is the message Protect's UI/timeline actually keys its event thumbnail off of.
+4. **leave** — terminal message for the track. This stop message explicitly carries the post-departure zone state in `zonesStatus`, with the active zone reporting `status: "leave"` (e.g. `"zonesStatus": {"2": {"level": 68, "status": "leave"}}`). Other configured zones remain present and may be `"none"`. This same terminal message also carries the enriched summary payload (`smartDetectSnapshotFullFoV`, `smartDetectSnapshots`, `trackerIDAttrMap`). This is the message Protect's UI/timeline actually keys its event thumbnail off of. **Confirmed 2026-07-21:** this terminal message's wire-clock fields (`clockMonotonic`/`clockWall`) can be nearly contiguous with the prior tick, but the message's actual transmission (`timeStamp`) can lag several seconds behind — see Section 11.6.
 
 Separately, low-confidence stationary "animal" blobs cycle through their own independent `enter`→`none`→`leave` messages roughly every 5 minutes even with zero real motion — this is background noise-floor detection, not something you need to reproduce faithfully; Frigate's static "false positive"/stationary filtering already suppresses most of this on the source side.
+
+Running *concurrently* with the above, the loiter subsystem for the same trackerID cycles `warmup` messages on (approximately) the same tick cadence — see Section 11.
 
 ## 6. Implications for your `FrigateCam` bridge
 
 Given your existing dual-dict label mapping and dataclass hierarchy in `unifi/protect_api/smart_detect.py`, the additions needed:
 
-1. **Session/message counters**: one shared `messageId` counter and one shared `eventId` counter per emulated camera connection (not per Frigate event).
-2. **TrackerID allocator**: map Frigate `event.id` → synthetic incrementing int, retained for the lifetime of the Frigate event.
-3. **Zone ID mapping**: Frigate zone *names* → Protect's numeric zone IDs as configured per-camera in Protect (this has to be a static config map per camera, since Protect assigns zone numbers at zone-creation time in its own UI).
+1. **Session/message counters**: one shared `messageId` counter and one shared `eventId` counter per emulated camera connection (not per Frigate event, and not per subsystem — see Section 11.2).
+2. **TrackerID allocator**: map Frigate `event.id` → synthetic incrementing int, retained for the lifetime of the Frigate event. The same trackerID is reused by both the zone-subsystem and loiter-subsystem messages for that object.
+3. **Zone ID mapping**: Frigate zone *names* → Protect's numeric zone IDs as configured per-camera in Protect (this has to be a static config map per camera, since Protect assigns zone numbers at zone-creation time in its own UI). **Loiter zones use a separate ID namespace from regular zones** (observed `5`/`7`/`9` vs `1`/`2`/`3`) — maintain a second static map if you intend to emit `loiterZonesStatus`.
 4. **Clock offset tracking**: maintain `clockMonotonic` as real elapsed ms since emulated-stream start; derive `clockStream` via a fixed per-session offset; derive `clockWall` directly from Frigate's `frame_time * 1000`.
-5. **State machine per Frigate event**: on Frigate `event.type == "new"` → emit `enter`; on `update` with zone change → emit `moving`; on `end` → emit `leave` with populated `smartDetectSnapshots`/`trackerIDAttrMap`, plus generate/serve the two snapshot JPEGs (crop + full FoV) from Frigate's stored snapshot for that event.
-6. **`zonesStatus` completeness**: every message must include *all* configured zones for the camera, not just the changed one — build this from the static zone-name→ID map plus current per-zone occupancy state.
+5. **State machine per Frigate event**: on Frigate `event.type == "new"` → emit `enter`; on `update` with zone change → emit `moving`; on `end` → emit `leave` with populated `smartDetectSnapshots`/`trackerIDAttrMap`, plus generate/serve the two snapshot JPEGs (crop + full FoV) from Frigate's stored snapshot for that event. **Whether your bridge needs to also emit a parallel loiter/`warmup` state machine is a product decision** — Frigate doesn't have a native "loiter" concept distinct from `stationary`, so this would need to be synthesized (e.g. from Frigate's stationary-duration tracking) if you want Protect's loiter-zone UI features to light up. If you skip it, Protect simply won't show loiter-specific alerts; the regular zone enter/moving/leave path is unaffected.
+6. **`zonesStatus` completeness**: every message must include *all* configured zones for the camera, not just the changed one — build this from the static zone-name→ID map plus current per-zone occupancy state. The same completeness rule applies to `loiterZonesStatus` if you implement it.
 7. **boxColor derivation**: `"red"` while `edgeType` for the track is active (in zone), `"white"` for out-of-zone/background detections you still want to surface (optional — could just omit non-zone detections entirely, which is simpler and matches Frigate's zone-scoped semantics better).
+8. **Terminal `leave` timing**: don't assume the terminal `leave` for a track is sent immediately when Frigate emits `type: "end"`. The real device appears to buffer/delay this message by several seconds in at least one capture (Section 11.6). If your bridge emits it immediately, that's a behavioral difference from the real device, though probably harmless for Protect's UI — flagged here for awareness, not necessarily something to replicate.
 
 This is enough to drive `trigger_smart_detect_enter`/`_moving`/`_leave` (or equivalent) calls in your existing `UnifiCamBase` API from a Frigate MQTT event stream with correct field population.
 
@@ -241,6 +248,18 @@ When recordings motion is available, use that value directly as the zone level. 
 - `start`: filename stubs are populated (`motionHeatmap`, `motionSnapshot`, `motionSnapshotFullFoV`, `motionRawHeatmapNPZ`) with size fields set; actual data uploaded on `stop` GetRequest
 - `pulse`: all snapshot fields are empty strings / zero sizes
 - `stop`: populated with actual filenames; Protect immediately issues `GetRequest` for each file
+- **Confirmed dimensions (2026-07-21 capture):** the non-fullFoV `motionSnapshotHeight`/`motionSnapshotWidth` came through as `360×360` — square, and distinct from `motionSnapshotFullFoVHeight`/`motionSnapshotFullFoVWidth` at `360×640`. Treat `motionSnapshot` as a cropped/scaled square capture, not sharing the sub-stream's aspect ratio.
+
+### 8.1 Cross-checked against a full EventSmartDetect/EventSmartMotion session (2026-07-21)
+
+A session capture that interleaves `EventSmartMotion` with the `EventSmartDetect` loiter/zone traffic from Section 11 confirms and refines the above:
+
+- **`eventId` independence confirmed with concrete numbers.** While the concurrent `EventSmartDetect` messages ran an `eventId` sequence in the 114,000s (`114455`...`114531`), the two `EventSmartMotion` messages in the same window used `eventId: 4301` then `4302` — a completely separate counter, exactly as this section already claimed.
+- **`messageId` sharing confirmed across function names.** The two message types interleave on one incrementing sequence: `81497636 (EventSmartDetect/loiter), 81497637 (EventSmartDetect/zone), 81497638 (EventSmartMotion), 81497639 (loiter), 81497640 (zone), 81497641 (EventSmartMotion), ...`. Don't give `EventSmartMotion` its own `messageId` counter.
+- **Correction — `levels` is not always present.** Both captured `EventSmartMotion` messages in this session (`edgeType: "stop"`) omit the `levels` field entirely — no empty dict, just absent. This contradicts treating `levels` as a guaranteed field; at minimum, don't assume it's present on every `stop` message. It may be that `levels` is specifically dropped on stale/residual stop messages (see next point) rather than genuinely absent from all stops — that distinction isn't resolved by this capture.
+- **These two `stop` messages are themselves stale/residual**, following the same pattern as the residual `EventSmartDetect` `leave` pairs in Section 11.5: they appear at the very start of the connection, before any real detection, and their `clockBestMonotonic`/`clockBestWall` (`576202970` / `1784641699710`) sit roughly 5.5 minutes before the messages' own `clockWall` (`1784642021235` and `1784642024968`) — consistent with them reporting a motion window that actually opened well before this log window began, not a fresh event. No `start` or `pulse` `EventSmartMotion` messages for the real ~13-second person-detection track later in this same session (13:54:19–13:54:40) appear in this capture, so nothing new is confirmed here about `start`/`pulse` timing.
+- **Cross-subsystem close-out order.** When a full track/connection close-out fires, the three sibling systems flush in a fixed order sharing one `clockMonotonic`/`clockWall` tick: loiter-subsystem `leave` → zone-subsystem `leave` → `EventSmartMotion` `stop`. All three used the same underlying clock values in this capture (`clockMonotonic: 576524495` / `576528228` for the two pairs), just packaged as three separate messages on the shared `messageId` counter. If your bridge emits a synthetic connection-teardown or long-idle flush, replicate this ordering rather than emitting the three message types in arbitrary order.
+- **Logging artifact, not a protocol detail:** one `DEVICE_TO_BACKEND` line in the raw capture for this session is corrupted with unrelated camera-settings JSON (video stream config) spliced into the middle of an `EventSmartMotion` payload. This is almost certainly a buffer/overlap artifact in whatever tool produced the log, not a real wire-format behavior — don't model it.
 
 ## 9. Doorbell-Specific Protocol
 
@@ -341,7 +360,7 @@ Ring occurs
      
 Motion detection (optional)
   └─ EventSmartDetect (if person/vehicle detected)
-     └─ Edge types: enter, moving, leave
+     └─ Edge types: enter, moving, leave (and warmup on the loiter subsystem — see Section 11)
         └─ Triggers zone-based smart detect events
 ```
 
@@ -357,7 +376,7 @@ Motion detection (optional)
 | Smart detect scope | Ring events + motion | Motion + object tracking |
 | Chime control | `chimeControl` feature | N/A |
 
-This completes the doorbell protocol specification. Doorbell devices follow the same session framing and message envelope structure as standard cameras, but use `MCUEventMessage` for ring events and report `features.doorbell: true` in the hello message.
+Doorbell devices follow the same session framing and message envelope structure as standard cameras, but use `MCUEventMessage` for ring events and report `features.doorbell: true` in the hello message. The `EventSmartDetect` capture used for Section 11 below happens to be from this same doorbell device (`Wasaga Doorbell`), so the loiter/`warmup` subsystem is confirmed present on doorbell hardware, not just standard cameras.
 
 ## 10. EventSmartAudio — Classified Audio Event Protocol
 
@@ -462,3 +481,80 @@ Recommended bridge behavior:
 3. Use the shared connection-wide `messageId`, but maintain EventSmartAudio's time-derived `eventId` behavior separately from EventSmartDetect and EventSmartMotion counters.
 4. Keep the stream/monotonic offset consistent with the active camera stream and retain the original detection-edge time in `clockWall`, even if classification introduces a delivery delay.
 5. Do not synthesize periodic updates: none were observed between `enter` and `leave`.
+
+## 11. Loiter-Zone Subsystem & the `warmup` edgeType
+
+**Confirmed from a full session capture, camera `F4E2C60D4B4C` / doorbell "Wasaga Doorbell", session `F4E2C60D4B4C-1784642017261`, 2026-07-21T13:53:48–13:54:40. This is a genuine gap in the earlier revision of this document: `warmup` is a real, frequently-emitted `edgeType` value, and it belongs to a second tracking state machine the earlier revision didn't know existed.**
+
+### 11.1 Two sibling state machines per tracked object
+
+The capture shows that a single tracked person (`trackerID: 1254633`) drives **two separate, concurrently-running EventSmartDetect message streams**, distinguished by which zone-status field and edgeType vocabulary they use:
+
+| | Zone subsystem (documented pre-2026-07-21) | Loiter subsystem (new) |
+|---|---|---|
+| Zone-status field | `zonesStatus` | `loiterZonesStatus` |
+| Observed zone IDs | `1`, `2`, `3` | `5`, `7`, `9` |
+| Per-zone shape | `{level, status}` | `{level, loiterTriggerTime, startStreakTime, status}` |
+| edgeTypes seen | `enter`, `moving`, `leave` | `warmup`, `leave` |
+| `descriptors[].zones` while active | populated, e.g. `[1]` | always `[]` in this capture |
+| `objectTypes` while active | populated, e.g. `["person"]` | always `[]` in this capture |
+| Snapshot filename prefix | `smartdetectsnap_zone_...` | `smartdetectsnap_loiter_...` |
+
+Both subsystems emit messages for the *same* `trackerID`, on the *same* tick, as two back-to-back separate EventSmartDetect envelopes.
+
+### 11.2 Shared counters, alternating messages
+
+`messageId` and `eventId` are shared between the two subsystems — confirmed by the strictly alternating, monotonically increasing sequence observed for one track:
+
+```
+eventId 114459  warmup   (loiter)   trackerID 1254633, zones: []
+eventId 114460  enter    (zone)     trackerID 1254633, zones: [1]
+eventId 114461  warmup   (loiter)   trackerID 1254633, zones: []
+eventId 114462  moving   (zone)     trackerID 1254633, zones: [1]
+eventId 114463  warmup   (loiter)
+eventId 114464  moving   (zone)
+...
+```
+
+This pattern repeats for the whole ~13-second track: one loiter message, one zone message, per detector tick (roughly every 250-650ms), sharing a single incrementing `eventId`/`messageId` sequence. Do not implement separate counters per subsystem.
+
+### 11.3 What `warmup` means, and what wasn't observed
+
+`warmup` on the loiter subsystem's `loiterZonesStatus["<zone>"].status` field appears to represent an object that is being evaluated for loitering (i.e., is present but hasn't remained stationary/in-place long enough to trip whatever loiter-duration threshold Protect uses) . In this capture:
+
+- The relevant loiter zone (`"5"`) shows `status: "warmup"` on every tick while the person is being tracked.
+- The other configured loiter zones (`"7"`, `"9"`) stay `status: "none"` throughout.
+- `loiterTriggerTime` and `startStreakTime` are `0` in every message — the loiter threshold was never actually reached in this capture.
+
+**Not confirmed by this capture:** what edgeType/status Protect sends once a loiter threshold *is* crossed. By analogy with the zone subsystem's `enter`, there is presumably a distinct loiter-triggered edgeType or status value, but no such transition appears in this log. Treat any such value as unconfirmed until a capture shows it — don't infer a name for it.
+
+### 11.4 Snapshot filename counters are per-subsystem
+
+Confirmed distinct counters:
+- Loiter subsystem: `smartdetectsnap_loiter_00000000_fullfov.jpg` (unchanged at `00000000` across the whole capture — no loiter-subsystem `leave` with a new count was observed in this window).
+- Zone subsystem: `smartdetectsnap_zone_00000004_fullfov.jpg` at the start of the capture (a residual `leave` from a prior track, see 11.5), then `smartdetectsnap_zone_00000000_fullfov.jpg` on the track's actual terminal `leave` at the end.
+
+**Open question:** the zone-subsystem counter going from `00000004` to `00000000` within one connection doesn't fit a simple always-incrementing model. Possible explanations include a counter reset on reconnect, two distinct snapshot-counter pools we haven't distinguished, or an artifact of this specific capture window. Implement the counter as monotonic-per-subsystem-per-connection as a reasonable default, but don't hard-code an assumption that it never resets — this needs another capture spanning a full connection lifecycle to pin down.
+
+### 11.5 Leading residual `leave` pairs at connection start
+
+At the very start of this capture, before any real detection, two pairs of `leave` messages appear (four messages total, `eventId 114455-114458`), each pair consisting of one loiter-styled `leave` (`loiterZonesStatus`, placeholder `loiter_00000000` filename) and one zone-styled `leave` (`zonesStatus`, `zone_00000004` filename), both with empty `descriptors: []`. These look like stale closeout messages left over from a track that ended before this log window began, re-sent or flushed at connection start — not a new pattern to reproduce, just residual state. Bridges emulating a fresh connection likely don't need to replicate this.
+
+**Extends to `EventSmartMotion` too (confirmed in the same capture — see Section 8.1):** immediately following each of these two residual `leave` pairs, a residual `EventSmartMotion` `stop` message is also flushed, sharing the exact same `clockMonotonic`/`clockWall` as the pair it follows but carrying a `clockBestMonotonic`/`clockBestWall` roughly 5.5 minutes older. So the full residual close-out at connection start is three messages, not two: loiter `leave` → zone `leave` → motion `stop`, all describing state from before the log window began.
+
+### 11.6 Terminal `leave` can be transmitted well after the underlying detection ended
+
+The real device's last "live" tick for this track (`eventId 114530`, `warmup`) has `clockMonotonic: 576575285`, sent (`timeStamp`) at `13:54:32.300Z`. The terminal zone `leave` message (`eventId 114531`) has `clockMonotonic: 576575549` — only ~264ms later by the device's own clock — but its `timeStamp` shows it wasn't actually put on the wire until `13:54:40.803Z`, roughly **8.5 seconds later**. No other EventSmartDetect messages for this trackerID appear in the gap.
+
+This means the device (or Frigate-side pipeline you're emulating) can hold the terminal `leave` for several seconds — plausibly for snapshot encoding/upload preparation — before transmitting it, with no intervening heartbeat. Bridge implementations should not assume Frigate's `type: "end"` should map to an immediately-sent `leave`; a short deliberate delay before flushing the terminal message is consistent with real-device behavior, though the exact cause (and whether it's required for Protect's UI to behave correctly) isn't established by this capture alone.
+
+### 11.7 Correction to Section 4's `objectTypes` claim
+
+The earlier revision of this document stated `objectTypes` "stays populated ... for the *entire* life of a track — enter through every moving message — and only clears to `[]` on the terminal leave." This capture shows that claim is only true for zone-subsystem messages. The sibling loiter-subsystem `warmup` message for the identical trackerID, emitted on the same tick, carries `objectTypes: []` throughout. If you implement both subsystems, `objectTypes` needs to be computed per-message based on which subsystem/edgeType is being emitted, not tracked as a single flag per object.
+
+### 11.8 Implementation guidance
+
+1. If your bridge doesn't emit `loiterZonesStatus`/`warmup` at all, Protect's zone-based enter/moving/leave detection is unaffected — those are the well-understood, already-implemented messages. Skipping the loiter subsystem simply means Protect's loiter-zone-specific UI/alerts won't activate for your emulated cameras.
+2. If you do want to implement it: maintain a second static zone-ID map (loiter zones, distinct numbering from regular zones) per camera, and drive a simple per-track state that starts at `warmup` when the object is first seen and stays there for the observed lifetime of the track (since no loiter-triggered transition was captured to model). Emit it on the same per-tick cadence as your zone-subsystem `moving` messages, sharing the same `eventId`/`messageId` counter.
+3. `objectTypes` on your loiter messages should be `[]`; on your zone messages, populated per the existing Section 6 guidance.
+4. Don't rush the terminal `leave` message immediately off of Frigate's `type: "end"` if you want to match observed device timing — a delay in the low single-digit seconds before flushing is consistent with this capture, though not proven necessary.
