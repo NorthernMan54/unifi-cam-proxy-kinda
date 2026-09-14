@@ -558,3 +558,56 @@ The earlier revision of this document stated `objectTypes` "stays populated ... 
 2. If you do want to implement it: maintain a second static zone-ID map (loiter zones, distinct numbering from regular zones) per camera, and drive a simple per-track state that starts at `warmup` when the object is first seen and stays there for the observed lifetime of the track (since no loiter-triggered transition was captured to model). Emit it on the same per-tick cadence as your zone-subsystem `moving` messages, sharing the same `eventId`/`messageId` counter.
 3. `objectTypes` on your loiter messages should be `[]`; on your zone messages, populated per the existing Section 6 guidance.
 4. Don't rush the terminal `leave` message immediately off of Frigate's `type: "end"` if you want to match observed device timing — a delay in the low single-digit seconds before flushing is consistent with this capture, though not proven necessary.
+
+## 12. Backend Decompile Cross-Checks (`service.js`)
+
+**Source: decompiled Protect controller backend (`service.js`), not a device wire capture.** Everything in this section describes how the *backend* parses, indexes, or gates data — it confirms shape and existence with high confidence, but not the exact conditions under which a real camera populates these fields on the wire. Treat findings here as "confirmed via backend decompile, pending device capture" — a step below the device-log-derived sections above.
+
+### 12.1 `attributes` field — schema now confirmed (supersedes Section 4 placeholder)
+
+Section 4 previously listed `attributes` as "not exercised in either capture — safe to emit `null`". Two independent backend code paths now confirm a concrete shape:
+
+- `onVehicleDescriptionDetected` (module 41286) reads `t.attributes.color.val`/`.confidence` and `t.attributes.vehicleType.val`/`.confidence` directly off a descriptor-like object.
+- `extractAttributeLabelSet` (module 78899) independently confirms the same two literal keys (`color`, `vehicleType`) and the same `{val, confidence}` per-key shape, iterating a closed `AttributeKey` list containing only these two members as of this build.
+
+**Revised shape:**
+
+```json
+"attributes": {
+  "color": { "val": "red", "confidence": 87 },
+  "vehicleType": { "val": "sedan", "confidence": 91 }
+}
+```
+
+- Vehicle description (color/type) is filed under the `LICENSE_PLATE_WILDCARD`/`LICENSE_PLATE_DESCRIPTION` event keys on the backend — i.e. color/type search indexing shares a code path with license-plate recognition, not a separate "vehicle description" category. This suggests `lprEnhancedByAiKey` (a capability flag your bridge currently does not advertise) may gate both plate text and color/type, not just plate text. Unconfirmed — no code seen yet that checks this flag server-side.
+- `matchedName` exists as a sibling field in the same internal event-value object but is left `void 0` by this handler — face/plate identity matches are evidently a separate concept from vehicle description attributes, populated by a different code path.
+- **Not yet confirmed:** whether Frigate can even supply vehicle color/type without a custom-trained object classification model (`type: attribute`, Frigate 0.17+) — this isn't a Frigate+ built-in label. `descriptors.py` currently always emits `attributes: None`.
+
+### 12.2 `lines[]` / loiter — real feature surfaces, not vestigial
+
+The `LabelPrefix` enum (module 78899) lists `zone`, `line`, and `loiterZone` as equal-tier search facets, and `onVehicleDescriptionDetected`'s zone-state helper (`getZoneEnterState`) is called identically against `metadata.zonesStatus`, `metadata.linesStatus`, and `metadata.loiterStatus`. Section 4/5's descriptor-level `lines` field (currently documented "not exercised, safe to emit `[]`") and Section 11's loiter subsystem are both confirmed as first-class backend concepts, not edge cases. No change to current emission behavior recommended yet — this raises the priority of a future capture from a camera with line-crossing configured, to see `linesStatus` populated on the wire.
+
+### 12.3 Capability-flag gating — confirmed mechanism, one concrete gap found
+
+Automation trigger definitions (module 86901, `activityTriggers`) gate "Line Crossing" and "Loitering" UI triggers behind `requires: { [Provides.LINE_CROSSING]: ... }` / `[Provides.LOITERING]: ...}`. Cross-referencing against the real doorbell's captured `ubnt_avclient_hello` (`DOORBELL_IMPLEMENTATION.md`):
+
+```
+"smartDetect": ["person","vehicle","animal","lineCrossing","faceEnhancedByAiKey","lprEnhancedByAiKey","alrmSmoke","alrmCmonx","alrmBabyCry","alrmSpeak"]
+```
+
+`"lineCrossing"` is present as a literal string, consistent with `Provides.LINE_CROSSING` being derived from the device's advertised `smartDetect` array. **Action item:** the bridge's current `get_feature_flags()` advertises only `["person","vehicle","animal","package"]` — missing `lineCrossing`, `faceEnhancedByAiKey`, and `lprEnhancedByAiKey` at minimum. Without these, Protect's automation UI won't offer Line Crossing / Face / LPR triggers for the emulated camera regardless of what the descriptor payloads contain.
+
+**Open question:** the same real capture has no obviously-corresponding string for loitering capability, despite Section 11 confirming the device actively emits loiter-subsystem messages. Either loitering is signaled via a different/undiscovered feature key, or is implicit rather than opt-in. Unresolved — needs the `Provides` enum module (imported as module 27320 in module 86901) to settle.
+
+### 12.4 Audio alarm triggers — all nine confirmed as live, user-facing automations
+
+Module 86901's `activityTriggers` maps all nine `alrm*` classes from Section 10 (`audioAlarmSpeak`, `audioAlarmBabyCry`, `audioAlarmBark`, `audioAlarmCo`, `audioAlarmSmoke`, `audioAlarmCarHorn`, `audioAlarmGlassBreak`, `audioAlarmSiren`, `audioAlarmBurglar`) to real Alarm Manager triggers, each gated on `scope_all_smart_cameras_with_microphone`. This confirms `EventSmartAudio`'s nine classes are actively wired into user-facing automations, not incidental telemetry — raises implementation priority for `EventSmartAudio` emission, which currently has zero code coverage (see prior review).
+
+### 12.5 `idleSinceTimeMs`/`stationary` — confirmed downstream consumer
+
+A dedicated `idleTrackerMiddleware` (module 35395) exists in the backend's event-producer pipeline and independently contributes `PERSON_IDLE_TIME`/`VEHICLE_IDLE_TIME` keys to the `EventKeys` enum, consumed by "Object Idle Time" automation triggers (duration + timeframe, converted to ms). This is a real, architecturally first-class consumer of the `idleSinceTimeMs`/`stationary` descriptor fields `descriptors.py` already derives from Frigate's `motionless_count`. No implementation gap — this is a confirmation, not an action item.
+
+### 12.6 Open leads for future decompile passes
+
+- `EventKeys` is federated across at least 7 modules (88245, 92185, 14036, 77541, 8590, 96067, 35395), not defined in one place — module 88245 is the likely "core" module (also source of `NVR_DEVICE`) and the best next pull for the full smart-detect/motion/audio key taxonomy.
+- `dsRecognitionsEventProducerMiddleware` (32310) and `dsUpdatesEventProducerMiddleware` (43904) are the `ds`-prefixed (device-session) stages in the backend's event-producer pipeline — most likely candidates for seeing exactly how raw `EventSmartDetect`/`EventSmartAudio`/`MCUEventMessage` payloads get parsed into Protect's internal event model, as distinct from the five other middlewares handling NVR/schedule/webhook/external-API-originated events.
