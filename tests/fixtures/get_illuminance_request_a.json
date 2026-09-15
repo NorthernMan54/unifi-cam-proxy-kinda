@@ -1,0 +1,9 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "GetIlluminance",
+  "messageId": 48121,
+  "inResponseTo": 0,
+  "payload": {}
+}

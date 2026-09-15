@@ -1,0 +1,13 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "GetIlluminance",
+  "inResponseTo": 48121,
+  "messageId": 81411212,
+  "payload": {
+    "illuminance": 51
+  },
+  "responseExpected": false,
+  "statusCode": 0,
+  "timeStamp": "2026-07-01T23:27:16.186+00:00",
+  "to": "UniFiVideo"
+}
