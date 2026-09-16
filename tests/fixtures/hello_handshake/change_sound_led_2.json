@@ -1,0 +1,18 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ChangeSoundLedSettings",
+  "messageId": 29054,
+  "inResponseTo": 0,
+  "payload": {
+    "language": "en",
+    "allowThirdPartyNfcCards": true,
+    "screenOffTimeout": "auto",
+    "doorEntryMethod": "in",
+    "showUnlockSchedule": true,
+    "doorId": null,
+    "doorName": null,
+    "unlockDuration": 5
+  }
+}

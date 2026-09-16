@@ -1,0 +1,11 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ChangeDeviceSettings",
+  "messageId": 29062,
+  "inResponseTo": 0,
+  "payload": {
+    "analyticsMode": "anonymous"
+  }
+}

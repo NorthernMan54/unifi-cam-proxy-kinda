@@ -1,0 +1,32 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ChangeSmartMotionSettings",
+  "inResponseTo": 29060,
+  "messageId": 10,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.768+00:00",
+  "payload": {
+    "enable": true,
+    "eventMaxDurationMSec": 300000,
+    "bgmodel": "default",
+    "lingerEventStartMSec": 1000,
+    "lingerEventStopMSec": 3000,
+    "zones": {
+      "1": {
+        "coord": [
+          0,
+          0,
+          1000,
+          0,
+          1000,
+          1000,
+          0,
+          1000
+        ],
+        "level": 50,
+        "triggerLight": true
+      }
+    }
+  }
+}

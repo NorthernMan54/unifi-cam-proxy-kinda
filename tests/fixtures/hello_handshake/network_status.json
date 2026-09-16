@@ -1,0 +1,9 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "NetworkStatus",
+  "messageId": 29048,
+  "inResponseTo": 0,
+  "payload": {}
+}

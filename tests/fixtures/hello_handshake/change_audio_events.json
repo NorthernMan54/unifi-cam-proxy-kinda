@@ -1,0 +1,23 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeAudioEventsSettings",
+  "messageId": 29067,
+  "inResponseTo": 0,
+  "payload": {
+    "enableAlrmSmoke": 0,
+    "enableAlrmCmonx": 0,
+    "enableAlrmSiren": 0,
+    "enableAlrmSpeak": 0,
+    "enableAlrmBabyCry": 0,
+    "enableAlrmBark": 0,
+    "enableAlrmBurglar": 0,
+    "enableAlrmCarHorn": 0,
+    "enableAlrmGlassBreak": 0,
+    "recordEventSpeak": 0,
+    "recordEventSmoke": 0,
+    "recordEventCmonx": 0,
+    "sendPulse": 0
+  }
+}

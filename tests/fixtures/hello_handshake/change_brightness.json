@@ -1,0 +1,12 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ChangeBrightnessSettings",
+  "messageId": 29053,
+  "inResponseTo": 0,
+  "payload": {
+    "brightness": 36,
+    "autoBrightness": true
+  }
+}

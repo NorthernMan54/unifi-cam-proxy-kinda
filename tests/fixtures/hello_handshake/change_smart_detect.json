@@ -1,0 +1,149 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeSmartDetectSettings",
+  "messageId": 29068,
+  "inResponseTo": 0,
+  "payload": {
+    "enableSmartDetect": [
+      "person",
+      "vehicle",
+      "animal",
+      "package"
+    ],
+    "eventStartMSec": 1000,
+    "eventStopMSec": 3000,
+    "region": "CA",
+    "zones": {
+      "1": {
+        "coord": [
+          0,
+          0,
+          276,
+          0,
+          275,
+          121,
+          0,
+          210
+        ],
+        "sensitivity": 50,
+        "objectTypes": [
+          "person",
+          "vehicle",
+          "animal"
+        ],
+        "triggerLight": true,
+        "triggerAccessTypes": []
+      },
+      "5": {
+        "coord": [
+          78,
+          212,
+          275,
+          168,
+          488,
+          365,
+          863,
+          746,
+          897,
+          1000,
+          0,
+          988,
+          0,
+          521
+        ],
+        "sensitivity": 50,
+        "objectTypes": [
+          "animal",
+          "person",
+          "vehicle"
+        ],
+        "triggerLight": false,
+        "triggerAccessTypes": []
+      },
+      "6": {
+        "coord": [
+          782,
+          25,
+          942,
+          104,
+          857,
+          425,
+          715,
+          541,
+          560,
+          368,
+          715,
+          277
+        ],
+        "sensitivity": 50,
+        "objectTypes": [
+          "animal",
+          "person"
+        ],
+        "triggerLight": false,
+        "triggerAccessTypes": []
+      },
+      "7": {
+        "coord": [
+          936,
+          180,
+          1000,
+          198,
+          878,
+          748,
+          707,
+          523,
+          850,
+          432
+        ],
+        "sensitivity": 50,
+        "objectTypes": [
+          "animal",
+          "person"
+        ],
+        "triggerLight": false,
+        "triggerAccessTypes": []
+      }
+    },
+    "secondLensZones": {
+      "1": {
+        "coord": [
+          0,
+          0,
+          1000,
+          0,
+          1000,
+          1000,
+          0,
+          1000
+        ],
+        "sensitivity": 50,
+        "objectTypes": [],
+        "triggerLight": true,
+        "triggerAccessTypes": []
+      }
+    },
+    "lines": {},
+    "loiterZones": {},
+    "excludeZones": {},
+    "intelligenceZones": {},
+    "enableTamperDetection": false,
+    "recognitionAccuracy": {
+      "face": "auto",
+      "licensePlate": "auto"
+    },
+    "reVerificationPolicy": {
+      "person": {
+        "enable": false
+      },
+      "vehicle": {
+        "enable": false
+      },
+      "animal": {
+        "enable": false
+      }
+    }
+  }
+}

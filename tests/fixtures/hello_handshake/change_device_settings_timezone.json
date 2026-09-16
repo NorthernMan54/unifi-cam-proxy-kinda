@@ -1,0 +1,11 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeDeviceSettings",
+  "messageId": 29049,
+  "inResponseTo": 0,
+  "payload": {
+    "timezone": "America/Toronto"
+  }
+}

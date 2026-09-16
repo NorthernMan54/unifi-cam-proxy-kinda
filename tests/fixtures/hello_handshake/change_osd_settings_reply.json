@@ -1,0 +1,44 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ChangeOsdSettings",
+  "inResponseTo": 29051,
+  "messageId": 5,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.632+00:00",
+  "payload": {
+    "_1": {
+      "enableDate": 1,
+      "enableLogo": 1,
+      "enableReportdStatsLevel": 0,
+      "enableStreamerStatsLevel": 0,
+      "tag": "Driveway"
+    },
+    "_2": {
+      "enableDate": 1,
+      "enableLogo": 1,
+      "enableReportdStatsLevel": 0,
+      "enableStreamerStatsLevel": 0,
+      "tag": "Driveway"
+    },
+    "_3": {
+      "enableDate": 1,
+      "enableLogo": 1,
+      "enableReportdStatsLevel": 0,
+      "enableStreamerStatsLevel": 0,
+      "tag": "Driveway"
+    },
+    "_4": {
+      "enableDate": 1,
+      "enableLogo": 1,
+      "enableReportdStatsLevel": 0,
+      "enableStreamerStatsLevel": 0,
+      "tag": "Driveway"
+    },
+    "enableOverlay": 1,
+    "logoScale": 50,
+    "overlayColorId": 0,
+    "textScale": 50,
+    "useCustomLogo": 0
+  }
+}

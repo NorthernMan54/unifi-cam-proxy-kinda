@@ -1,0 +1,13 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ubnt_avclient_paramAgreement",
+  "messageId": 29046,
+  "inResponseTo": 0,
+  "payload": {
+    "enableStatusCodes": true,
+    "useHeartbeats": false,
+    "heartbeatsTimeoutMs": 60000
+  }
+}

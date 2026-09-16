@@ -1,0 +1,10 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ChangeClarityZones",
+  "inResponseTo": 29065,
+  "messageId": 13,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.776+00:00",
+  "payload": {}
+}

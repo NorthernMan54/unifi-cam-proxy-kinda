@@ -1,0 +1,10 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ChangeAudioEventsSettings",
+  "inResponseTo": 29067,
+  "messageId": 14,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.778+00:00",
+  "payload": {}
+}

@@ -1,0 +1,15 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ubnt_avclient_hello",
+  "messageId": 29045,
+  "inResponseTo": 1,
+  "payload": {
+    "protocolVersion": 67,
+    "controllerName": "Cottage GW",
+    "controllerUuid": "a92b69bc-a75f-41d0-842b-00c5ca898a08",
+    "controllerVersion": "7.2.105",
+    "overrideUuid": true
+  }
+}

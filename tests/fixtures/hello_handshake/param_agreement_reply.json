@@ -1,0 +1,25 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ubnt_avclient_paramAgreement",
+  "inResponseTo": 29046,
+  "messageId": 2,
+  "payload": {
+    "authToken": "Y6aU73WEsQuehmnlg7PKMbu1JZybzOK5",
+    "features": {
+      "mic": true,
+      "aec": [],
+      "videoMode": ["default"],
+      "motionDetect": ["enhanced"],
+      "hotplug": {
+        "extender": {
+          "attached": false
+        }
+      },
+      "doorbell": true,
+      "smartDetect": ["person", "vehicle", "animal", "package"]
+    }
+  },
+  "responseExpected": false,
+  "timeStamp": "2026-09-15T23:37:11.320+00:00",
+  "to": "UniFiVideo"
+}

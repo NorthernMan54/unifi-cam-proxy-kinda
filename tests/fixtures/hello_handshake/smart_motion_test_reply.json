@@ -1,0 +1,10 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "SmartMotionTest",
+  "inResponseTo": 29063,
+  "messageId": 11,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.771+00:00",
+  "payload": {}
+}

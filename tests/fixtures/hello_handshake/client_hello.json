@@ -1,0 +1,40 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ubnt_avclient_hello",
+  "inResponseTo": 0,
+  "messageId": 1,
+  "payload": {
+    "adoptionCode": "Y6aU73WEsQuehmnlg7PKMbu1JZybzOK5",
+    "connectionHost": "192.168.1.1",
+    "connectionSecurePort": 7442,
+    "fwVersion": "5.3.95",
+    "hwrev": 19,
+    "idleTime": 191.96,
+    "ip": "192.168.1.42",
+    "mac": "FFFFFFFFFFBB",
+    "model": "UVC G4 Dome",
+    "name": "Driveway",
+    "protocolVersion": 67,
+    "rebootTimeoutSec": 30,
+    "semver": "v4.4.8",
+    "totalLoad": 0.5474,
+    "upgradeTimeoutSec": 150,
+    "uptime": 3,
+    "features": {
+      "mic": true,
+      "aec": [],
+      "videoMode": ["default"],
+      "motionDetect": ["enhanced"],
+      "hotplug": {
+        "extender": {
+          "attached": false
+        }
+      },
+      "doorbell": true,
+      "smartDetect": ["person", "vehicle", "animal", "package"]
+    }
+  },
+  "responseExpected": false,
+  "timeStamp": "2026-09-15T23:37:10.781+00:00",
+  "to": "UniFiVideo"
+}

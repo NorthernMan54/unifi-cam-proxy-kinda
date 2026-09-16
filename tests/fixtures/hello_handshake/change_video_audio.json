@@ -1,0 +1,14 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeVideoSettings",
+  "messageId": 29056,
+  "inResponseTo": 0,
+  "payload": {
+    "audio": {
+      "bitRate": 64000,
+      "volume": 0
+    }
+  }
+}

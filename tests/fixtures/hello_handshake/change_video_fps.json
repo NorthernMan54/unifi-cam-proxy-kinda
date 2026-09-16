@@ -1,0 +1,46 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeVideoSettings",
+  "messageId": 29059,
+  "inResponseTo": 0,
+  "payload": {
+    "video": {
+      "video1": {
+        "dynamicFpsMode": 2,
+        "enabled": true,
+        "fps": 20,
+        "isCbr": false,
+        "minClientAdaptiveBitRate": 0,
+        "minMotionAdaptiveBitRate": 1500000,
+        "nMultiplier": 5,
+        "autoFps": true,
+        "autoBitrate": true,
+        "bitRateVbrMax": 2800000
+      },
+      "video2": {
+        "dynamicFpsMode": 2,
+        "enabled": true,
+        "fps": 10,
+        "isCbr": false,
+        "minClientAdaptiveBitRate": 150000,
+        "minMotionAdaptiveBitRate": 750000,
+        "nMultiplier": 2,
+        "autoFps": true,
+        "autoBitrate": true
+      },
+      "video3": {
+        "dynamicFpsMode": 2,
+        "enabled": true,
+        "fps": 15,
+        "isCbr": false,
+        "minClientAdaptiveBitRate": 0,
+        "minMotionAdaptiveBitRate": 200000,
+        "nMultiplier": 1,
+        "autoFps": true,
+        "autoBitrate": true
+      }
+    }
+  }
+}

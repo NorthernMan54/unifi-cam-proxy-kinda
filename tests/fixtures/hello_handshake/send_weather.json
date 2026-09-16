@@ -1,0 +1,18 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "SendWeatherUpdate",
+  "messageId": 29066,
+  "inResponseTo": 0,
+  "payload": {
+    "location": {
+      "city": "Wasaga Beach",
+      "adminDistrict": "Ontario",
+      "countryCode": "CA"
+    },
+    "iconCode": 27,
+    "temperature": 18.3,
+    "temperatureUnit": "C"
+  }
+}

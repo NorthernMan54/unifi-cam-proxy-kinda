@@ -1,0 +1,20 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeTalkbackSettings",
+  "messageId": 29055,
+  "inResponseTo": 0,
+  "payload": {
+    "typeFmt": "aac",
+    "typeIn": "serverudp",
+    "bindAddr": "0.0.0.0",
+    "bindPort": 7004,
+    "filterAddr": null,
+    "filterPort": null,
+    "channels": 1,
+    "samplingRate": 22050,
+    "bitsPerSample": 16,
+    "quality": 100
+  }
+}

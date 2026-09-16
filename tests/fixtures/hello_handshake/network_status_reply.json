@@ -1,0 +1,22 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "NetworkStatus",
+  "inResponseTo": 29048,
+  "messageId": 3,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.600+00:00",
+  "payload": {
+    "connectionState": 2,
+    "connectionStateDescription": "CONNECTED",
+    "defaultInterface": "eth0",
+    "dhcpLeasetime": 86400,
+    "dnsServer": "8.8.8.8 4.2.2.2",
+    "gateway": "192.168.103.1",
+    "ipAddress": "192.168.1.42",
+    "linkDuplex": 1,
+    "linkSpeedMbps": 100,
+    "mode": "dhcp",
+    "networkMask": "255.255.255.0"
+  }
+}

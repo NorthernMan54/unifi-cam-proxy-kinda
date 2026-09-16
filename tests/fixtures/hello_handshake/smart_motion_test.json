@@ -1,0 +1,11 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "SmartMotionTest",
+  "messageId": 29063,
+  "inResponseTo": 0,
+  "payload": {
+    "lingerTestStopSec": 0
+  }
+}

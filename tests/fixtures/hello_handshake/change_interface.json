@@ -1,0 +1,21 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ChangeInterfaceSettings",
+  "messageId": 29069,
+  "inResponseTo": 0,
+  "payload": {
+    "logoPath": null,
+    "bgPath": null,
+    "showLogo": true,
+    "heading": "G4 Dome",
+    "subHeading": null,
+    "layout": "horizontal",
+    "callMethod": "swipe",
+    "showTime": true,
+    "showWeather": true,
+    "timeFormat": "12h",
+    "temperatureUnit": "C"
+  }
+}

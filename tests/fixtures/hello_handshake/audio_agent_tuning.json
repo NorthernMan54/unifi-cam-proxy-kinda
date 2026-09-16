@@ -1,0 +1,11 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "AudioAgentChangeTuning",
+  "messageId": 29057,
+  "inResponseTo": 0,
+  "payload": {
+    "tuningStyle": "nature"
+  }
+}

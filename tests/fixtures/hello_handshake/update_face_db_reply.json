@@ -1,0 +1,10 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "UpdateFaceDBRequest",
+  "inResponseTo": 29070,
+  "messageId": 16,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:14.335+00:00",
+  "payload": {}
+}

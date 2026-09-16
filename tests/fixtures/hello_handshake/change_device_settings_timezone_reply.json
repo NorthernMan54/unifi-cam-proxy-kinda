@@ -1,0 +1,13 @@
+{
+  "from": "ubnt_avclient",
+  "functionName": "ChangeDeviceSettings",
+  "inResponseTo": 29049,
+  "messageId": 4,
+  "responseExpected": false,
+  "to": "UniFiVideo",
+  "timeStamp": "2026-09-15T23:37:11.623+00:00",
+  "payload": {
+    "name": "Driveway",
+    "timezone": "PST8PDT,M3.2.0,M11.1.0"
+  }
+}

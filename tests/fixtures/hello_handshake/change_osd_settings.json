@@ -1,0 +1,36 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": true,
+  "functionName": "ChangeOsdSettings",
+  "messageId": 29051,
+  "inResponseTo": 0,
+  "payload": {
+    "_1": {
+      "tag": "",
+      "enableDate": 0,
+      "enableLogo": 1,
+      "enableStreamerStatsLevel": 0
+    },
+    "_2": {
+      "tag": "",
+      "enableDate": 0,
+      "enableLogo": 1,
+      "enableStreamerStatsLevel": 0
+    },
+    "_3": {
+      "tag": "",
+      "enableDate": 0,
+      "enableLogo": 1,
+      "enableStreamerStatsLevel": 0
+    },
+    "_4": {
+      "tag": "",
+      "enableDate": 0,
+      "enableLogo": 1,
+      "enableStreamerStatsLevel": 0
+    },
+    "datetimeFormat": "%Y-%m-%d  %r",
+    "overlayLocation": "topLeft"
+  }
+}

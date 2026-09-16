@@ -1,0 +1,18 @@
+{
+  "from": "UniFiVideo",
+  "to": "ubnt_avclient",
+  "responseExpected": false,
+  "functionName": "ChangeSoundLedSettings",
+  "messageId": 29052,
+  "inResponseTo": 0,
+  "payload": {
+    "ledFaceEnabled": 1,
+    "ledFaceAlwaysOnWhenManaged": 1,
+    "speakerEnabled": 1,
+    "systemSoundsEnabled": 0,
+    "speakerVolume": 100,
+    "welcomeType": "text",
+    "ringVolume": 100,
+    "welcomeLed": true
+  }
+}
