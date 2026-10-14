@@ -10,14 +10,62 @@ to `None` immediately before being checked -- that branch could never execute
 and has been dropped.
 """
 import asyncio
+import atexit
 import logging
+import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
 DEFAULT_FETCH_TIMEOUT = 5.0
+
+# Snapshot temp files are referenced from event dicts that are retained for up
+# to an hour after the event ends, and ownership is shared between several
+# managers, so rather than tracking each file we keep them all in one
+# directory and prune anything older than this.
+SNAPSHOT_MAX_AGE = 2 * 3600
+SNAPSHOT_PRUNE_INTERVAL = 60.0
+
+_snapshot_dir: Optional[Path] = None
+_last_prune = 0.0
+
+
+def snapshot_dir() -> Path:
+    """Per-process directory holding snapshot temp files; removed at exit."""
+    global _snapshot_dir
+    if _snapshot_dir is None or not _snapshot_dir.is_dir():
+        _snapshot_dir = Path(tempfile.mkdtemp(prefix="unifi-cam-proxy-snapshots-"))
+        atexit.register(shutil.rmtree, _snapshot_dir, ignore_errors=True)
+    return _snapshot_dir
+
+
+def prune_snapshot_dir(max_age: float = SNAPSHOT_MAX_AGE, now: Optional[float] = None) -> int:
+    """Delete snapshot temp files older than `max_age` seconds. Returns count removed."""
+    cutoff = (now if now is not None else time.time()) - max_age
+    removed = 0
+    for path in snapshot_dir().iterdir():
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def write_snapshot_tempfile(data: bytes, suffix: str = ".jpg") -> Path:
+    """Write `data` to a new file in the snapshot dir, pruning stale files periodically."""
+    global _last_prune
+    now = time.time()
+    if now - _last_prune >= SNAPSHOT_PRUNE_INTERVAL:
+        _last_prune = now
+        prune_snapshot_dir(now=now)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=snapshot_dir()) as f:
+        f.write(data)
+    return Path(f.name)
 
 
 async def download_to_tempfile(
@@ -42,11 +90,9 @@ async def download_to_tempfile(
         logger.error(f"Error fetching {url}: {e}")
         return None
 
-    f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    f.write(data)
-    f.close()
-    logger.debug(f"Fetched {url} ({len(data)} bytes) -> {f.name}")
-    return Path(f.name)
+    path = write_snapshot_tempfile(data, suffix)
+    logger.debug(f"Fetched {url} ({len(data)} bytes) -> {path}")
+    return path
 
 
 class FrigateSnapshotClient:

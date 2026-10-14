@@ -9,15 +9,14 @@ helpers, etc.) plus the RTSPCam/UnifiCamBase trigger_* methods.
 """
 import asyncio
 import json
-import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
 from aiomqtt import Message
 
 from unifi.cams.base import SmartDetectObjectType
 from unifi.cams.frigate_lib.descriptors import label_to_object_type
+from unifi.cams.frigate_lib.snapshots import write_snapshot_tempfile
 from unifi.cams.frigate_lib.zones import ZoneStatusTracker
 
 
@@ -458,14 +457,12 @@ class FrigateEventHandlerMixin:
                 break
 
         if matching_frigate_event_id and self._motion_smart_event_id is not None:
-            f = tempfile.NamedTemporaryFile(delete=False)
-            f.write(message.payload)
-            f.close()
+            path = write_snapshot_tempfile(message.payload)
             self.logger.debug(
                 f"Cached snapshot for Frigate event {matching_frigate_event_id} "
-                f"({snapshot_label}): {f.name} ({len(message.payload)} bytes)"
+                f"({snapshot_label}): {path} ({len(message.payload)} bytes)"
             )
-            self.update_motion_snapshot(Path(f.name))
+            self.update_motion_snapshot(path)
             if matching_frigate_event_id in self.event_snapshot_ready:
                 self.event_snapshot_ready[matching_frigate_event_id].set()
         else:
